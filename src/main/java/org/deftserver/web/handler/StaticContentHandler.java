@@ -45,12 +45,13 @@ public class StaticContentHandler extends RequestHandler {
 	/**
 	 * @param request the <code>HttpRequest</code>
 	 * @param response the <code>HttpResponse</code> 
-	 * @param hasBody <code>true</code> to write the message body; <code>false</code> otherwise.
+	 * @param hasBody <code>true</code> to write the message body; <code>false</code> oth	erwise.
 	 */
 	private void perform(final HttpRequest request, final HttpResponse response, boolean hasBody) {
-		
+		System.out.println("req: " + request + ", resp: " + response + ", body: " + hasBody);
 		final String path = request.getRequestedPath();
 		final File file = new File(path.substring(1));	// remove the leading '/'
+		System.out.println(file);
 		if (!file.exists()) {
 			throw new HttpException(404);
 		} else if (!file.isFile()) {

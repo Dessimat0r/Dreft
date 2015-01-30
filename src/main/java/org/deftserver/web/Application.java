@@ -65,7 +65,7 @@ public class Application {
 	 * @return Returns the {@link RequestHandler} associated with the given path. If no mapping exists a 
 	 * {@link NotFoundRequestHandler} is returned.
 	 */
-	private RequestHandler getHandler(String path) {
+	public RequestHandler getHandler(String path) {
 		RequestHandler rh = absoluteHandlers.get(path);
 		if (rh == null) {
 			// path could contain capturing groups which we could have a handler associated with.
@@ -74,7 +74,7 @@ public class Application {
 				// path could be prefixed with the 'static content directory'
 				rh = getStaticContentHandler(path);
 			}
-		} 
+		}
 		return rh != null ? rh : NotFoundRequestHandler.getInstance();	// TODO RS store in a final field for improved performance?
 	}
 	
@@ -84,7 +84,8 @@ public class Application {
 		}
 		// if @Authenticated annotation is present, make sure that the request/user is authenticated 
 		// (i.e RequestHandler.getCurrentUser() != null).
-		RequestHandler rh = getHandler(request.getRequestedPath());;
+		RequestHandler rh = getHandler(request.getRequestedPath());
+		if (rh == null) return NotFoundRequestHandler.getInstance();
 		if (rh.isMethodAuthenticated(request.getMethod()) && rh.getCurrentUser(request) == null) {
 			return ForbiddenRequestHandler.getInstance();
 		}

@@ -5,6 +5,7 @@ import static org.deftserver.web.http.HttpServerDescriptor.WRITE_BUFFER_SIZE;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
@@ -168,6 +169,34 @@ public class HttpResponse {
 		return sb.toString();
 	}
 	
+	public long write(ByteBuffer data) {
+		long size = data.remaining();
+		setHeader("Content-Length", String.valueOf(size));
+		long bytesWritten = 0;
+		flush(); // write initial line + headers
+		try {
+			while (data.hasRemaining()) {
+				int written   = ((SocketChannel) key.channel()).write(data);
+				bytesWritten += written;
+				logger.debug("sending bytebuffer, bytes sent last: {}, total: {}", written, bytesWritten);
+			}
+			if (bytesWritten > 0) {
+				logger.debug("sent bytebuffer, bytes sent total: {}", bytesWritten);
+				try {
+					key.channel().register(key.selector(), SelectionKey.OP_WRITE); //TODO RS 110621, use IOLoop.updateHandler
+				} catch (ClosedChannelException e) {
+					logger.error("ClosedChannelException during write(bytebuffer): {}", e.getMessage());
+					Closeables.closeQuietly(key.channel());
+				}
+				key.attach(data);
+			}
+		} catch (IOException e) {
+			logger.error("Error writing (bytebuffer) response: {}", e.getMessage());
+		}
+
+		return bytesWritten;
+	}
+	
 	/**
 	 * Experimental support.
 	 * Before use, read https://github.com/rschildmeijer/deft/issues/75
@@ -184,11 +213,11 @@ public class HttpResponse {
 			FileChannel fc = raf.getChannel();
 			MappedByteBuffer mbb = raf.getChannel().map(MapMode.READ_ONLY, 0L, fc.size());
 
-			if (mbb.hasRemaining()) {
-				bytesWritten = ((SocketChannel) key.channel()).write(mbb);
+			while (mbb.hasRemaining()) {
+				bytesWritten += ((SocketChannel) key.channel()).write(mbb);
 				logger.debug("sent file, bytes sent: {}", bytesWritten);
 			}
-			if (mbb.hasRemaining()) {
+			if (bytesWritten > 0) {
 				try {
 					key.channel().register(key.selector(), SelectionKey.OP_WRITE); //TODO RS 110621, use IOLoop.updateHandler
 				} catch (ClosedChannelException e) {
@@ -204,7 +233,7 @@ public class HttpResponse {
 				try {
 					raf.close();
 				} catch (IOException e) {
-					logger.error("Error closing static file: ", e.getMessage());					
+					logger.error("Error closing static file: {}", e.getMessage());					
 				}
 			}
 		}

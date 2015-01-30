@@ -63,9 +63,11 @@ public class HttpProtocol implements IOHandler {
 
 	@Override
 	public void handleRead(SelectionKey key) throws IOException {
-		logger.debug("handle read...");
+		logger.debug("handle read... key: " + key);
 		SocketChannel clientChannel = (SocketChannel) key.channel();
+		logger.debug("handle read 2...");
 		HttpRequest request = getHttpRequest(key, clientChannel);
+		logger.debug("handle read 3...");
 		
 		if (request.isKeepAlive()) {
 			ioLoop.addKeepAliveTimeout(
@@ -73,9 +75,13 @@ public class HttpProtocol implements IOHandler {
 					Timeout.newKeepAliveTimeout(ioLoop, clientChannel, KEEP_ALIVE_TIMEOUT)
 			);
 		}
+		logger.debug("handle read 4...");
 		HttpResponse response = new HttpResponse(this, key, request.isKeepAlive());
+		logger.debug("handle read 5...");
 		RequestHandler rh = application.getHandler(request);
+		logger.debug("handle read 6...");
 		HttpRequestDispatcher.dispatch(rh, request, response);
+		logger.debug("handle read 7...");
 		
 		//Only close if not async. In that case its up to RH to close it (+ don't close if it's a partial request).
 		if (!rh.isMethodAsynchronous(request.getMethod()) && ! (request instanceof PartialHttpRequest)) {
