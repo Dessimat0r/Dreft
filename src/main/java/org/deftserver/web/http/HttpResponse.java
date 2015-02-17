@@ -36,6 +36,7 @@ public class HttpResponse {
 	private final Map<String, String> headers = new HashMap<String, String>();
 	private boolean headersCreated = false;
 	private DynamicByteBuffer responseData = DynamicByteBuffer.allocate(WRITE_BUFFER_SIZE);
+	private boolean hasContent = false;
 	
 	public HttpResponse(HttpProtocol protocol, SelectionKey key, boolean keepAlive) {
 		this.protocol = protocol;
@@ -153,6 +154,7 @@ public class HttpResponse {
 		if (responseData.position() > 0) {
 			setHeader("Etag", HttpUtil.getEtag(responseData.array()));
 		}
+		System.out.println("cl-httpresp1");
 		setHeader("Content-Length", String.valueOf(responseData.position()));
 	}
 	
@@ -160,8 +162,10 @@ public class HttpResponse {
 		StringBuilder sb = new StringBuilder(HttpUtil.createInitialLine(statusCode));
 		for (Map.Entry<String, String> header : headers.entrySet()) {
 			sb.append(header.getKey());
-			sb.append(": ");
-			sb.append(header.getValue());
+			if (!header.getValue().isEmpty()) {
+				sb.append(": ");
+				sb.append(header.getValue());
+			}
 			sb.append("\r\n");
 		}
 		
@@ -171,6 +175,7 @@ public class HttpResponse {
 	
 	public long write(ByteBuffer data) {
 		long size = data.remaining();
+		System.out.println("cl-httpresp2");
 		setHeader("Content-Length", String.valueOf(size));
 		long bytesWritten = 0;
 		flush(); // write initial line + headers
@@ -203,6 +208,7 @@ public class HttpResponse {
 	 */
 	public long write(File file) {
 		//setHeader("Etag", HttpUtil.getEtag(file));
+		System.out.println("cl-httpresp3");
 		setHeader("Content-Length", String.valueOf(file.length()));
 		long bytesWritten = 0;
 		flush(); // write initial line + headers

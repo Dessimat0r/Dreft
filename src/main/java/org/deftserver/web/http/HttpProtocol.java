@@ -34,7 +34,7 @@ public class HttpProtocol implements IOHandler {
 
 	
 	// a queue of half-baked (pending/unfinished) HTTP post request
-	private final Map<SelectableChannel, PartialHttpRequest> partials = Maps.newHashMap();
+	private final Map<SelectableChannel, HttpRequest> partials = Maps.newHashMap();
  	
 	public HttpProtocol(Application app) {
 		this(IOLoop.INSTANCE, app);
@@ -67,7 +67,7 @@ public class HttpProtocol implements IOHandler {
 		SocketChannel clientChannel = (SocketChannel) key.channel();
 		logger.debug("handle read 2...");
 		HttpRequest request = getHttpRequest(key, clientChannel);
-		logger.debug("handle read 3...");
+		logger.debug("handle read 3..., req class: " + request.getClass().toString() + ", req: " + request);
 		
 		if (request.isKeepAlive()) {
 			ioLoop.addKeepAliveTimeout(
@@ -84,7 +84,7 @@ public class HttpProtocol implements IOHandler {
 		logger.debug("handle read 7...");
 		
 		//Only close if not async. In that case its up to RH to close it (+ don't close if it's a partial request).
-		if (!rh.isMethodAsynchronous(request.getMethod()) && ! (request instanceof PartialHttpRequest)) {
+		if (!rh.isMethodAsynchronous(request.getMethod()) && request.isComplete()) {
 			response.finish();
 		}
 	}
@@ -208,14 +208,20 @@ public class HttpProtocol implements IOHandler {
 		//do we have any unfinished http post requests for this channel?
 		HttpRequest request = null;
 		if (partials.containsKey(clientChannel)) {
-			request = HttpRequest.continueParsing(buffer, partials.get(clientChannel));
-			if (! (request instanceof PartialHttpRequest)) {	// received the entire payload/body
+			System.out.println("continuing to parse partial http request");
+			request = partials.get(clientChannel);
+			request.putContentData(true, buffer);
+			if (request.isComplete()) {	// received the entire payload/body
+				System.out.println("entire partial http request received, removing");
 				partials.remove(clientChannel);
 			}
 		} else {
 			request = HttpRequest.of(buffer);
-			if (request instanceof PartialHttpRequest) {
-				partials.put(key.channel(), (PartialHttpRequest) request);
+			if (!request.isComplete()) {
+				System.out.println("adding partial http request");
+				partials.put(key.channel(), request);
+			} else {
+				System.out.println("normal HttpRequest");
 			}
 		}
 		//set extra request info

@@ -33,6 +33,13 @@ public class DynamicByteBuffer {
 		backend.put(src);
 	}
 
+	/**
+	 * Append the data. Will reallocate if needed.
+	 */
+	public void put(ByteBuffer src) {
+		ensureCapacity(src.remaining());
+		backend.put(src);
+	}	
 	
 	/**
 	 * Prepend the data. Will reallocate if needed.

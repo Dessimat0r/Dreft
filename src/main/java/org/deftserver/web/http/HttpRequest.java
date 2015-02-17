@@ -1,5 +1,10 @@
 package org.deftserver.web.http;
 
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.Collection;
@@ -7,16 +12,16 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import org.deftserver.io.IOLoop;
-import org.deftserver.util.ArrayUtil;
+import org.deftserver.io.stream.ByteBufferBackedInputStream;
 import org.deftserver.web.HttpVerb;
 
 import com.google.common.base.Charsets;
 import com.google.common.collect.ImmutableMultimap;
 
 public class HttpRequest {
-	
 	private IOLoop ioLoop;
 	
 	private final String requestLine;
@@ -25,7 +30,7 @@ public class HttpRequest {
 	private final String version; 
 	private Map<String, String> headers;
 	private ImmutableMultimap<String, String> parameters;
-	private String body;
+	private String body = null;
 	private boolean keepAlive;
 	private InetAddress remoteHost;
 	private InetAddress serverHost;
@@ -46,8 +51,15 @@ public class HttpRequest {
 	public static final Pattern HEADERS_BODY_PATTERN = Pattern.compile("\\r\\n");
 	/** Regex to parse header name and value */
 	public static final Pattern HEADER_VALUE_PATTERN = Pattern.compile(": ");
+	/** Regex to parse header name and value */
+	public static final Pattern HEADER_VAL_SPLIT_PATTERN = Pattern.compile("\\; ");	
 	
-	
+	protected ByteBuffer rawBody           = null;
+	protected int        contentLength     = -1;
+	protected String[]   contentTypeArr    = null;
+	protected boolean    multipart         = false;
+	protected String     multipartBoundary = null;
+	protected boolean    complete          = false;
 	
 	/**
 	 * Creates a new HttpRequest 
@@ -61,64 +73,105 @@ public class HttpRequest {
 		String[] pathFrags = QUERY_STRING_PATTERN.split(elements[1]);
 		requestedPath = pathFrags[0];
 		version = elements[2];
-		this.headers = headers;	
-		body = null;
+		this.headers = headers;
+		
+		if (method == HttpVerb.POST) {
+			String ctype = headers.get("content-type");
+			if (ctype == null) throw new IllegalArgumentException("no content type for POST");
+			contentTypeArr = HEADER_VAL_SPLIT_PATTERN.split(ctype);
+			contentTypeArr[0] = contentTypeArr[0].trim();
+			if (contentTypeArr[0].equals("multipart/form-data")) {
+				multipartBoundary = contentTypeArr[1].trim();
+				multipart = true;
+			}
+			String clen = headers.get("content-length");
+			if (clen == null) throw new IllegalArgumentException("no content length for POST");
+			contentLength = Integer.parseInt(clen);
+			rawBody = ByteBuffer.allocate(contentLength);
+		} else {
+			complete = true;
+		}
 		initKeepAlive();
 		parameters = parseParameters(elements[1]);
 	}
 	
-	/**
-	 * Creates a new HttpRequest
-	 * @param requestLine The Http request text line
-	 * @param headers The Http request headers
-	 * @param body The Http request posted body
-	 */
-	public HttpRequest(String requestLine, Map<String, String> headers, String body) {
-		this(requestLine, headers);
-		this.body = body;
+	public static String streamHeadersToString(final InputStream inputStream) throws IOException {
+		try (final BufferedReader br = new BufferedReader(new InputStreamReader(inputStream))) {
+			return br.lines().parallel().collect(Collectors.joining("\r\n"));
+		}
+	}
+	
+	public boolean isComplete() {
+		return complete;
 	}
 	
 	public static HttpRequest of(ByteBuffer buffer) {
 		try {
 			String raw = new String(buffer.array(), 0, buffer.limit(), Charsets.ISO_8859_1);
-			String[] headersAndBody = RAW_VALUE_PATTERN.split(raw); 
-			String[] headerFields = HEADERS_BODY_PATTERN.split(headersAndBody[0]);
-			headerFields = ArrayUtil.dropFromEndWhile(headerFields, "");
-
-			String requestLine = headerFields[0];
-			Map<String, String> generalHeaders = new HashMap<String, String>();
-			for (int i = 1; i < headerFields.length; i++) {
-				String[] header = HEADER_VALUE_PATTERN.split(headerFields[i]);
-				generalHeaders.put(header[0].toLowerCase(), header[1]);
-			}
-
-			String body = "";
-			for (int i = 1; i < headersAndBody.length; ++i) { //First entry contains headers
-				body += headersAndBody[i];
-			}
+			System.out.println("raw httpreq. (of), buf: " + raw);
 			
-			if (requestLine.contains("POST")) {
-				int contentLength = Integer.parseInt(generalHeaders.get("content-length"));
-				if (contentLength > body.length()) {
-					return new PartialHttpRequest(requestLine, generalHeaders, body);
+			Map<String, String> generalHeaders = new HashMap<String, String>();
+			try (
+				ByteBufferBackedInputStream bbbis = new ByteBufferBackedInputStream(buffer);
+				InputStreamReader isr = new InputStreamReader(bbbis);
+				BufferedReader br = new BufferedReader(isr);
+			) {
+				String line = br.readLine(); // request line
+				String requestLine = line;
+				System.out.println("got req. line: " + requestLine);
+				while ((line = br.readLine()) != null) {
+					if (line.contains(":")) {
+						//TODO: optimise this
+						String[] splitLine = HEADER_VALUE_PATTERN.split(line);
+						String   key       = splitLine[0].trim().toLowerCase();
+						String   val       = splitLine[1].trim();
+						generalHeaders.put(key, val);
+					}
+					if (line.isEmpty()) {
+						// continue parsing after blank line
+						HttpRequest req = new HttpRequest(requestLine, generalHeaders);
+						// only do this for POST
+						if (req.getMethod() == HttpVerb.POST) {
+							System.out.println("buffer pos: " + buffer.position());
+							req.putContentData(false, buffer);
+						}
+						return req;
+					}
 				}
 			}
-			return new HttpRequest(requestLine, generalHeaders, body);
+			throw new IOException("Excepected body seperator, still parsing headers");
 		} catch (Exception t) {
-			return MalFormedHttpRequest.instance;
+			System.out.println("malformed http req. (of): exception");
+			t.printStackTrace();
 		}
+		return MalFormedHttpRequest.instance;
 	}
 	
-	public static HttpRequest continueParsing(ByteBuffer buffer, PartialHttpRequest unfinished) {
-		String nextChunk = new String(buffer.array(), 0, buffer.limit(), Charsets.US_ASCII);
-		unfinished.appendBody(nextChunk);
-		
-		int contentLength = Integer.parseInt(unfinished.getHeader("Content-Length"));
-		if (contentLength > unfinished.getBody().length()) {
-			return unfinished;
-		} else {
-			return new HttpRequest(unfinished.getRequestLine(), unfinished.getHeaders(), unfinished.getBody());
+	/**
+	 * Returns true if got all content data
+	 * @param buffer
+	 * @return
+	 */
+	public boolean putContentData(boolean continuing, ByteBuffer buffer) {
+		if (method != HttpVerb.POST) {
+			throw new IllegalStateException("Method not POST");
 		}
+		String raw = new String(buffer.array(), 0, buffer.limit(), Charsets.ISO_8859_1);
+		System.out.println("raw httpreq. (putContentData), buf: " + raw);
+		
+		rawBody.put(buffer);
+		
+		if (!rawBody.hasRemaining()) {
+			rawBody.flip();
+			//TODO: add multipart parsing code
+			if (!multipart) {
+				body = new String(rawBody.array(), 0, rawBody.limit(), Charsets.ISO_8859_1);
+			}
+			complete = true;
+			return true;
+		}
+		
+		return false;
 	}
 	
 	protected void setIOLoop(IOLoop ioLoop) {

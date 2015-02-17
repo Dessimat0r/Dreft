@@ -53,9 +53,9 @@ public class StaticContentHandler extends RequestHandler {
 		final File file = new File(path.substring(1));	// remove the leading '/'
 		System.out.println(file);
 		if (!file.exists()) {
-			throw new HttpException(404);
+			throw new HttpException(404, "Not found", "Requested resource: <tt>" + path +  "</tt> was not found.");
 		} else if (!file.isFile()) {
-			throw new HttpException(403, path + "is not a file");
+			throw new HttpException(403, "Not a file", "Requested resource: <tt>" + path +  "</tt> is not a file.");
 		}
 
 		final long lastModified = file.lastModified();

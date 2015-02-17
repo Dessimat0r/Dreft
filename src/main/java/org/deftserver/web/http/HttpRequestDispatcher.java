@@ -38,7 +38,9 @@ public class HttpRequestDispatcher {
 			}
 		} catch (HttpException he) {
 			response.setStatusCode(he.getStatusCode());
-			response.write(he.getMessage());
+			response.setHeader("Content-Type", "text/html");
+			response.write("<html><head><title>403" + (he.getMessage() != null ? ": " + he.getMessage() : "") + "</title></head>");
+			response.write("<body>" + he.getLongHTMLMessage() + "</body>");
 			if (rh.isMethodAsynchronous(request.getMethod())) {
 				response.finish();
 			}
