@@ -67,6 +67,9 @@ public class HttpProtocol implements IOHandler {
 		SocketChannel clientChannel = (SocketChannel) key.channel();
 		logger.debug("handle read 2...");
 		HttpRequest request = getHttpRequest(key, clientChannel);
+		if (request == null) {
+			return;
+		}
 		logger.debug("handle read 3..., req class: " + request.getClass().toString() + ", req: " + request);
 		
 		if (request.isKeepAlive()) {
@@ -192,16 +195,17 @@ public class HttpProtocol implements IOHandler {
 	}
 
 	private HttpRequest getHttpRequest(SelectionKey key, SocketChannel clientChannel) {
-		ByteBuffer buffer = (ByteBuffer) key.attachment();
 		try {
+			ByteBuffer buffer = (ByteBuffer) key.attachment();
+			buffer.clear();
 			clientChannel.read(buffer);
+			buffer.flip();
+			return doGetHttpRequest(key, clientChannel, buffer);
 		} catch (IOException e) {
 			logger.warn("Could not read buffer: {}", e.getMessage());
 			Closeables.closeQuietly(ioLoop, clientChannel);
 		}
-		buffer.flip();
-		
-		return doGetHttpRequest(key, clientChannel, buffer);
+		return null;
 	}
 	
 	private HttpRequest doGetHttpRequest(SelectionKey key, SocketChannel clientChannel, ByteBuffer buffer) {
@@ -210,8 +214,7 @@ public class HttpProtocol implements IOHandler {
 		if (partials.containsKey(clientChannel)) {
 			System.out.println("continuing to parse partial http request");
 			request = partials.get(clientChannel);
-			request.putContentData(true, buffer);
-			if (request.isComplete()) {	// received the entire payload/body
+			if (request.putContentData(true, buffer)) {	// if received the entire payload/body
 				System.out.println("entire partial http request received, removing");
 				partials.remove(clientChannel);
 			}
