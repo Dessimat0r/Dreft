@@ -44,7 +44,7 @@ public class DynamicByteBuffer {
 	/**
 	 * Prepend the data. Will reallocate if needed.
 	 */
-	public void prepend(String data) {
+	public long prepend(String data) {
 		byte[] bytes = data.getBytes(Charsets.UTF_8);
 		int newSize = bytes.length + backend.position();
 		byte[] newBuffer = new byte[newSize];
@@ -52,6 +52,7 @@ public class DynamicByteBuffer {
 		System.arraycopy(backend.array(), 0, newBuffer, bytes.length, backend.position()); // body
 		backend = ByteBuffer.wrap(newBuffer);
 		backend.position(newSize);
+		return bytes.length;
 	}
 	
 	/**
@@ -75,7 +76,7 @@ public class DynamicByteBuffer {
 		System.arraycopy(backend.array(), 0, newBuffer, 0, backend.position());
 		backend = ByteBuffer.wrap(newBuffer);
 		backend.position(oldPosition);
-		logger.debug("allocated new DynamicByteBufer, new capacity: {}", backend.capacity());
+		logger.debug("allocated new DynamicByteBuffer, new capacity: {}", backend.capacity());
 	}
 	
 	/**

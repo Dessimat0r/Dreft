@@ -12,6 +12,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.deftserver.io.callback.CallbackManager;
@@ -19,6 +20,7 @@ import org.deftserver.io.callback.JMXDebuggableCallbackManager;
 import org.deftserver.io.timeout.JMXDebuggableTimeoutManager;
 import org.deftserver.io.timeout.Timeout;
 import org.deftserver.io.timeout.TimeoutManager;
+import org.deftserver.util.Closeables;
 import org.deftserver.util.MXBeanUtil;
 import org.deftserver.web.AsyncCallback;
 import org.slf4j.Logger;
@@ -26,7 +28,6 @@ import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Function;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 
 public class IOLoop implements IOLoopMXBean {
 	
@@ -40,12 +41,12 @@ public class IOLoop implements IOLoopMXBean {
 
 	private Selector selector;
 	
-	private final Map<SelectableChannel, IOHandler> handlers = Maps.newHashMap();
+	private final Map<SelectableChannel, IOHandler> handlers = new WeakHashMap<>();
 	
 	private final TimeoutManager tm = new JMXDebuggableTimeoutManager();
 	private final CallbackManager cm = new JMXDebuggableCallbackManager();
 	
-	private static final AtomicInteger sequence = new AtomicInteger();
+	private static final AtomicInteger sequence = new AtomicInteger(0);
 	
 	public IOLoop() {
 		try {
@@ -60,7 +61,7 @@ public class IOLoop implements IOLoopMXBean {
 	 * and will be the io loop thread.
 	 */
 	public void start() {
-		Thread.currentThread().setName("I/O-LOOP" + sequence.incrementAndGet());
+		Thread.currentThread().setName("I/O-LOOP" + sequence.getAndIncrement());
 		running = true;
 		
 		long selectorTimeout = 250; // 250 ms
@@ -78,20 +79,33 @@ public class IOLoop implements IOLoopMXBean {
 				Iterator<SelectionKey> keys = selector.selectedKeys().iterator();
 				while (keys.hasNext()) {
 					SelectionKey key = keys.next();
-					IOHandler handler = handlers.get(key.channel());
-					if (key.isAcceptable()) {
-						handler.handleAccept(key);
+					try {
+						IOHandler handler = handlers.get(key.channel());
+						if (handler == null) {
+							logger.debug("No handler found in IOLoop for channel");
+							Closeables.closeQuietly(this, key.channel());
+							continue;
+						}
+						try {
+							if (key.isAcceptable()) {
+								handler.handleAccept(key);
+							}
+							if (key.isConnectable()) {
+								handler.handleConnect(key);
+							}
+							if (key.isValid() && key.isReadable()) {
+								handler.handleRead(key);
+							}
+							if (key.isValid() && key.isWritable()) {
+								handler.handleWrite(key);
+							}
+						} catch (IOException e) {
+							logger.debug("I/O exception in IOLoop", e);
+							Closeables.closeQuietly(this, key.channel());
+						}
+					} finally {
+						keys.remove();
 					}
-					if (key.isConnectable()) {
-						handler.handleConnect(key);
-					}
-					if (key.isValid() && key.isReadable()) {
-						handler.handleRead(key);
-					}
-					if (key.isValid() && key.isWritable()) {
-						handler.handleWrite(key);
-					}
-					keys.remove();
 				}
 				long ms = tm.execute();
 				selectorTimeout = Math.min(ms, /*selectorTimeout*/ 250);

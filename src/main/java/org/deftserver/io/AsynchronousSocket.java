@@ -26,7 +26,7 @@ public class AsynchronousSocket implements IOHandler {
 	
 	private final IOLoop ioLoop;
 	
-	private final int DEFAULT_BYTEBUFFER_SIZE = 1024;
+	private final static int DEFAULT_BYTEBUFFER_SIZE = 1024;
 	
 	private final AsyncResult<String> nopAsyncStringResult = NopAsyncResult.of(String.class).nopAsyncResult;
 	private final AsyncResult<Boolean> nopAsyncBooleanResult = NopAsyncResult.of(Boolean.class).nopAsyncResult;
@@ -164,20 +164,33 @@ public class AsynchronousSocket implements IOHandler {
 		}
 	}
 	
+	protected static final ByteBuffer READ_BUFFER = ByteBuffer.allocate(DEFAULT_BYTEBUFFER_SIZE);
+	
 	/**
 	 * Should only be invoked by the IOLoop
 	 */
 	@Override
 	public void handleRead(SelectionKey key) throws IOException {
 		logger.debug("handle read...");
-		ByteBuffer buffer = ByteBuffer.allocate(DEFAULT_BYTEBUFFER_SIZE);
-		int read = ((SocketChannel) key.channel()).read(buffer);
+		SocketChannel socketChannel = ((SocketChannel) key.channel());
+		long bytesRead = 0;
+		int read = 0;
+		READ_BUFFER.clear();
+		if (READ_BUFFER.hasRemaining()) {
+			do {
+				read = socketChannel.read(READ_BUFFER);
+				if (read > 0) {
+					bytesRead += read;
+				}
+			} while (read > 0 && READ_BUFFER.hasRemaining());
+		}
+		READ_BUFFER.flip();
+		readBuffer.append(new String(READ_BUFFER.array(), 0, READ_BUFFER.limit(), Charsets.ISO_8859_1));
 		if (read == -1) {	// EOF
 			reachedEOF = true;
 			ioLoop.updateHandler(channel, interestOps &= ~SelectionKey.OP_READ);
 			return;
 		}
-		readBuffer.append(new String(buffer.array(), 0, buffer.position(), Charsets.ISO_8859_1));
 		logger.debug("readBuffer size: {}", readBuffer.length());
 		checkReadState();
 	}
@@ -272,7 +285,7 @@ public class AsynchronousSocket implements IOHandler {
 	private void invokeConnectFailureCallback(Exception e) {
 		AsyncResult<Boolean> cb = connectCallback;
 		connectCallback = nopAsyncBooleanResult;
-		cb.onFailure(e);;
+		cb.onFailure(e);
 	}
 
 	/**
@@ -291,18 +304,23 @@ public class AsynchronousSocket implements IOHandler {
 	 * If we succeed to write everything in writeBuffer, client write is finished => invoke writeCallback
 	 */
 	private void doWrite() {
-		int written = 0;
-		try {
-			if (((SocketChannel)channel).isConnected()) {
-				written = ((SocketChannel) channel).write(ByteBuffer.wrap(writeBuffer.toString().getBytes()));
+		SocketChannel sc = (SocketChannel)channel;
+		int bytesWritten = 0;
+		if (sc.isConnected()) {
+			try {
+				int written = 0;
+				do {
+					written = sc.write(ByteBuffer.wrap(writeBuffer.toString().getBytes(Charsets.ISO_8859_1)));
+					bytesWritten += written;
+				} while (written > 0 && sc.isConnected());
+			} catch (IOException e) {
+				logger.error("IOException during write: {}", e.getMessage());
+				invokeCloseCallback();
+				Closeables.closeQuietly(ioLoop, channel);
 			}
-		} catch (IOException e) {
-			logger.error("IOException during write: {}", e.getMessage());
-			invokeCloseCallback();
-			Closeables.closeQuietly(ioLoop, channel);
 		}
-		writeBuffer.delete(0, written);
-		logger.debug("wrote: {} bytes", written);
+		writeBuffer.delete(0, bytesWritten);
+		logger.debug("wrote: {} bytes", bytesWritten);
 		logger.debug("writeBuffer size: {}", writeBuffer.length());
 		if (writeBuffer.length() > 0) {
 			ioLoop.updateHandler(channel, interestOps |= SelectionKey.OP_WRITE);

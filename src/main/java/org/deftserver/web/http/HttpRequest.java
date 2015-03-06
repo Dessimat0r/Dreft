@@ -6,7 +6,6 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
-import java.nio.charset.Charset;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -30,14 +29,16 @@ public class HttpRequest {
 	private final HttpVerb method;
 	private final String requestedPath;	// correct name?
 	private final String version; 
-	private Map<String, String> headers;
-	private ImmutableMultimap<String, String> parameters;
+	private final Map<String, String> headers;
+	private final Map<String, String> um_headers;
+	private final ImmutableMultimap<String, String> parameters;
 	private String body = null;
-	private boolean keepAlive;
+	private final boolean keepAlive;
 	private InetAddress remoteHost;
 	private InetAddress serverHost;
 	private int remotePort;
 	private int serverPort;
+	private long flipRemain = -1;
 	
 	public class HeadKeyVals {
 		String key;
@@ -68,7 +69,7 @@ public class HttpRequest {
 		int         num                         = -1;
 		Map<String, HeadKeyVals> headKeyVals    = new LinkedHashMap<String, HttpRequest.HeadKeyVals>();
 		Map<String, HeadKeyVals> um_headKeyVals = Collections.unmodifiableMap(headKeyVals);
-		ByteBuffer  rawData                     = null;
+		byte[]      rawData                     = null;
 		String      data                        = null;
 		int         rawBufStartPos              = -1;
 		int         rawBufEndPos                = -1;
@@ -86,7 +87,7 @@ public class HttpRequest {
 			return um_headKeyVals;
 		}
 		
-		public ByteBuffer getRawData() {
+		public byte[] getRawData() {
 			return rawData;
 		}
 		
@@ -141,51 +142,71 @@ public class HttpRequest {
 	protected Map<String, Part> mpParts     = null;
 	protected Map<String, Part> um_mpParts  = null;
 	protected Part              currPart    = null;
+	protected final int         requestNum;
 	
 	/**
 	 * Creates a new HttpRequest 
 	 * @param requestLine The Http request text line
 	 * @param headers The Http request headers
 	 */
-	public HttpRequest(String requestLine, Map<String, String> headers) {
+	public HttpRequest(int requestNum, String requestLine, Map<String, String> headers, ByteBuffer buffer) {
+		this.requestNum  = requestNum;
 		this.requestLine = requestLine;
-		String[] elements = REQUEST_LINE_PATTERN.split(requestLine);
-		method = HttpVerb.valueOf(elements[0]);
-		String[] pathFrags = QUERY_STRING_PATTERN.split(elements[1]);
-		requestedPath = pathFrags[0];
-		version = elements[2];
-		this.headers = headers;
-		
-		if (method == HttpVerb.POST) {
-			String ctype = headers.get("content-type");
-			if (ctype == null) throw new IllegalArgumentException("no content type for POST");
-			contentTypeArr = HEADER_VAL_SPLIT_PATTERN.split(ctype);
-			contentTypeArr[0] = contentTypeArr[0].trim();
-			if (contentTypeArr[0].equals("multipart/form-data")) {
-				String[] mparr = contentTypeArr[1].split("=");
-				if (mparr.length < 2 || !mparr[0].equals("boundary")) {
-					throw new IllegalArgumentException("Expected mp boundary string, got " + contentTypeArr[1]);
+		if (requestLine != null && headers != null) {
+			String[] elements = REQUEST_LINE_PATTERN.split(requestLine);
+			method = HttpVerb.valueOf(elements[0]);
+			String[] pathFrags = QUERY_STRING_PATTERN.split(elements[1]);
+			requestedPath = pathFrags[0];
+			version = elements[2];
+			this.headers = new HashMap<String, String>(headers);
+			this.um_headers = Collections.unmodifiableMap(this.headers);
+			
+			if (method == HttpVerb.POST) {
+				String ctype = headers.get("content-type");
+				if (ctype == null) throw new IllegalArgumentException("no content type for POST");
+				contentTypeArr = HEADER_VAL_SPLIT_PATTERN.split(ctype);
+				contentTypeArr[0] = contentTypeArr[0].trim();
+				if (contentTypeArr[0].equals("multipart/form-data")) {
+					String[] mparr = contentTypeArr[1].split("=");
+					if (mparr.length < 2 || !mparr[0].equals("boundary")) {
+						throw new IllegalArgumentException("Expected mp boundary string, got " + contentTypeArr[1]);
+					}
+					multipartBoundary = mparr[1];
+					System.out.println("got multipart boundary: " + multipartBoundary);
+					multipartBoundaryB = multipartBoundary.getBytes(Charsets.ISO_8859_1);
+					mpBoundaryBStart  = ("--" + multipartBoundary + "\r\n").getBytes(Charsets.ISO_8859_1);
+					mpBoundaryBActual  = ("\r\n--" + multipartBoundary + "\r\n").getBytes(Charsets.ISO_8859_1);
+					mpBoundaryBFinish  = ("\r\n--" + multipartBoundary + "--\r\n").getBytes(Charsets.ISO_8859_1);
+					multipart = true;
+					mpParts = new LinkedHashMap<String, HttpRequest.Part>();
+					um_mpParts = Collections.unmodifiableMap(mpParts);
 				}
-				multipartBoundary = mparr[1];
-				System.out.println("got multipart boundary: " + multipartBoundary);
-				multipartBoundaryB = multipartBoundary.getBytes(Charsets.ISO_8859_1);
-				mpBoundaryBStart  = ("--" + multipartBoundary + "\r\n").getBytes(Charsets.ISO_8859_1);
-				mpBoundaryBActual  = ("\r\n--" + multipartBoundary + "\r\n").getBytes(Charsets.ISO_8859_1);
-				mpBoundaryBFinish  = ("\r\n--" + multipartBoundary + "--\r\n").getBytes(Charsets.ISO_8859_1);
-				multipart = true;
-				mpParts = new LinkedHashMap<String, HttpRequest.Part>();
-				um_mpParts = Collections.unmodifiableMap(mpParts);
+				String clen = headers.get("content-length");
+				if (clen == null) throw new IllegalArgumentException("no content length for POST");
+				contentLength = Integer.parseInt(clen);
+				if (contentLength <= 0) throw new IllegalArgumentException("content-length <= 0!");
+				rawBody = ByteBuffer.allocate(contentLength);
 			}
-			String clen = headers.get("content-length");
-			if (clen == null) throw new IllegalArgumentException("no content length for POST");
-			contentLength = Integer.parseInt(clen);
-			if (contentLength <= 0) throw new IllegalArgumentException("content-length <= 0!");
-			rawBody = ByteBuffer.allocate(contentLength);
+			parameters = parseParameters(elements[1]);
 		} else {
-			complete = true;
+			version = null;
+			requestedPath = null;
+			method = null;
+			this.headers = null;
+			this.um_headers = null;
+			parameters = null;
 		}
-		initKeepAlive();
-		parameters = parseParameters(elements[1]);
+		String connection = getHeader("Connection");
+		if (connection == null) {
+			keepAlive = true;
+		} else if ("keep-alive".equalsIgnoreCase(connection)) { 
+			keepAlive = true;
+		} else if ("close".equalsIgnoreCase(connection) || (requestLine != null && requestLine.contains("1.0"))) {
+			keepAlive = false;
+		} else {
+			keepAlive = true;
+		}
+		putContentData(false, buffer);
 	}
 	
 	public static String streamHeadersToString(final InputStream inputStream) throws IOException {
@@ -194,71 +215,72 @@ public class HttpRequest {
 		}
 	}
 	
+	public long getRemaining() {
+		return complete ? 0 : rawBody.remaining();
+	}
+	
 	public boolean isComplete() {
 		return complete;
 	}
 	
-	public static HttpRequest of(ByteBuffer buffer) {
+	public static HttpRequest of(int requestNum, ByteBuffer buffer) {
 		try {
-			String raw = new String(buffer.array(), 0, buffer.limit(), Charsets.ISO_8859_1);
-			System.out.println("raw httpreq. (of), pos: " + buffer.position() + ", limit: " + buffer.limit() + ", buf: " + raw);
-			
-			int oldpos = buffer.position();
-			boolean found = findInBB(buffer, HTTP_HEAD_TERM_BYTES);
-			if (!found) throw new IllegalArgumentException("Expected body seperator for initial HTTP req, none found");
-			int buflimit = buffer.limit();
-			int bodystartpos = buffer.position();
-			buffer.limit(bodystartpos);
-			buffer.position(oldpos);
-			
-			Map<String, String> generalHeaders = new HashMap<String, String>();
-			try (
-				ByteBufferBackedInputStream bbbis = new ByteBufferBackedInputStream(buffer);
-			) {
-				boolean sepfound = false;				
-				String requestLine = null;
-				try (
-					InputStreamReader isr = new InputStreamReader(bbbis, Charsets.ISO_8859_1);
-					BufferedReader br = new BufferedReader(isr)
-				) {
-					String line = br.readLine(); // request line
-					requestLine = line;
-					if (requestLine == null || (requestLine = requestLine.trim()).isEmpty()) {
-						throw new IllegalArgumentException("Request line is empty/missing!");
-					}
-					System.out.println("got req. line: " + requestLine);
-					while ((line = br.readLine()) != null) {
-						if (line.contains(": ")) {
-							//TODO: optimise this
-							String[] splitLine = HEADER_VALUE_PATTERN.split(line);
-							String   key       = splitLine[0].trim().toLowerCase();
-							String   val       = splitLine[1].trim();
-							generalHeaders.put(key, val);
-						}
-						if (line.isEmpty()) {
-							sepfound = true;
-							break;
-						}
-					}
-				}
-				if (!sepfound) throw new IOException("Excepected body seperator, still parsing headers");
+			String requestLine = null;
+			Map<String, String> generalHeaders = null;
+			if (buffer.hasRemaining()) {
+				// not basic keep-alive
+				//String raw = new String(buffer.array(), 0, buffer.limit(), Charsets.ISO_8859_1);
+				//System.out.println("raw httpreq. (of), pos: " + buffer.position() + ", limit: " + buffer.limit() + ", buf: " + raw);
 				
-				buffer.limit(buflimit);
-				buffer.position(bodystartpos);
-				System.out.println("buffer remaining: " + buffer.remaining());
-					
-				HttpRequest req = new HttpRequest(requestLine, generalHeaders);
-				// only do this for POST
-				if (req.getMethod() == HttpVerb.POST) {
-					System.out.println("got HTTP post, buffer pos: " + buffer.position() + ", limit: " + buffer.limit());
-					req.putContentData(false, buffer);
-				} else {
-					System.out.println("normal req, buffer pos->limit, curr pos: " + buffer.position() + ", limit: " + buffer.limit());
-					buffer.position(buffer.limit());
-					req.complete = true;
+				int oldpos = buffer.position();
+				boolean foundSep = findInBB(buffer, HTTP_HEAD_TERM_BYTES);
+				if (!foundSep) {
+					String raw = new String(buffer.array(), 0, buffer.limit(), Charsets.ISO_8859_1);
+					System.out.println("raw httpreq. (of), pos: " + buffer.position() + ", limit: " + buffer.limit() + ", buf: " + raw);
+					throw new IllegalArgumentException("Expected body seperator for initial HTTP req, none found");
 				}
-				return req;
+				int buflimit = buffer.limit();
+				int bodystartpos = buffer.position();
+				buffer.limit(bodystartpos);
+				buffer.position(oldpos);
+				
+				generalHeaders = new HashMap<String, String>();
+				try (
+					ByteBufferBackedInputStream bbbis = new ByteBufferBackedInputStream(buffer);
+				) {
+					boolean sepfound = false;				
+					try (
+						InputStreamReader isr = new InputStreamReader(bbbis, Charsets.ISO_8859_1);
+						BufferedReader br = new BufferedReader(isr)
+					) {
+						String line = br.readLine(); // request line
+						requestLine = line;
+						if (requestLine == null || (requestLine = requestLine.trim()).isEmpty()) {
+							throw new IllegalArgumentException("Request line is empty/missing!");
+						}
+						System.out.println("got req. line: " + requestLine);
+						while ((line = br.readLine()) != null) {
+							if (line.contains(": ")) {
+								//TODO: optimise this
+								String[] splitLine = HEADER_VALUE_PATTERN.split(line);
+								String   key       = splitLine[0].trim().toLowerCase();
+								String   val       = splitLine[1].trim();
+								generalHeaders.put(key, val);
+							}
+							if (line.isEmpty()) {
+								sepfound = true;
+								break;
+							}
+						}
+					}
+					if (!sepfound) throw new IOException("Excepected body seperator, still parsing headers");
+					
+					buffer.limit(buflimit);
+					buffer.position(bodystartpos);
+					System.out.println("buffer remaining: " + buffer.remaining());
+				}
 			}
+			return new HttpRequest(requestNum, requestLine, generalHeaders, buffer);
 		} catch (Exception t) {
 			System.out.println("malformed http req. (of): exception");
 			t.printStackTrace();
@@ -274,12 +296,20 @@ public class HttpRequest {
 		return multipart;
 	}
 	
+	public int getRequestNum() {
+		return requestNum;
+	}
+	
 	/**
 	 * Returns true if got all content data
 	 * @param buffer
 	 * @return
 	 */
 	public boolean putContentData(boolean continuing, ByteBuffer buffer) {
+		if ((buffer == null || !buffer.hasRemaining()) && !continuing) {
+			complete = true;
+			return true;
+		}
 		if (method != HttpVerb.POST) {
 			throw new IllegalStateException("Method not POST");
 		}
@@ -287,22 +317,23 @@ public class HttpRequest {
 		// to set it up for reading that new data.
 		int oldRawPos = rawBody.position();
 		System.out.println("rawbody pos (pre buffer dump): " + rawBody.position() + ", limit: " + rawBody.limit());
+		System.out.println("buffer remaining: " + buffer.remaining() + ", rawbody new pos: " + (rawBody.position() + buffer.remaining()));
 		rawBody.put(buffer);
 		System.out.println("rawbody pos (post buffer dump): " + rawBody.position() + ", limit: " + rawBody.limit());
 		if (!rawBody.hasRemaining()) {
+			flipRemain = buffer.remaining();
 			rawBody.flip();
+			if (!multipart) {
+				body = new String(rawBody.array(), 0, rawBody.limit(), Charsets.ISO_8859_1);
+			}
 			complete = true;
 		}
 		if (!complete) return false;
 		
 		System.out.println("complete, now parsing");
 		
-		String raw = new String(rawBody.array(), 0, rawBody.limit(), Charsets.ISO_8859_1);
-		System.out.println("raw putContentData. (of), pos: " + rawBody.position() + ", limit: " + rawBody.limit() + ", buf: " + raw);
-		
-		if (!multipart) {
-			body = new String(rawBody.array(), 0, rawBody.limit(), Charsets.ISO_8859_1);
-		}
+		//String raw = new String(rawBody.array(), 0, rawBody.limit(), Charsets.ISO_8859_1);
+		//System.out.println("raw putContentData. (of), pos: " + rawBody.position() + ", limit: " + rawBody.limit() + ", buf: " + raw);
 		
 		try (ByteBufferBackedInputStream bbbis = new ByteBufferBackedInputStream(rawBody)) {
 			boolean initial = true;
@@ -399,9 +430,10 @@ public class HttpRequest {
 					int rawBodyOldLimit = rawBody.limit();
 					rawBody.limit(currPart.rawBufEndPos);
 					rawBody.position(currPart.rawBufStartPos);
-					currPart.rawData = ByteBuffer.allocate(currPart.rawBufEndPos-currPart.rawBufStartPos);
-					currPart.rawData.put(rawBody);
-					currPart.rawData.flip();
+					ByteBuffer bb = ByteBuffer.allocate(currPart.rawBufEndPos-currPart.rawBufStartPos);
+					bb.put(rawBody).flip();
+					//XXX: check that array doesn't disappear when bytebuffer gets gc'ed
+					currPart.rawData = bb.array();
 					rawBody.limit(rawBodyOldLimit);
 					rawBody.position(rawBodyOldPos);
 					currPart.complete = true;
@@ -441,10 +473,11 @@ public class HttpRequest {
 	}
 	
 	public Map<String, String> getHeaders() {
-		return Collections.unmodifiableMap(headers);
+		return headers == null ? null : Collections.unmodifiableMap(headers);
 	}
 	
 	public String getHeader(String name) {
+		if (headers == null) return null;
 		return headers.get(name.toLowerCase());
 	}
 	
@@ -481,6 +514,10 @@ public class HttpRequest {
 		}
 		System.out.println("hkv: " + hkv);
 		return hkv;
+	}
+	
+	public long getFlipRemain() {
+		return flipRemain;
 	}
 	
 	/**
@@ -588,18 +625,6 @@ public class HttpRequest {
 			}
 		}
 		return builder.build();
-	}
-	
-	
-	private void initKeepAlive() {
-		String connection = getHeader("Connection");
-		if ("keep-alive".equalsIgnoreCase(connection)) { 
-			keepAlive = true;
-		} else if ("close".equalsIgnoreCase(connection) || requestLine.contains("1.0")) {
-			keepAlive = false;
-		} else {
-			keepAlive = true;
-		}
 	}
 	
 	public static final boolean findInBB(ByteBuffer buffer, byte[] bytes) {

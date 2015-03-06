@@ -9,7 +9,7 @@ public class MalFormedHttpRequest extends HttpRequest {
 	
 	/* Dummy HttpRequest that represents a malformed client HTTP request */
 	private MalFormedHttpRequest() {
-		super("GET / Mal formed request\r\n", Maps.<String, String>newHashMap());
+		super(-1, "GET / Mal formed request\r\n", Maps.<String, String>newHashMap(), null);
 	}
 
 }

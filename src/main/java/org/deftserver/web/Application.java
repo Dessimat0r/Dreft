@@ -1,6 +1,7 @@
 package org.deftserver.web;
 
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
 import org.deftserver.util.HttpUtil;
@@ -14,6 +15,7 @@ import org.deftserver.web.http.HttpRequest;
 import com.google.common.collect.ImmutableMap;
 
 public class Application {
+	public final AtomicInteger requestNum = new AtomicInteger(0);
 	
 	/**
 	 * "Normal/Absolute" (non group capturing) RequestHandlers
@@ -112,6 +114,10 @@ public class Application {
 			}
 		}
 		return null;
+	}
+	
+	public int nextHttpReqNum() {
+		return requestNum.getAndIncrement();
 	}
 	
 	private RequestHandler getStaticContentHandler(String path) {

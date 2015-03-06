@@ -16,6 +16,6 @@ public interface IOHandler {
 	
 	void handleRead(SelectionKey key) throws IOException;
 	
-	void handleWrite(SelectionKey key);
+	void handleWrite(SelectionKey key) throws IOException;
 	
 }

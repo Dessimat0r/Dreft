@@ -3,7 +3,9 @@ package org.deftserver.web.http;
 import static org.deftserver.web.http.HttpServerDescriptor.KEEP_ALIVE_TIMEOUT;
 import static org.deftserver.web.http.HttpServerDescriptor.READ_BUFFER_SIZE;
 
+import java.io.EOFException;
 import java.io.IOException;
+import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.ClosedChannelException;
@@ -52,6 +54,7 @@ public class HttpProtocol implements IOHandler {
 		if (clientChannel != null) {
 			// could be null in a multithreaded deft environment because another ioloop was "faster" to accept()
 			clientChannel.configureBlocking(false);
+			clientChannel.setOption(StandardSocketOptions.TCP_NODELAY, Boolean.TRUE);
 			ioLoop.addHandler(clientChannel, this, SelectionKey.OP_READ, ByteBuffer.allocate(READ_BUFFER_SIZE));
 		}
 	}
@@ -68,14 +71,15 @@ public class HttpProtocol implements IOHandler {
 		logger.debug("handle read 2...");
 		HttpRequest request = getHttpRequest(key, clientChannel);
 		if (request == null) {
+			System.out.println("null request (no data)");
 			return;
 		}
 		logger.debug("handle read 3..., req class: " + request.getClass().toString() + ", req: " + request);
 		
 		if (request.isKeepAlive()) {
 			ioLoop.addKeepAliveTimeout(
-					clientChannel, 
-					Timeout.newKeepAliveTimeout(ioLoop, clientChannel, KEEP_ALIVE_TIMEOUT)
+				clientChannel, 
+				Timeout.newKeepAliveTimeout(ioLoop, clientChannel, KEEP_ALIVE_TIMEOUT)
 			);
 		}
 		logger.debug("handle read 4...");
@@ -93,14 +97,22 @@ public class HttpProtocol implements IOHandler {
 	}
 
 	@Override
-	public void handleWrite(SelectionKey key) {
+	public void handleWrite(SelectionKey key) throws IOException {
 		logger.debug("handle write...");
 		SocketChannel channel = ((SocketChannel) key.channel());
 
 		if (key.attachment() instanceof MappedByteBuffer) {
+			System.out.println("mbb write #1");
 			writeMappedByteBuffer(key, channel);
+			System.out.println("mbb write #2");
 		} else if (key.attachment() instanceof DynamicByteBuffer) {
+			System.out.println("dbb write #1");
 			writeDynamicByteBuffer(key, channel);
+			System.out.println("dbb write #2");
+		} else if (key.attachment() instanceof ByteBuffer) {
+			System.out.println("bb write #1");
+			writeByteBuffer(key, channel);
+			System.out.println("bb write #2");
 		}
 		if (ioLoop.hasKeepAliveTimeout(channel)) {
 			prolongKeepAliveTimeout(channel);
@@ -108,11 +120,18 @@ public class HttpProtocol implements IOHandler {
 
 	}
 
-	private void writeMappedByteBuffer(SelectionKey key, SocketChannel channel) {
+	private long writeMappedByteBuffer(SelectionKey key, SocketChannel channel) {
+		long bytesWritten = 0;
 		MappedByteBuffer mbb = (MappedByteBuffer) key.attachment();
 		if (mbb.hasRemaining()) {
 			try {
-				channel.write(mbb);
+				int written = 0;
+				do {
+					written = channel.write(mbb);
+					if (written > 0) {
+						bytesWritten += written;
+					}
+				} while (channel.isConnected() && written > 0 && mbb.hasRemaining());
 			} catch (IOException e) {
 				logger.error("Failed to send data to client: {}", e.getMessage());
 				Closeables.closeQuietly(channel);
@@ -121,27 +140,66 @@ public class HttpProtocol implements IOHandler {
 		if (!mbb.hasRemaining()) {
 			closeOrRegisterForRead(key);
 		}
+		return bytesWritten;
 	}
 	
-	private void writeDynamicByteBuffer(SelectionKey key, SocketChannel channel) {
+	private long writeDynamicByteBuffer(SelectionKey key, SocketChannel channel) {
 		DynamicByteBuffer dbb = (DynamicByteBuffer) key.attachment();
 		logger.debug("pending data about to be written");
 		ByteBuffer toSend = dbb.getByteBuffer();
-		toSend.flip(); // prepare for write
+		//toSend.flip(); // prepare for write
 		long bytesWritten = 0;
-		try {
-			bytesWritten = channel.write(toSend);
-		} catch (IOException e) {
-			logger.error("Failed to send data to client: {}", e.getMessage());
-			Closeables.closeQuietly(channel);
+		if (toSend.hasRemaining()) {
+			try {
+				int written = 0;
+				do {
+					written = channel.write(toSend);
+					if (written > 0) {
+						bytesWritten += written;
+					}
+				} while (channel.isConnected() && written > 0 && toSend.hasRemaining());
+			} catch (IOException e) {
+				logger.error("Failed to send data to client: {}", e.getMessage());
+				Closeables.closeQuietly(channel);
+			}
+			logger.debug("sent {} bytes to wire", bytesWritten);
 		}
-		logger.debug("sent {} bytes to wire", bytesWritten);
 		if (!toSend.hasRemaining()) {
 			logger.debug("sent all data in toSend buffer");
 			closeOrRegisterForRead(key); // should probably only be done if the HttpResponse is finished
 		} else {
 			toSend.compact(); // make room for more data be "read" in
 		}
+		return bytesWritten;
+	}
+	
+	private long writeByteBuffer(SelectionKey key, SocketChannel channel) {
+		ByteBuffer toSend = (ByteBuffer) key.attachment();
+		logger.debug("pending data about to be written");
+		//toSend.flip(); // prepare for write
+		long bytesWritten = 0;
+		if (toSend.hasRemaining()) {
+			try {
+				int written = 0;
+				do {
+					written = channel.write(toSend);
+					if (written > 0) {
+						bytesWritten += written;
+					}
+				} while (channel.isConnected() && written > 0 && toSend.hasRemaining());
+			} catch (IOException e) {
+				logger.error("Failed to send data to client: {}", e.getMessage());
+				Closeables.closeQuietly(channel);
+			}
+			logger.debug("sent {} bytes to wire", bytesWritten);
+		}
+		if (!toSend.hasRemaining()) {
+			logger.debug("sent all data in toSend buffer");
+			closeOrRegisterForRead(key); // should probably only be done if the HttpResponse is finished
+		} else {
+			toSend.compact(); // make room for more data be "read" in
+		}
+		return bytesWritten;
 	}
 
 	public void closeOrRegisterForRead(SelectionKey key) {
@@ -193,38 +251,99 @@ public class HttpProtocol implements IOHandler {
 		attachment.clear(); // prepare for reuse
 		return attachment;
 	}
-
+	
+	/*
 	private HttpRequest getHttpRequest(SelectionKey key, SocketChannel clientChannel) {
+		DynamicByteBuffer buffer = (DynamicByteBuffer) key.attachment();
+		long bytesRead = 0;
+		boolean error = false;
 		try {
-			ByteBuffer buffer = (ByteBuffer) key.attachment();
-			buffer.clear();
-			clientChannel.read(buffer);
-			buffer.flip();
-			return doGetHttpRequest(key, clientChannel, buffer);
+			int read = 0;
+			do {
+				READ_BUFFER.clear();
+				read = clientChannel.read(READ_BUFFER);
+				bytesRead += read;
+				READ_BUFFER.flip();
+				buffer.put(READ_BUFFER);
+			} while (read > 0 && buffer.hasRemaining());
 		} catch (IOException e) {
 			logger.warn("Could not read buffer: {}", e.getMessage());
 			Closeables.closeQuietly(ioLoop, clientChannel);
+			error = true;
+		}
+		int oldpos   = buffer.getByteBuffer().position();
+		int oldlimit = buffer.getByteBuffer().limit();
+		buffer.getByteBuffer().flip();
+		int fpos   = buffer.getByteBuffer().position();
+		int flimit = buffer.getByteBuffer().limit();
+		boolean found = HttpRequest.findInBB(buffer.getByteBuffer(), HttpRequest.HTTP_HEAD_TERM_BYTES);
+		if (!found) {
+			// found nothing
+			buffer.getByteBuffer().limit(oldlimit);
+			buffer.getByteBuffer().position(oldpos);
+			if (error) {
+				System.out.println("buffer cleared");
+				buffer.getByteBuffer().clear();
+			}
+			return null;
+		}
+		System.out.println("found HTTP_HEAD_TERM_BYTES");
+		try {
+			int foundpos = buffer.position();
+			buffer.getByteBuffer().limit(flimit);
+			buffer.getByteBuffer().position(fpos);
+			HttpRequest req = doGetHttpRequest(key, clientChannel, buffer.getByteBuffer());
+			return req;
+		} finally {
+			System.out.println("buffer cleared");
+			buffer.getByteBuffer().clear();
+		}
+	}
+	*/
+
+	//TODO: change this to work with the entire stream rather than individual calls (no guarantee the client sends their data wholly in discrete packets)
+	private HttpRequest getHttpRequest(SelectionKey key, SocketChannel clientChannel) throws IOException {
+		ByteBuffer buffer = (ByteBuffer) key.attachment();
+		buffer.clear();
+		if (!buffer.hasRemaining()) throw new IllegalStateException("Cleared channel buffer has no remaining space.");
+		long bytesRead = 0;
+		int read = 0;
+		do {
+			read = clientChannel.read(buffer);
+			if (read > 0) {
+				bytesRead += read;
+			}
+		} while (read > 0 && buffer.hasRemaining());
+		try {
+			buffer.flip();
+			logger.debug("getHttpRequest bytesRead: {}, buffer remaining: {}", bytesRead, buffer.remaining());
+			//System.out.println("raw: " + new String(buffer.array(), 0, buffer.remaining(), Charsets.ISO_8859_1));
+			if (read == -1) logger.debug("EOF in getHttpRequest(..) #2, bytesRead: {}, buffer remaining: {}", bytesRead, buffer.remaining());
+			if (read >= 0 || (read == -1 && buffer.hasRemaining())) {
+				return doGetHttpRequest(key, clientChannel, buffer);
+			}
+		} finally {
+			if (read == -1) throw new EOFException("EOF in getHttpRequest");
 		}
 		return null;
 	}
 	
 	private HttpRequest doGetHttpRequest(SelectionKey key, SocketChannel clientChannel, ByteBuffer buffer) {
 		//do we have any unfinished http post requests for this channel?
-		HttpRequest request = null;
-		if (partials.containsKey(clientChannel)) {
-			System.out.println("continuing to parse partial http request");
-			request = partials.get(clientChannel);
+		HttpRequest request = partials.get(clientChannel);
+		if (request != null) {
+			logger.debug("continuing to parse partial http request - http req #{}, remaining: {}", request.getRequestNum(), request.getRemaining());
 			if (request.putContentData(true, buffer)) {	// if received the entire payload/body
-				System.out.println("entire partial http request received, removing");
+				logger.debug("entire partial http request received, removing - http req #{}, remaining: {}, flipremain: {}", request.getRequestNum(), request.getRemaining(), request.getFlipRemain());
 				partials.remove(clientChannel);
 			}
 		} else {
-			request = HttpRequest.of(buffer);
+			request = HttpRequest.of(application.nextHttpReqNum(), buffer);
 			if (!request.isComplete()) {
-				System.out.println("adding partial http request");
+				logger.debug("adding partial http request - http req #{}, remaining: {}", request.getRequestNum(), request.getRemaining());
 				partials.put(key.channel(), request);
 			} else {
-				System.out.println("normal HttpRequest");
+				logger.debug("normal HttpRequest");
 			}
 		}
 		//set extra request info
