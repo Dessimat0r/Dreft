@@ -130,7 +130,7 @@ public class HttpProtocol implements IOHandler {
 				if (written > 0) {
 					bytesWritten += written;
 				}
-			} while (channel.isConnected() && written > 0 && mbb.hasRemaining());
+			} while (written > 0 && mbb.hasRemaining());
 		}
 		logger.debug("sent {} bytes to wire", bytesWritten);
 		if (!mbb.hasRemaining()) {
@@ -154,7 +154,7 @@ public class HttpProtocol implements IOHandler {
 				if (written > 0) {
 					bytesWritten += written;
 				}
-			} while (channel.isConnected() && written > 0 && toSend.hasRemaining());
+			} while (written > 0 && toSend.hasRemaining());
 		}
 		logger.debug("sent {} bytes to wire", bytesWritten);
 		if (!toSend.hasRemaining()) {
@@ -179,7 +179,7 @@ public class HttpProtocol implements IOHandler {
 				if (written > 0) {
 					bytesWritten += written;
 				}
-			} while (channel.isConnected() && written > 0 && toSend.hasRemaining());
+			} while (written > 0 && toSend.hasRemaining());
 			logger.debug("sent {} bytes to wire", bytesWritten);
 		}
 		if (!toSend.hasRemaining()) {
