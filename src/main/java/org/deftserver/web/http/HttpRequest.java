@@ -431,7 +431,7 @@ public class HttpRequest {
 					rawBody.limit(currPart.rawBufEndPos);
 					rawBody.position(currPart.rawBufStartPos);
 					ByteBuffer bb = ByteBuffer.allocate(currPart.rawBufEndPos-currPart.rawBufStartPos);
-					bb.put(rawBody).flip();
+					bb.put(rawBody);
 					//XXX: check that array doesn't disappear when bytebuffer gets gc'ed
 					currPart.rawData = bb.array();
 					rawBody.limit(rawBodyOldLimit);

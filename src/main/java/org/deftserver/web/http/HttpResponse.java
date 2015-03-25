@@ -127,7 +127,7 @@ public class HttpResponse {
 				} while (written > 0 && mbb.hasRemaining() && clientChannel.isOpen());
 			}
 			if (!mbb.hasRemaining()) {
-				protocol.closeOrRegisterForRead(key);
+				protocol.registerForRead(key);
 			}
 		} else {
 			if (clientChannel.isOpen()) {
@@ -143,15 +143,15 @@ public class HttpResponse {
 			if (key.attachment() instanceof DynamicByteBuffer) {
 				DynamicByteBuffer dbb = (DynamicByteBuffer) key.attachment();
 				if (!dbb.hasRemaining()) {
-					protocol.closeOrRegisterForRead(key);
+					protocol.registerForRead(key);
 				}
 			} else if (key.attachment() instanceof ByteBuffer) {
 				 ByteBuffer bb = (ByteBuffer)key.attachment();
 				 if (!bb.hasRemaining()) {
-					 protocol.closeOrRegisterForRead(key);
+					 protocol.registerForRead(key);
 				 }
 			} else {
-				protocol.closeOrRegisterForRead(key);
+				protocol.registerForRead(key);
 			}
 		}
 		return bytesWritten;

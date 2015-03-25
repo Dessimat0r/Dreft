@@ -134,7 +134,7 @@ public class HttpProtocol implements IOHandler {
 		}
 		logger.debug("sent {} bytes to wire", bytesWritten);
 		if (!mbb.hasRemaining()) {
-			closeOrRegisterForRead(key);
+			registerForRead(key);
 		} else {
 			key.interestOps(SelectionKey.OP_WRITE);
 		}
@@ -145,7 +145,7 @@ public class HttpProtocol implements IOHandler {
 		DynamicByteBuffer dbb = (DynamicByteBuffer) key.attachment();
 		logger.debug("pending data about to be written");
 		ByteBuffer toSend = dbb.getByteBuffer();
-		//toSend.flip(); // prepare for write
+		toSend.flip(); // prepare for write
 		long bytesWritten = 0;
 		if (toSend.hasRemaining()) {
 			int written = 0;
@@ -159,7 +159,7 @@ public class HttpProtocol implements IOHandler {
 		logger.debug("sent {} bytes to wire", bytesWritten);
 		if (!toSend.hasRemaining()) {
 			logger.debug("sent all data in toSend buffer");
-			closeOrRegisterForRead(key); // should probably only be done if the HttpResponse is finished
+			registerForRead(key); // should probably only be done if the HttpResponse is finished
 		} else {
 			toSend.compact(); // make room for more data be "read" in
 			key.interestOps(SelectionKey.OP_WRITE);
@@ -170,7 +170,7 @@ public class HttpProtocol implements IOHandler {
 	private long writeByteBuffer(SelectionKey key, SocketChannel channel) throws IOException {
 		ByteBuffer toSend = (ByteBuffer) key.attachment();
 		logger.debug("pending data about to be written");
-		//toSend.flip(); // prepare for write
+		toSend.flip(); // prepare for write
 		long bytesWritten = 0;
 		if (toSend.hasRemaining()) {
 			int written = 0;
@@ -184,36 +184,26 @@ public class HttpProtocol implements IOHandler {
 		}
 		if (!toSend.hasRemaining()) {
 			logger.debug("sent all data in toSend buffer");
-			closeOrRegisterForRead(key); // should probably only be done if the HttpResponse is finished
+			registerForRead(key); // should probably only be done if the HttpResponse is finished
 		} else {
 			toSend.compact(); // make room for more data be "read" in
 			key.interestOps(SelectionKey.OP_WRITE);
-			
 		}
 		return bytesWritten;
 	}
 
-	public void closeOrRegisterForRead(SelectionKey key) {
+	public void registerForRead(SelectionKey key) throws IOException {
 		if (key.isValid() && ioLoop.hasKeepAliveTimeout(key.channel())) {
-			try {
-				key.channel().register(key.selector(), SelectionKey.OP_READ, reuseAttachment(key));
-				prolongKeepAliveTimeout(key.channel());
-				logger.debug("keep-alive connection. registrating for read.");
-			} catch (ClosedChannelException e) {
-				logger.debug("ClosedChannelException while registrating key for read: {}", e.getMessage());
-				Closeables.closeQuietly(ioLoop, key.channel());
-			}		
-		} else {
-			// http request should be finished and no 'keep-alive' => close connection
-			logger.debug("Closing finished (non keep-alive) http connection"); 
-			Closeables.closeQuietly(ioLoop, key.channel());
+			key.channel().register(key.selector(), SelectionKey.OP_READ, reuseAttachment(key));
+			prolongKeepAliveTimeout(key.channel());
+			logger.debug("keep-alive connection. registrating for read.");
 		}
 	}
 	
 	public void prolongKeepAliveTimeout(SelectableChannel channel) {
 		ioLoop.addKeepAliveTimeout(
-				channel, 
-				Timeout.newKeepAliveTimeout(ioLoop, channel, KEEP_ALIVE_TIMEOUT)
+			channel, 
+			Timeout.newKeepAliveTimeout(ioLoop, channel, KEEP_ALIVE_TIMEOUT)
 		);
 	}
 	
@@ -301,22 +291,13 @@ public class HttpProtocol implements IOHandler {
 		int read = 0;
 		do {
 			read = clientChannel.read(buffer);
-			if (read > 0) {
-				bytesRead += read;
-			}
+			if (read == -1) throw new EOFException();
+			else bytesRead += read;
 		} while (read > 0 && buffer.hasRemaining());
-		try {
-			buffer.flip();
-			logger.debug("getHttpRequest bytesRead: {}, buffer remaining: {}", bytesRead, buffer.remaining());
-			//System.out.println("raw: " + new String(buffer.array(), 0, buffer.remaining(), Charsets.ISO_8859_1));
-			if (read == -1) logger.debug("EOF in getHttpRequest(..) #2, bytesRead: {}, buffer remaining: {}", bytesRead, buffer.remaining());
-			if (read >= 0 || (read == -1 && buffer.hasRemaining())) {
-				return doGetHttpRequest(key, clientChannel, buffer);
-			}
-		} finally {
-			if (read == -1) throw new EOFException("EOF in getHttpRequest");
-		}
-		return null;
+		buffer.flip();
+		logger.debug("getHttpRequest bytesRead: {}, buffer remaining: {}", bytesRead, buffer.remaining());
+		//System.out.println("raw: " + new String(buffer.array(), 0, buffer.remaining(), Charsets.ISO_8859_1));
+		return doGetHttpRequest(key, clientChannel, buffer);
 	}
 	
 	private HttpRequest doGetHttpRequest(SelectionKey key, SocketChannel clientChannel, ByteBuffer buffer) {
