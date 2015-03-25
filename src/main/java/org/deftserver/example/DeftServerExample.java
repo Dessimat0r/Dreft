@@ -1,5 +1,6 @@
 package org.deftserver.example;
 
+import java.io.IOException;
 import java.util.Map;
 
 import org.deftserver.io.IOLoop;
@@ -23,12 +24,12 @@ public class DeftServerExample {
 	private static class ExampleRequestHandler extends RequestHandler {
 
 		@Override
-		public void get(HttpRequest request, HttpResponse response) {
+		public void get(HttpRequest request, HttpResponse response) throws IOException {
 			response.write("hello world");
 		}
 		
 		@Override
-		public void post(HttpRequest request, HttpResponse response) {
+		public void post(HttpRequest request, HttpResponse response)  throws IOException {
 			response.write("hello post world\nbody: " + request.getBody());
 		}
 

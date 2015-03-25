@@ -1,5 +1,7 @@
 package org.deftserver.web.http;
 
+import java.io.IOException;
+
 import org.deftserver.web.HttpVerb;
 import org.deftserver.web.handler.RequestHandler;
 import org.slf4j.Logger;
@@ -9,7 +11,7 @@ public class HttpRequestDispatcher {
 
 	private static final Logger logger = LoggerFactory.getLogger(HttpRequestDispatcher.class);
 
-	public static void dispatch(RequestHandler rh, HttpRequest request, HttpResponse response) {
+	public static void dispatch(RequestHandler rh, HttpRequest request, HttpResponse response) throws IOException {
 		HttpVerb method = request.getMethod();
 		System.out.println("method: " + method);
 		try {

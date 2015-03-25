@@ -1,6 +1,7 @@
 package org.deftserver.web.handler;
 
 import java.io.File;
+import java.io.IOException;
 
 import javax.activation.FileTypeMap;
 import javax.activation.MimetypesFileTypeMap;
@@ -32,13 +33,13 @@ public class StaticContentHandler extends RequestHandler {
 
 	/** {inheritDoc} */
 	@Override
-	public void get(HttpRequest request, HttpResponse response) {
+	public void get(HttpRequest request, HttpResponse response) throws IOException {
 		this.perform(request, response, true);
 	}
 	
 	/** {inheritDoc} */
 	@Override
-	public void head(final HttpRequest request, final HttpResponse response) {
+	public void head(final HttpRequest request, final HttpResponse response) throws IOException {
 		this.perform(request, response, false);
 	}
 
@@ -47,7 +48,7 @@ public class StaticContentHandler extends RequestHandler {
 	 * @param response the <code>HttpResponse</code> 
 	 * @param hasBody <code>true</code> to write the message body; <code>false</code> oth	erwise.
 	 */
-	private void perform(final HttpRequest request, final HttpResponse response, boolean hasBody) {
+	private void perform(final HttpRequest request, final HttpResponse response, boolean hasBody) throws IOException {
 		System.out.println("req: " + request + ", resp: " + response + ", body: " + hasBody);
 		final String path = request.getRequestedPath();
 		final File file = new File(path.substring(1));	// remove the leading '/'
@@ -75,7 +76,6 @@ public class StaticContentHandler extends RequestHandler {
 				return;
 			}
 		}
-		
 		if(hasBody) {
 			response.write(file);
 		}

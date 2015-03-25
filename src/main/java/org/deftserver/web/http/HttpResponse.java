@@ -7,7 +7,6 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
-import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
 import java.nio.channels.SelectionKey;
@@ -16,7 +15,6 @@ import java.util.HashMap;
 import java.util.Map;
 
 import org.deftserver.io.buffer.DynamicByteBuffer;
-import org.deftserver.util.Closeables;
 import org.deftserver.util.DateUtil;
 import org.deftserver.util.HttpUtil;
 import org.slf4j.Logger;
@@ -75,8 +73,7 @@ public class HttpResponse {
 	 * 
 	 * @return the number of bytes that were actually written as the result of this flush.
 	 */
-	public long flush() {
-		boolean error = false;
+	public long flush() throws IOException {
 		long bytesWritten = 0;
 		try {
 			if (!headersCreated) {
@@ -88,34 +85,21 @@ public class HttpResponse {
 	
 			SocketChannel channel = (SocketChannel) key.channel();
 			if (responseData.hasRemaining()) {
-				try {
-					int written = 0;
-					do {
-						written = channel.write(responseData.getByteBuffer());
-						bytesWritten += written;
-					} while (channel.isConnected() && written > 0 && responseData.hasRemaining());
-				} catch (IOException e) {
-					logger.error("ClosedChannelException during channel.write(): {}", e.getMessage());
-					error = true;
-				}
+				int written = 0;
+				do {
+					written = channel.write(responseData.getByteBuffer());
+					bytesWritten += written;
+				} while (channel.isConnected() && written > 0 && responseData.hasRemaining());
 			}
-			if (!error) {
-				if (protocol.getIOLoop().hasKeepAliveTimeout(channel)) {
-					protocol.prolongKeepAliveTimeout(channel);
-				}
-				if (responseData.hasRemaining()) { 
-					responseData.compact();	// make room for more data be 'read' in
-					try {
-						key.channel().register(key.selector(), SelectionKey.OP_WRITE);	//TODO RS 110621, use IOLoop.updateHandler
-					} catch (ClosedChannelException e) {
-						logger.error("ClosedChannelException during flush(): {}", e.getMessage());
-						error = true;
-					}
-					key.attach(responseData);
-				}
+			if (protocol.getIOLoop().hasKeepAliveTimeout(channel)) {
+				protocol.prolongKeepAliveTimeout(channel);
+			}
+			if (responseData.hasRemaining()) { 
+				responseData.compact();	// make room for more data be 'read' in
+				key.channel().register(key.selector(), SelectionKey.OP_WRITE, responseData);
 			}
 		} finally {
-			if (error || !responseData.hasRemaining()) {
+			if (!responseData.hasRemaining()) {
 				responseData.clear();
 			}
 		}
@@ -129,7 +113,7 @@ public class HttpResponse {
 	 * inserted to the HTTP response.
 	 * 
 	 */
-	public long finish() {
+	public long finish() throws IOException {
 		long bytesWritten = 0;
 		SocketChannel clientChannel = (SocketChannel) key.channel();
 
@@ -138,13 +122,8 @@ public class HttpResponse {
 			if (mbb.hasRemaining()) {
 				int written = 0;
 				do {
-					try {
-						written = clientChannel.write(mbb);
-						bytesWritten += written;
-					} catch (IOException e) {
-						logger.warn("Could not write to channel: ", e.getMessage());					
-						Closeables.closeQuietly(key.channel());
-					}
+					written = clientChannel.write(mbb);
+					bytesWritten += written;
 				} while (written > 0 && mbb.hasRemaining() && clientChannel.isOpen());
 			}
 			if (!mbb.hasRemaining()) {
@@ -200,7 +179,7 @@ public class HttpResponse {
 		return sb.toString();
 	}
 	
-	public long write(ByteBuffer data) {
+	public long write(ByteBuffer data) throws IOException {
 		SocketChannel sc = ((SocketChannel) key.channel());
 		long size = data.remaining();
 		System.out.println("cl-httpresp4");
@@ -208,27 +187,17 @@ public class HttpResponse {
 		long bytesWritten = 0;
 		flush(); // write initial line + headers
 		
-		try {
-			if (data.hasRemaining()) {
-				int written = 0;
-				do {
-					written = sc.write(data);
-					bytesWritten += written;
-				} while (written > 0 && data.hasRemaining());
-			}
-			logger.debug("sent bytebuffer data, bytes sent: {}, remaining: {}", bytesWritten, data.remaining());
-			if (data.hasRemaining()) {
-				logger.debug("unable to send complete bytebuffer, attaching to key for later send");
-				try {
-					key.channel().register(key.selector(), SelectionKey.OP_WRITE); //TODO RS 110621, use IOLoop.updateHandler
-					key.attach(data);
-				} catch (ClosedChannelException e) {
-					logger.error("ClosedChannelException during write(bytebuffer): {}", e.getMessage());
-					Closeables.closeQuietly(key.channel());
-				}
-			}
-		} catch (IOException e) {
-			logger.error("Error writing/closing bytebuffer response: {}", e.getMessage());
+		if (data.hasRemaining()) {
+			int written = 0;
+			do {
+				written = sc.write(data);
+				bytesWritten += written;
+			} while (written > 0 && data.hasRemaining());
+		}
+		logger.debug("sent bytebuffer data, bytes sent: {}, remaining: {}", bytesWritten, data.remaining());
+		if (data.hasRemaining()) {
+			logger.debug("unable to send complete bytebuffer, attaching to key for later send");
+			key.channel().register(key.selector(), SelectionKey.OP_WRITE, data);
 		}
 		return bytesWritten;
 	}
@@ -237,7 +206,7 @@ public class HttpResponse {
 	 * Experimental support.
 	 * Before use, read https://github.com/rschildmeijer/deft/issues/75
 	 */
-	public long write(File file) {
+	public long write(File file) throws IOException {
 		//setHeader("Etag", HttpUtil.getEtag(file));
 		System.out.println("cl-httpresp3");
 		setHeader("Content-Length", String.valueOf(file.length()));
@@ -257,16 +226,8 @@ public class HttpResponse {
 			}
 			if (mbb.hasRemaining()) {
 				logger.debug("unable to send complete file, attaching to key for later send");
-				try {
-					key.channel().register(key.selector(), SelectionKey.OP_WRITE); //TODO RS 110621, use IOLoop.updateHandler
-					key.attach(mbb);
-				} catch (ClosedChannelException e) {
-					logger.error("ClosedChannelException during write(File): {}", e.getMessage());
-					Closeables.closeQuietly(key.channel());
-				}
+				key.channel().register(key.selector(), SelectionKey.OP_WRITE, mbb);
 			}
-		} catch (IOException e) {
-			logger.error("Error reading/closing static file response: {}", e.getMessage());
 		}
 		return bytesWritten;
 	}

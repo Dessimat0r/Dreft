@@ -2,7 +2,9 @@ package org.deftserver.io;
 
 import static com.google.common.collect.Collections2.transform;
 
+import java.io.EOFException;
 import java.io.IOException;
+import java.nio.channels.CancelledKeyException;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.SelectableChannel;
 import java.nio.channels.SelectionKey;
@@ -75,36 +77,58 @@ public class IOLoop implements IOLoopMXBean {
 					}
 					continue;
 				}
-
 				Iterator<SelectionKey> keys = selector.selectedKeys().iterator();
 				while (keys.hasNext()) {
 					SelectionKey key = keys.next();
+					keys.remove();
+					IOHandler handler = handlers.get(key.channel());
+					if (handler == null) {
+						logger.debug("No handler found in IOLoop for channel: {}", key.channel());
+						Closeables.closeQuietly(this, key.channel());
+						continue;
+					}
 					try {
-						IOHandler handler = handlers.get(key.channel());
-						if (handler == null) {
-							logger.debug("No handler found in IOLoop for channel");
-							Closeables.closeQuietly(this, key.channel());
-							continue;
-						}
-						try {
-							if (key.isAcceptable()) {
-								handler.handleAccept(key);
-							}
-							if (key.isConnectable()) {
-								handler.handleConnect(key);
-							}
-							if (key.isValid() && key.isReadable()) {
+						if (key.isReadable()) {
+							try {
 								handler.handleRead(key);
+							} catch (EOFException e) {
+								logger.debug("EOFException in read", e);
+								Closeables.closeQuietly(this, key.channel());
+								continue;
+							} catch (IOException e) {
+								logger.debug("IOException in read", e);
+								Closeables.closeQuietly(this, key.channel());
+								continue;
 							}
-							if (key.isValid() && key.isWritable()) {
-								handler.handleWrite(key);
-							}
-						} catch (IOException e) {
-							logger.debug("I/O exception in IOLoop", e);
-							Closeables.closeQuietly(this, key.channel());
 						}
-					} finally {
-						keys.remove();
+						if (key.isWritable()) {
+							try {
+								handler.handleWrite(key);
+							} catch (IOException e) {
+								logger.debug("IOException in write", e);
+								Closeables.closeQuietly(this, key.channel());
+								continue;
+							}
+						}
+						if (key.isConnectable()) {
+							try {
+								handler.handleConnect(key);
+							} catch (IOException e) {
+								logger.debug("Unable to connect", e);
+								Closeables.closeQuietly(this, key.channel());
+								continue;
+							}
+						}
+						if (key.isAcceptable()) {
+							try {
+								handler.handleAccept(key);
+							} catch (IOException e) {
+								logger.debug("Unable to accept connection", e);
+							}
+						}
+					} catch (CancelledKeyException e) {
+						logger.debug("CancelledKeyException in IOLoop", e);
+						Closeables.closeQuietly(this, key.channel());
 					}
 				}
 				long ms = tm.execute();
@@ -112,9 +136,8 @@ public class IOLoop implements IOLoopMXBean {
 				if (cm.execute()) { 
 					selectorTimeout = 1; 
 				}
-
 			} catch (IOException e) {
-				logger.error("Exception received in IOLoop: {}", e);			
+				logger.error("IOException received in IOLoop", e);			
 			}
 		}
 	}

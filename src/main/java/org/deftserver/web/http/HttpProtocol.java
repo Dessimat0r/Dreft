@@ -120,77 +120,66 @@ public class HttpProtocol implements IOHandler {
 
 	}
 
-	private long writeMappedByteBuffer(SelectionKey key, SocketChannel channel) {
+	private long writeMappedByteBuffer(SelectionKey key, SocketChannel channel) throws IOException {
 		long bytesWritten = 0;
 		MappedByteBuffer mbb = (MappedByteBuffer) key.attachment();
 		if (mbb.hasRemaining()) {
-			try {
-				int written = 0;
-				do {
-					written = channel.write(mbb);
-					if (written > 0) {
-						bytesWritten += written;
-					}
-				} while (channel.isConnected() && written > 0 && mbb.hasRemaining());
-			} catch (IOException e) {
-				logger.error("Failed to send data to client: {}", e.getMessage());
-				Closeables.closeQuietly(channel);
-			}
+			int written = 0;
+			do {
+				written = channel.write(mbb);
+				if (written > 0) {
+					bytesWritten += written;
+				}
+			} while (channel.isConnected() && written > 0 && mbb.hasRemaining());
 		}
+		logger.debug("sent {} bytes to wire", bytesWritten);
 		if (!mbb.hasRemaining()) {
 			closeOrRegisterForRead(key);
+		} else {
+			key.interestOps(SelectionKey.OP_WRITE);
 		}
 		return bytesWritten;
 	}
 	
-	private long writeDynamicByteBuffer(SelectionKey key, SocketChannel channel) {
+	private long writeDynamicByteBuffer(SelectionKey key, SocketChannel channel) throws IOException {
 		DynamicByteBuffer dbb = (DynamicByteBuffer) key.attachment();
 		logger.debug("pending data about to be written");
 		ByteBuffer toSend = dbb.getByteBuffer();
 		//toSend.flip(); // prepare for write
 		long bytesWritten = 0;
 		if (toSend.hasRemaining()) {
-			try {
-				int written = 0;
-				do {
-					written = channel.write(toSend);
-					if (written > 0) {
-						bytesWritten += written;
-					}
-				} while (channel.isConnected() && written > 0 && toSend.hasRemaining());
-			} catch (IOException e) {
-				logger.error("Failed to send data to client: {}", e.getMessage());
-				Closeables.closeQuietly(channel);
-			}
-			logger.debug("sent {} bytes to wire", bytesWritten);
+			int written = 0;
+			do {
+				written = channel.write(toSend);
+				if (written > 0) {
+					bytesWritten += written;
+				}
+			} while (channel.isConnected() && written > 0 && toSend.hasRemaining());
 		}
+		logger.debug("sent {} bytes to wire", bytesWritten);
 		if (!toSend.hasRemaining()) {
 			logger.debug("sent all data in toSend buffer");
 			closeOrRegisterForRead(key); // should probably only be done if the HttpResponse is finished
 		} else {
 			toSend.compact(); // make room for more data be "read" in
+			key.interestOps(SelectionKey.OP_WRITE);
 		}
 		return bytesWritten;
 	}
 	
-	private long writeByteBuffer(SelectionKey key, SocketChannel channel) {
+	private long writeByteBuffer(SelectionKey key, SocketChannel channel) throws IOException {
 		ByteBuffer toSend = (ByteBuffer) key.attachment();
 		logger.debug("pending data about to be written");
 		//toSend.flip(); // prepare for write
 		long bytesWritten = 0;
 		if (toSend.hasRemaining()) {
-			try {
-				int written = 0;
-				do {
-					written = channel.write(toSend);
-					if (written > 0) {
-						bytesWritten += written;
-					}
-				} while (channel.isConnected() && written > 0 && toSend.hasRemaining());
-			} catch (IOException e) {
-				logger.error("Failed to send data to client: {}", e.getMessage());
-				Closeables.closeQuietly(channel);
-			}
+			int written = 0;
+			do {
+				written = channel.write(toSend);
+				if (written > 0) {
+					bytesWritten += written;
+				}
+			} while (channel.isConnected() && written > 0 && toSend.hasRemaining());
 			logger.debug("sent {} bytes to wire", bytesWritten);
 		}
 		if (!toSend.hasRemaining()) {
@@ -198,6 +187,8 @@ public class HttpProtocol implements IOHandler {
 			closeOrRegisterForRead(key); // should probably only be done if the HttpResponse is finished
 		} else {
 			toSend.compact(); // make room for more data be "read" in
+			key.interestOps(SelectionKey.OP_WRITE);
+			
 		}
 		return bytesWritten;
 	}
@@ -336,12 +327,15 @@ public class HttpProtocol implements IOHandler {
 			if (request.putContentData(true, buffer)) {	// if received the entire payload/body
 				logger.debug("entire partial http request received, removing - http req #{}, remaining: {}, flipremain: {}", request.getRequestNum(), request.getRemaining(), request.getFlipRemain());
 				partials.remove(clientChannel);
+			} else {
+				key.interestOps(SelectionKey.OP_READ);
 			}
 		} else {
 			request = HttpRequest.of(application.nextHttpReqNum(), buffer);
 			if (!request.isComplete()) {
 				logger.debug("adding partial http request - http req #{}, remaining: {}", request.getRequestNum(), request.getRemaining());
 				partials.put(key.channel(), request);
+				key.interestOps(SelectionKey.OP_READ);
 			} else {
 				logger.debug("normal HttpRequest");
 			}

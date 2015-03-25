@@ -1,5 +1,6 @@
 package org.deftserver.example.kv;
 
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -30,13 +31,18 @@ public class KeyValueStoreExample {
 		
 		@Override
 		@Asynchronous
-		public void get(HttpRequest request, final HttpResponse response) {
+		public void get(HttpRequest request, final HttpResponse response) throws IOException {
 			client.get("deft", new AsyncResult<String>() {
 				@Override public void onFailure(Throwable caught) { /* ignore */}
-				@Override public void onSuccess(String result) { response.write(result).finish(); }
+				@Override public void onSuccess(String result) { 
+					try {
+						response.write(result).finish();
+					} catch (IOException e) {
+						e.printStackTrace();
+					}
+				}
 			});
 		}
-
 	}
 	
 	public static void main(String[] args) {

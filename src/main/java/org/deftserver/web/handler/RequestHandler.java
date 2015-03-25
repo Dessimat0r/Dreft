@@ -1,5 +1,6 @@
 package org.deftserver.web.handler;
 
+import java.io.IOException;
 import java.lang.annotation.Annotation;
 import java.util.Map;
 
@@ -46,27 +47,27 @@ public abstract class RequestHandler {
 	}
 
 	//Default implementation of HttpMethods return a 501 page
-	public void get(HttpRequest request, HttpResponse response) {
+	public void get(HttpRequest request, HttpResponse response) throws IOException { 
 		response.setStatusCode(501);
 		response.write("");
 	}
 
-	public void post(HttpRequest request, HttpResponse response) { 
+	public void post(HttpRequest request, HttpResponse response) throws IOException { 
 		response.setStatusCode(501);
 		response.write("");
 	}
 
-	public void put(HttpRequest request, HttpResponse response) { 
+	public void put(HttpRequest request, HttpResponse response) throws IOException { 
 		response.setStatusCode(501);
 		response.write("");
 	}
 
-	public void delete(HttpRequest request, HttpResponse response) { 
+	public void delete(HttpRequest request, HttpResponse response) throws IOException { 
 		response.setStatusCode(501);
 		response.write("");
 	}
 
-	public void head(HttpRequest request, HttpResponse response) { 
+	public void head(HttpRequest request, HttpResponse response) throws IOException { 
 		response.setStatusCode(501);
 		response.write("");
 	}

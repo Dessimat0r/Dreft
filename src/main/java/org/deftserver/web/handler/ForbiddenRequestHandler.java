@@ -1,5 +1,7 @@
 package org.deftserver.web.handler;
 
+import java.io.IOException;
+
 import org.deftserver.web.http.HttpRequest;
 import org.deftserver.web.http.HttpResponse;
 
@@ -14,7 +16,7 @@ private final static ForbiddenRequestHandler instance = new ForbiddenRequestHand
 	}
 	
 	@Override
-	public void get(HttpRequest request, HttpResponse response) {
+	public void get(HttpRequest request, HttpResponse response) throws IOException {
 		response.setStatusCode(403);
 		response.setHeader("Connection", "close");
 		response.write("Authentication failed");
