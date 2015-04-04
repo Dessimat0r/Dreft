@@ -5,6 +5,7 @@ import static org.deftserver.web.http.HttpServerDescriptor.READ_BUFFER_SIZE;
 
 import java.io.EOFException;
 import java.io.IOException;
+import java.net.ProtocolException;
 import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
@@ -69,11 +70,17 @@ public class HttpProtocol implements IOHandler {
 		logger.debug("handle read... key: " + key);
 		SocketChannel clientChannel = (SocketChannel) key.channel();
 		logger.debug("handle read 2...");
-		HttpRequest request = getHttpRequest(key, clientChannel);
-		if (request == null) {
-			System.out.println("null request (no data)");
-			return;
+		HttpRequest request = null;
+		try {
+			request = getHttpRequest(key, clientChannel);
+			if (request == null) {
+				System.out.println("not obtained all request data yet..");
+				return;
+			}
+		} catch (ProtocolException e) {
+			request = MalFormedHttpRequest.instance;
 		}
+		reuseAttachment(key);
 		logger.debug("handle read 3..., req class: " + request.getClass().toString() + ", req: " + request);
 		
 		if (request.isKeepAlive()) {
@@ -285,22 +292,31 @@ public class HttpProtocol implements IOHandler {
 	//TODO: change this to work with the entire stream rather than individual calls (no guarantee the client sends their data wholly in discrete packets)
 	private HttpRequest getHttpRequest(SelectionKey key, SocketChannel clientChannel) throws IOException {
 		ByteBuffer buffer = (ByteBuffer) key.attachment();
-		buffer.clear();
+		//buffer.clear();
 		if (!buffer.hasRemaining()) throw new IllegalStateException("Cleared channel buffer has no remaining space.");
 		long bytesRead = 0;
 		int read = 0;
 		do {
 			read = clientChannel.read(buffer);
 			if (read == -1) throw new EOFException();
-			else bytesRead += read;
+			bytesRead += read;
 		} while (read > 0 && buffer.hasRemaining());
+		int oldlim = buffer.limit();
+		int oldpos = buffer.position();
 		buffer.flip();
 		logger.debug("getHttpRequest bytesRead: {}, buffer remaining: {}", bytesRead, buffer.remaining());
 		//System.out.println("raw: " + new String(buffer.array(), 0, buffer.remaining(), Charsets.ISO_8859_1));
-		return doGetHttpRequest(key, clientChannel, buffer);
+		HttpRequest req = doGetHttpRequest(key, clientChannel, buffer);
+		if (req == null) buffer.compact();
+		//if (req == null) {
+			// unflip buffer
+		//	buffer.limit(oldlim);
+		//	buffer.position(oldpos);
+		//}
+		return req;
 	}
 	
-	private HttpRequest doGetHttpRequest(SelectionKey key, SocketChannel clientChannel, ByteBuffer buffer) {
+	private HttpRequest doGetHttpRequest(SelectionKey key, SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
 		//do we have any unfinished http post requests for this channel?
 		HttpRequest request = partials.get(clientChannel);
 		if (request != null) {
@@ -309,10 +325,12 @@ public class HttpProtocol implements IOHandler {
 				logger.debug("entire partial http request received, removing - http req #{}, remaining: {}, flipremain: {}", request.getRequestNum(), request.getRemaining(), request.getFlipRemain());
 				partials.remove(clientChannel);
 			} else {
+				System.out.println("not recvd entire http request, adding OP_READ");
 				key.interestOps(SelectionKey.OP_READ);
 			}
 		} else {
-			request = HttpRequest.of(application.nextHttpReqNum(), buffer);
+			request = HttpRequest.of(application, buffer);
+			if (request == null) return request;
 			if (!request.isComplete()) {
 				logger.debug("adding partial http request - http req #{}, remaining: {}", request.getRequestNum(), request.getRemaining());
 				partials.put(key.channel(), request);

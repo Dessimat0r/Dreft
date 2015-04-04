@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.InetAddress;
+import java.net.ProtocolException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Collection;
@@ -17,6 +18,7 @@ import java.util.stream.Collectors;
 
 import org.deftserver.io.IOLoop;
 import org.deftserver.io.stream.ByteBufferBackedInputStream;
+import org.deftserver.web.Application;
 import org.deftserver.web.HttpVerb;
 
 import com.google.common.base.Charsets;
@@ -149,7 +151,7 @@ public class HttpRequest {
 	 * @param requestLine The Http request text line
 	 * @param headers The Http request headers
 	 */
-	public HttpRequest(int requestNum, String requestLine, Map<String, String> headers, ByteBuffer buffer) {
+	public HttpRequest(int requestNum, String requestLine, Map<String, String> headers) {
 		this.requestNum  = requestNum;
 		this.requestLine = requestLine;
 		if (requestLine != null && headers != null) {
@@ -206,7 +208,6 @@ public class HttpRequest {
 		} else {
 			keepAlive = true;
 		}
-		putContentData(false, buffer);
 	}
 	
 	public static String streamHeadersToString(final InputStream inputStream) throws IOException {
@@ -223,69 +224,65 @@ public class HttpRequest {
 		return complete;
 	}
 	
-	public static HttpRequest of(int requestNum, ByteBuffer buffer) {
-		try {
-			String requestLine = null;
-			Map<String, String> generalHeaders = null;
-			if (buffer.hasRemaining()) {
-				// not basic keep-alive
-				//String raw = new String(buffer.array(), 0, buffer.limit(), Charsets.ISO_8859_1);
-				//System.out.println("raw httpreq. (of), pos: " + buffer.position() + ", limit: " + buffer.limit() + ", buf: " + raw);
-				
-				int oldpos = buffer.position();
-				boolean foundSep = findInBB(buffer, HTTP_HEAD_TERM_BYTES);
-				if (!foundSep) {
-					String raw = new String(buffer.array(), 0, buffer.limit(), Charsets.ISO_8859_1);
-					System.out.println("raw httpreq. (of), pos: " + buffer.position() + ", limit: " + buffer.limit() + ", buf: " + raw);
-					throw new IllegalArgumentException("Expected body seperator for initial HTTP req, none found");
-				}
-				int buflimit = buffer.limit();
-				int bodystartpos = buffer.position();
-				buffer.limit(bodystartpos);
-				buffer.position(oldpos);
-				
-				generalHeaders = new HashMap<String, String>();
+	public static HttpRequest of(Application app, ByteBuffer buffer) throws IOException {
+		buffer.flip();
+		String requestLine = null;
+		Map<String, String> generalHeaders = null;
+		if (buffer.hasRemaining()) {
+			// not basic keep-alive
+			//String raw = new String(buffer.array(), 0, buffer.limit(), Charsets.ISO_8859_1);
+			//System.out.println("raw httpreq. (of), pos: " + buffer.position() + ", limit: " + buffer.limit() + ", buf: " + raw);
+			
+			int oldpos = buffer.position();
+			boolean foundSep = findInBB(buffer, HTTP_HEAD_TERM_BYTES);
+			if (!foundSep) {
+				String raw = new String(buffer.array(), 0, buffer.limit(), Charsets.ISO_8859_1);
+				System.out.println("raw httpreq. (of), pos: " + buffer.position() + ", limit: " + buffer.limit() + ", buf: " + raw);
+				throw new ProtocolException("Expected body seperator for initial HTTP req, none found");
+			}
+			int buflimit = buffer.limit();
+			int bodystartpos = buffer.position();
+			buffer.limit(bodystartpos);
+			buffer.position(oldpos);
+			
+			generalHeaders = new HashMap<String, String>();
+			try (
+				ByteBufferBackedInputStream bbbis = new ByteBufferBackedInputStream(buffer);
+			) {
+				boolean sepfound = false;				
 				try (
-					ByteBufferBackedInputStream bbbis = new ByteBufferBackedInputStream(buffer);
+					InputStreamReader isr = new InputStreamReader(bbbis, Charsets.ISO_8859_1);
+					BufferedReader br = new BufferedReader(isr)
 				) {
-					boolean sepfound = false;				
-					try (
-						InputStreamReader isr = new InputStreamReader(bbbis, Charsets.ISO_8859_1);
-						BufferedReader br = new BufferedReader(isr)
-					) {
-						String line = br.readLine(); // request line
-						requestLine = line;
-						if (requestLine == null || (requestLine = requestLine.trim()).isEmpty()) {
-							throw new IllegalArgumentException("Request line is empty/missing!");
+					String line = br.readLine(); // request line
+					requestLine = line;
+					if (requestLine == null || (requestLine = requestLine.trim()).isEmpty()) {
+						throw new ProtocolException("Request line is empty/missing!");
+					}
+					System.out.println("got req. line: " + requestLine);
+					while ((line = br.readLine()) != null) {
+						if (line.contains(": ")) {
+							//TODO: optimise this
+							String[] splitLine = HEADER_VALUE_PATTERN.split(line);
+							String   key       = splitLine[0].trim().toLowerCase();
+							String   val       = splitLine[1].trim();
+							generalHeaders.put(key, val);
 						}
-						System.out.println("got req. line: " + requestLine);
-						while ((line = br.readLine()) != null) {
-							if (line.contains(": ")) {
-								//TODO: optimise this
-								String[] splitLine = HEADER_VALUE_PATTERN.split(line);
-								String   key       = splitLine[0].trim().toLowerCase();
-								String   val       = splitLine[1].trim();
-								generalHeaders.put(key, val);
-							}
-							if (line.isEmpty()) {
-								sepfound = true;
-								break;
-							}
+						if (line.isEmpty()) {
+							sepfound = true;
+							break;
 						}
 					}
-					if (!sepfound) throw new IOException("Excepected body seperator, still parsing headers");
-					
-					buffer.limit(buflimit);
-					buffer.position(bodystartpos);
-					System.out.println("buffer remaining: " + buffer.remaining());
 				}
+				if (!sepfound) throw new ProtocolException("Excepected body seperator, still parsing headers");
+				//buffer.limit(buflimit);
+				//buffer.position(bodystartpos);
+				System.out.println("buffer remaining: " + buffer.remaining());
 			}
-			return new HttpRequest(requestNum, requestLine, generalHeaders, buffer);
-		} catch (Exception t) {
-			System.out.println("malformed http req. (of): exception");
-			t.printStackTrace();
 		}
-		return MalFormedHttpRequest.instance;
+		HttpRequest req = new HttpRequest(app.nextHttpReqNum(), requestLine, generalHeaders);
+		req.putContentData(false, buffer);
+		return req;
 	}
 	
 	public Map<String, Part> getMultiParts() {
@@ -305,7 +302,7 @@ public class HttpRequest {
 	 * @param buffer
 	 * @return
 	 */
-	public boolean putContentData(boolean continuing, ByteBuffer buffer) {
+	public boolean putContentData(boolean continuing, ByteBuffer buffer) throws IOException {
 		if ((buffer == null || !buffer.hasRemaining()) && !continuing) {
 			complete = true;
 			return true;
@@ -345,14 +342,14 @@ public class HttpRequest {
 					if (initial) found = expectInBB(rawBody, mpBoundaryBStart, true);
 					else         found = findInBB  (rawBody, mpBoundaryBActual);
 					if (!found) {
-						throw new IllegalArgumentException("Trying to find mp boundary when not parsing but not found");
+						throw new ProtocolException("Trying to find mp boundary when not parsing but not found");
 					}
 					initial = false;
 					int segstartpos = rawBody.position();
 					// finding data start
 					found = findInBB(rawBody, HTTP_HEAD_TERM_BYTES);
 					if (!found) {
-						throw new IllegalArgumentException("Found no segment header/data separator");
+						throw new ProtocolException("Found no segment header/data separator");
 					}
 					parsingBoundary = true; // buffer will be set up to parse.
 					int datapos = rawBody.position();
@@ -382,10 +379,10 @@ public class HttpRequest {
 						}
 						// check we got content-type and disposition..
 						if (currPart.headKeyVals.get("Content-Disposition") == null) {
-							throw new IllegalArgumentException("content disp line doesn't exist in mp header");
+							throw new ProtocolException("content disp line doesn't exist in mp header");
 						}
 						if (currPart.headKeyVals.get("Content-Type") == null) {
-							throw new IllegalArgumentException("content type line doesn't exist in mp header");
+							throw new ProtocolException("content type line doesn't exist in mp header");
 						}
 						
 						HeadKeyVals hkv = currPart.headKeyVals.get("Content-Disposition");
@@ -424,7 +421,7 @@ public class HttpRequest {
 						}
 						//TODO: we may have newline before mpart seg mark, detect if possible
 					}
-					if (!found) throw new IOException("Couldn't find multipart segment end.");
+					if (!found) throw new ProtocolException("Couldn't find multipart segment end.");
 					currPart.rawBufEndPos = nextBoundaryPos;
 					int rawBodyOldPos   = rawBody.position();
 					int rawBodyOldLimit = rawBody.limit();
@@ -444,10 +441,8 @@ public class HttpRequest {
 				}
 			}
 			if (parsingBoundary) {
-				throw new IOException("Finished while still parsing multipart.");
+				throw new ProtocolException("Finished while still parsing multipart.");
 			}
-		} catch (IOException e) {
-			e.printStackTrace();
 		}
 		return true;
 	}
@@ -473,7 +468,7 @@ public class HttpRequest {
 	}
 	
 	public Map<String, String> getHeaders() {
-		return headers == null ? null : Collections.unmodifiableMap(headers);
+		return um_headers;
 	}
 	
 	public String getHeader(String name) {
