@@ -43,7 +43,7 @@ public class IOLoop implements IOLoopMXBean {
 
 	private Selector selector;
 	
-	private final Map<SelectableChannel, IOHandler> handlers = new WeakHashMap<>();
+	private final Map<SelectableChannel, IOHandler> handlers = new HashMap<>();
 	
 	private final TimeoutManager tm = new JMXDebuggableTimeoutManager();
 	private final CallbackManager cm = new JMXDebuggableCallbackManager();
@@ -160,9 +160,10 @@ public class IOLoop implements IOLoopMXBean {
 	 * attachment.
 	 * 
 	 */
-	public SelectionKey addHandler(SelectableChannel channel, IOHandler handler, int interestOps, Object attachment) {
+	public SelectionKey addHandler(SelectableChannel channel, IOHandler handler, int interestOps, Object attachment) throws IOException {
+		SelectionKey key = registerChannel(channel, interestOps, attachment);
 		handlers.put(channel, handler);
-		return registerChannel(channel, interestOps, attachment);		
+		return key;
 	}
 	
 	/**
@@ -195,14 +196,8 @@ public class IOLoop implements IOLoopMXBean {
 	 * @param attachment
 	 * @return
 	 */
-	private SelectionKey registerChannel(SelectableChannel channel, int interestOps, Object attachment) {
-		try {
-			return channel.register(selector, interestOps, attachment);
-		} catch (ClosedChannelException e) {
-			removeHandler(channel);
-			logger.error("Could not register channel: {}", e.getMessage());		
-		}		
-		return null;
+	private SelectionKey registerChannel(SelectableChannel channel, int interestOps, Object attachment) throws IOException {
+		return channel.register(selector, interestOps, attachment);
 	}
 	
 	public void addKeepAliveTimeout(SelectableChannel channel, Timeout keepAliveTimeout) {

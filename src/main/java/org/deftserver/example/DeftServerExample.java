@@ -49,9 +49,13 @@ public class DeftServerExample {
 
 		logger.debug("Starting up server on port: " + PORT);
 		HttpServer server = new HttpServer(application);
-		server.listen(PORT);
-		//server.bind(PORT);
-		//server.start(Runtime.getRuntime().availableProcessors());
-		IOLoop.INSTANCE.start();
+		try {
+			server.listen(PORT);
+			//server.bind(PORT);
+			//server.start(Runtime.getRuntime().availableProcessors());
+			IOLoop.INSTANCE.start();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
 	}
 }

@@ -10,11 +10,11 @@ import org.deftserver.web.AsyncCallback;
 
 public class AcceptUtil {
 
-	public static void accept(ServerSocketChannel server, final AsyncCallback cb) {
+	public static void accept(ServerSocketChannel server, final AsyncCallback cb) throws IOException {
 		accept(IOLoop.INSTANCE, server, cb);
 	}
 	
-	public static void accept(IOLoop ioLoop, ServerSocketChannel server, final AsyncCallback cb) {
+	public static void accept(IOLoop ioLoop, ServerSocketChannel server, final AsyncCallback cb) throws IOException {
 		ioLoop.addHandler(
 				server, 
 				new AcceptingIOHandler() {public void handleAccept(SelectionKey key) { cb.onCallback(); }},

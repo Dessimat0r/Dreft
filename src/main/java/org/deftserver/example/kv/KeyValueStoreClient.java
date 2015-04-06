@@ -31,9 +31,11 @@ public class KeyValueStoreClient {
 		try {
 			channel = SocketChannel.open(new InetSocketAddress(host, port));
 			channel.configureBlocking(false);
-		} catch (IOException e) { e.printStackTrace(); }
-		socket = new AsynchronousSocket(channel);
-		IOLoop.INSTANCE.addHandler(channel, socket, SelectionKey.OP_READ, ByteBuffer.allocate(1024));
+			socket = new AsynchronousSocket(channel);
+			IOLoop.INSTANCE.addHandler(channel, socket, SelectionKey.OP_READ, ByteBuffer.allocate(1024));
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
 	}
 	
 	public void get(String value, AsyncResult<String> cb) {

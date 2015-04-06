@@ -80,19 +80,15 @@ public class AsynchronousSocket implements IOHandler {
      *   }
 	 * </pre>
 	 */
-	public AsynchronousSocket(SelectableChannel channel) {
+	public AsynchronousSocket(SelectableChannel channel) throws IOException {
 		this(IOLoop.INSTANCE, channel);
 	}
 	
-	public AsynchronousSocket(IOLoop ioLoop, SelectableChannel channel) {
+	public AsynchronousSocket(IOLoop ioLoop, SelectableChannel channel) throws IOException {
 		this.ioLoop = ioLoop;
 		this.channel = channel;
 		interestOps = SelectionKey.OP_CONNECT;	// TODO RS110628 should probably be moved to connect(..)
-		try {
-			channel.configureBlocking(false);
-		} catch (IOException e) {
-			logger.error("Could not configure SocketChannel to be non-blocking");
-		}
+		channel.configureBlocking(false);
 		if (channel instanceof SocketChannel && (((SocketChannel) channel).isConnected())) {
 			interestOps |= SelectionKey.OP_READ;
 		}

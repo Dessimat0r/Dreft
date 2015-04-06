@@ -285,7 +285,6 @@ public class HttpProtocol implements IOHandler {
 	//TODO: change this to work with the entire stream rather than individual calls (no guarantee the client sends their data wholly in discrete packets)
 	private HttpRequest getHttpRequest(SelectionKey key, SocketChannel clientChannel) throws IOException {
 		ByteBuffer buffer = (ByteBuffer) key.attachment();
-		buffer.clear();
 		if (!buffer.hasRemaining()) throw new IllegalStateException("Cleared channel buffer has no remaining space.");
 		long bytesRead = 0;
 		int read = 0;
@@ -297,7 +296,10 @@ public class HttpProtocol implements IOHandler {
 		buffer.flip();
 		logger.debug("getHttpRequest bytesRead: {}, buffer remaining: {}", bytesRead, buffer.remaining());
 		//System.out.println("raw: " + new String(buffer.array(), 0, buffer.remaining(), Charsets.ISO_8859_1));
-		return doGetHttpRequest(key, clientChannel, buffer);
+		HttpRequest req = doGetHttpRequest(key, clientChannel, buffer);
+		if (req == null) buffer.rewind();
+		buffer.compact(); // allow for more data to be read in
+		return req;
 	}
 	
 	private HttpRequest doGetHttpRequest(SelectionKey key, SocketChannel clientChannel, ByteBuffer buffer) {
@@ -312,7 +314,7 @@ public class HttpProtocol implements IOHandler {
 				key.interestOps(SelectionKey.OP_READ);
 			}
 		} else {
-			request = HttpRequest.of(application.nextHttpReqNum(), buffer);
+			request = HttpRequest.of(application, buffer);
 			if (!request.isComplete()) {
 				logger.debug("adding partial http request - http req #{}, remaining: {}", request.getRequestNum(), request.getRemaining());
 				partials.put(key.channel(), request);

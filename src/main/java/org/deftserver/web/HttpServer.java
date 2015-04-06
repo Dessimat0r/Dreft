@@ -37,7 +37,7 @@ public class HttpServer {
 	 * 
 	 * @return this for chaining purposes
 	 */
-	public void listen(int port) {
+	public void listen(int port) throws IOException {
 		bind(port);
 		ioLoops.add(IOLoop.INSTANCE);
 		registerHandler(IOLoop.INSTANCE, new HttpProtocol(application));
@@ -72,8 +72,12 @@ public class HttpServer {
 			new Thread(new Runnable() {
 				
 				@Override public void run() {
-					registerHandler(ioLoop, protocol);
-					ioLoop.start();
+					try {
+						registerHandler(ioLoop, protocol);
+						ioLoop.start();
+					} catch (IOException e) {
+						e.printStackTrace();
+					}
 				}
 			}).start();
 		}
@@ -91,7 +95,7 @@ public class HttpServer {
 		}
 	}
 	
-	private void registerHandler(IOLoop ioLoop, HttpProtocol protocol) {
+	private void registerHandler(IOLoop ioLoop, HttpProtocol protocol) throws IOException {
 		ioLoop.addHandler(
 				serverChannel,
 				protocol, 

@@ -17,6 +17,7 @@ import java.util.stream.Collectors;
 
 import org.deftserver.io.IOLoop;
 import org.deftserver.io.stream.ByteBufferBackedInputStream;
+import org.deftserver.web.Application;
 import org.deftserver.web.HttpVerb;
 
 import com.google.common.base.Charsets;
@@ -223,7 +224,7 @@ public class HttpRequest {
 		return complete;
 	}
 	
-	public static HttpRequest of(int requestNum, ByteBuffer buffer) {
+	public static HttpRequest of(Application app, ByteBuffer buffer) {
 		try {
 			String requestLine = null;
 			Map<String, String> generalHeaders = null;
@@ -280,7 +281,7 @@ public class HttpRequest {
 					System.out.println("buffer remaining: " + buffer.remaining());
 				}
 			}
-			return new HttpRequest(requestNum, requestLine, generalHeaders, buffer);
+			return new HttpRequest(app.nextHttpReqNum(), requestLine, generalHeaders, buffer);
 		} catch (Exception t) {
 			System.out.println("malformed http req. (of): exception");
 			t.printStackTrace();

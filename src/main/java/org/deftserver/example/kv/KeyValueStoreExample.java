@@ -51,8 +51,12 @@ public class KeyValueStoreExample {
 		Application application = new Application(handlers);
 		logger.debug("Starting up server on port: " + PORT);
 		HttpServer server = new HttpServer(application);
-		server.listen(PORT);
-		IOLoop.INSTANCE.start();
+		try {
+			server.listen(PORT);
+			IOLoop.INSTANCE.start();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
 	}
 
 }
