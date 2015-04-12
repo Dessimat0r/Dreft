@@ -145,7 +145,7 @@ public class HttpProtocol implements IOHandler {
 		DynamicByteBuffer dbb = (DynamicByteBuffer) key.attachment();
 		logger.debug("pending data about to be written");
 		ByteBuffer toSend = dbb.getByteBuffer();
-		toSend.flip(); // prepare for write
+		if (!toSend.isReadOnly()) toSend.flip(); // prepare for write
 		long bytesWritten = 0;
 		if (toSend.hasRemaining()) {
 			int written = 0;
@@ -161,7 +161,7 @@ public class HttpProtocol implements IOHandler {
 			logger.debug("sent all data in toSend buffer");
 			registerForRead(key); // should probably only be done if the HttpResponse is finished
 		} else {
-			toSend.compact(); // make room for more data be "read" in
+			if (!toSend.isReadOnly()) toSend.compact(); // make room for more data be "read" in
 			key.interestOps(SelectionKey.OP_WRITE);
 		}
 		return bytesWritten;
@@ -170,7 +170,7 @@ public class HttpProtocol implements IOHandler {
 	private long writeByteBuffer(SelectionKey key, SocketChannel channel) throws IOException {
 		ByteBuffer toSend = (ByteBuffer) key.attachment();
 		logger.debug("pending data about to be written");
-		toSend.flip(); // prepare for write
+		if (!toSend.isReadOnly()) toSend.flip(); // prepare for write
 		long bytesWritten = 0;
 		if (toSend.hasRemaining()) {
 			int written = 0;
@@ -186,7 +186,7 @@ public class HttpProtocol implements IOHandler {
 			logger.debug("sent all data in toSend buffer");
 			registerForRead(key); // should probably only be done if the HttpResponse is finished
 		} else {
-			toSend.compact(); // make room for more data be "read" in
+			if (!toSend.isReadOnly()) toSend.compact(); // make room for more data be "read" in
 			key.interestOps(SelectionKey.OP_WRITE);
 		}
 		return bytesWritten;
@@ -225,8 +225,8 @@ public class HttpProtocol implements IOHandler {
 		} else {
 			attachment = (ByteBuffer) o;
 		}
-
-		if (attachment.capacity() < READ_BUFFER_SIZE) {
+		// a read-only buffer is only meant for reads
+		if (attachment.isReadOnly() || attachment.capacity() < READ_BUFFER_SIZE) {
 			attachment = ByteBuffer.allocate(READ_BUFFER_SIZE);
 		}
 		attachment.clear(); // prepare for reuse
@@ -302,7 +302,7 @@ public class HttpProtocol implements IOHandler {
 		return req;
 	}
 	
-	private HttpRequest doGetHttpRequest(SelectionKey key, SocketChannel clientChannel, ByteBuffer buffer) {
+	private HttpRequest doGetHttpRequest(SelectionKey key, SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
 		//do we have any unfinished http post requests for this channel?
 		HttpRequest request = partials.get(clientChannel);
 		if (request != null) {
@@ -314,7 +314,11 @@ public class HttpProtocol implements IOHandler {
 				key.interestOps(SelectionKey.OP_READ);
 			}
 		} else {
-			request = HttpRequest.of(application, buffer);
+			try {
+				request = HttpRequest.of(application, buffer);
+			} catch (IOException e) {
+				request = MalFormedHttpRequest.instance;
+			}
 			if (!request.isComplete()) {
 				logger.debug("adding partial http request - http req #{}, remaining: {}", request.getRequestNum(), request.getRemaining());
 				partials.put(key.channel(), request);

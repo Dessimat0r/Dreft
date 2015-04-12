@@ -14,6 +14,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -35,9 +36,16 @@ public class IOLoop implements IOLoopMXBean {
 	
 	/* IOLoop singleton to use for convenience (otherwise you would have to pass around the 
 	 * IOLoop instance explicitly, now you can simply use IOLoop.INSTANCE) */
-	public static final IOLoop INSTANCE = new IOLoop();
+	public static final IOLoop INSTANCE;
+	static {
+		try {
+			INSTANCE = new IOLoop();
+		} catch (IOException e) {
+			throw new IllegalStateException("Couldn't create IOLoop", e);
+		}
+	}
 	
-	private boolean running = false;
+	private volatile boolean running = false;
 	
 	private final Logger logger = LoggerFactory.getLogger(IOLoop.class);
 
@@ -50,12 +58,8 @@ public class IOLoop implements IOLoopMXBean {
 	
 	private static final AtomicInteger sequence = new AtomicInteger(0);
 	
-	public IOLoop() {
-		try {
-			selector = Selector.open();
-		} catch (IOException e) {
-			logger.error("Could not open selector: {}", e.getMessage());
-		}
+	public IOLoop() throws IOException {
+		selector = Selector.open();
 		MXBeanUtil.registerMXBean(this, "IOLoop");
 	}
 	/**
@@ -63,6 +67,8 @@ public class IOLoop implements IOLoopMXBean {
 	 * and will be the io loop thread.
 	 */
 	public void start() {
+		if (running) throw new IllegalStateException("IOLoop already running.");
+		
 		Thread.currentThread().setName("I/O-LOOP" + sequence.getAndIncrement());
 		running = true;
 		
@@ -146,8 +152,8 @@ public class IOLoop implements IOLoopMXBean {
 	 * Stop the io loop and release the thread (io loop thread) that invoked the {@link IOLoop#start} method.
 	 */
 	public void stop() {
-		running = false;
 		logger.debug("Stopping IOLoop...");
+		running = false;
 	}
 	
 	/**
@@ -235,5 +241,11 @@ public class IOLoop implements IOLoopMXBean {
 		});
 		return Lists.newLinkedList(readables);
 	}
-
+	
+	public void dispose() {
+		for (Entry<SelectableChannel, IOHandler> he : handlers.entrySet()) {
+			Closeables.closeQuietly(this, he.getKey());
+		}
+		stop();
+	}
 }

@@ -39,7 +39,7 @@ public class HttpResponse {
 	public HttpResponse(HttpProtocol protocol, SelectionKey key, boolean keepAlive) {
 		this.protocol = protocol;
 		this.key = key;
-		headers.put("Server", "Deft/0.4.0-SNAPSHOT");
+		headers.put("Server", "Dreft/0.4.0-SNAPSHOT");
 		headers.put("Date", DateUtil.getCurrentAsString());
 		headers.put("Connection", keepAlive ? "Keep-Alive" : "Close");
 	}
@@ -62,11 +62,6 @@ public class HttpResponse {
 		responseData.put(bytes);
 		return this;
 	}
-	
-	public HttpResponse write(byte[] data) {
-		responseData.put(data);
-		return this;
-	}	
 
 	/**
 	 * Explicit flush. 
@@ -174,7 +169,6 @@ public class HttpResponse {
 			}
 			sb.append("\r\n");
 		}
-		
 		sb.append("\r\n");
 		return sb.toString();
 	}
@@ -231,5 +225,4 @@ public class HttpResponse {
 		}
 		return bytesWritten;
 	}
-	
 }

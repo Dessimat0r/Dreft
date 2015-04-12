@@ -48,23 +48,21 @@ public class HttpServer {
 			throw new IllegalArgumentException("Invalid port number. Valid range: [" + 
 					MIN_PORT_NUMBER + ", " + MAX_PORT_NUMBER + ")");
 		}
-		
 		try {
 			serverChannel = ServerSocketChannel.open();
 			serverChannel.configureBlocking(false);
 		} catch (IOException e) {
 			logger.error("Error creating ServerSocketChannel: {}", e);
 		}
-		
 		InetSocketAddress endpoint = new InetSocketAddress(port);	// use "any" address
 		try {
 			serverChannel.socket().bind(endpoint);
 		} catch (IOException e) {
 			logger.error("Could not bind socket: {}", e);
-		}	
+		}
 	}
 	
-	public void start(int numThreads) {
+	public void start(int numThreads) throws IOException {
 		for (int i = 0; i < numThreads; i++) {
 			final IOLoop ioLoop = new IOLoop();
 			ioLoops.add(ioLoop);
@@ -76,7 +74,7 @@ public class HttpServer {
 						registerHandler(ioLoop, protocol);
 						ioLoop.start();
 					} catch (IOException e) {
-						e.printStackTrace();
+						logger.error("Couldn't register handler or start I/O loop.", e);
 					}
 				}
 			}).start();
@@ -89,18 +87,22 @@ public class HttpServer {
 	public void stop() {
 		logger.debug("Stopping HTTP server");
 		for (IOLoop ioLoop : ioLoops) {
-			// TODO RS 110527 Should probably do this in each IOLoop through an AsyncCallback 
-			// (hint: ioloop.addCallback(..))
-			Closeables.closeQuietly(ioLoop, serverChannel);
+			ioLoop.addCallback(new AsyncCallback() {
+				@Override
+				public void onCallback() {
+					Closeables.closeQuietly(ioLoop, serverChannel);
+					ioLoop.dispose();
+				}
+			});
 		}
 	}
 	
 	private void registerHandler(IOLoop ioLoop, HttpProtocol protocol) throws IOException {
 		ioLoop.addHandler(
-				serverChannel,
-				protocol, 
-				SelectionKey.OP_ACCEPT,
-				null /*attachment*/
+			serverChannel,
+			protocol, 
+			SelectionKey.OP_ACCEPT,
+			null /*attachment*/
 		);
 	}
 
