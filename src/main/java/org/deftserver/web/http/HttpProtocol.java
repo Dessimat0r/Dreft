@@ -76,14 +76,18 @@ public class HttpProtocol implements IOHandler {
 		}
 		logger.debug("handle read 3..., req class: " + request.getClass().toString() + ", req: " + request);
 		
-		if (request.isKeepAlive()) {
+		final boolean keepAlive;
+		
+		if (!(request instanceof MalFormedHttpRequest) && request.isKeepAlive()) {
+			keepAlive = true;
 			ioLoop.addKeepAliveTimeout(
 				clientChannel, 
 				Timeout.newKeepAliveTimeout(ioLoop, clientChannel, KEEP_ALIVE_TIMEOUT)
 			);
-		}
+		} else keepAlive = false;
+		
 		logger.debug("handle read 4...");
-		HttpResponse response = new HttpResponse(this, key, request.isKeepAlive());
+		HttpResponse response = new HttpResponse(this, key, keepAlive);
 		logger.debug("handle read 5...");
 		RequestHandler rh = application.getHandler(request);
 		logger.debug("handle read 6...");
@@ -91,7 +95,7 @@ public class HttpProtocol implements IOHandler {
 		logger.debug("handle read 7...");
 		
 		//Only close if not async. In that case its up to RH to close it (+ don't close if it's a partial request).
-		if (!rh.isMethodAsynchronous(request.getMethod()) && request.isComplete()) {
+		if (request instanceof MalFormedHttpRequest || (!rh.isMethodAsynchronous(request.getMethod()) && request.isComplete())) {
 			response.finish();
 		}
 	}
@@ -316,15 +320,16 @@ public class HttpProtocol implements IOHandler {
 		} else {
 			try {
 				request = HttpRequest.of(application, buffer);
+				if (!request.isComplete()) {
+					logger.debug("adding partial http request - http req #{}, remaining: {}", request.getRequestNum(), request.getRemaining());
+					partials.put(key.channel(), request);
+					key.interestOps(SelectionKey.OP_READ);
+				} else {
+					logger.debug("normal HttpRequest");
+				}
 			} catch (IOException e) {
 				request = MalFormedHttpRequest.instance;
-			}
-			if (!request.isComplete()) {
-				logger.debug("adding partial http request - http req #{}, remaining: {}", request.getRequestNum(), request.getRemaining());
-				partials.put(key.channel(), request);
-				key.interestOps(SelectionKey.OP_READ);
-			} else {
-				logger.debug("normal HttpRequest");
+				logger.debug("malformed HttpRequest");
 			}
 		}
 		//set extra request info
