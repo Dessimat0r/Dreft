@@ -69,7 +69,7 @@ public class HttpProtocol implements IOHandler {
 		logger.debug("handle read 2...");
 		HttpRequest request = getHttpRequest(key, clientChannel);
 		if (request == null) {
-			System.out.println("null request (no data)");
+			logger.debug("null request (no data)");
 			return;
 		}
 		logger.debug("handle read 3..., req class: " + request.getClass().toString() + ", req: " + request);
@@ -104,17 +104,17 @@ public class HttpProtocol implements IOHandler {
 		SocketChannel channel = ((SocketChannel) key.channel());
 
 		if (key.attachment() instanceof MappedByteBuffer) {
-			System.out.println("mbb write #1");
+			logger.debug("mbb write #1");
 			writeMappedByteBuffer(key, channel);
-			System.out.println("mbb write #2");
+			logger.debug("mbb write #2");
 		} else if (key.attachment() instanceof DynamicByteBuffer) {
-			System.out.println("dbb write #1");
+			logger.debug("dbb write #1");
 			writeDynamicByteBuffer(key, channel);
-			System.out.println("dbb write #2");
+			logger.debug("dbb write #2");
 		} else if (key.attachment() instanceof ByteBuffer) {
-			System.out.println("bb write #1");
+			logger.debug("bb write #1");
 			writeByteBuffer(key, channel);
-			System.out.println("bb write #2");
+			logger.debug("bb write #2");
 		}
 		if (ioLoop.hasKeepAliveTimeout(channel)) {
 			prolongKeepAliveTimeout(channel);

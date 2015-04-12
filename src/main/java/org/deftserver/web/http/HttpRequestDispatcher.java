@@ -13,7 +13,7 @@ public class HttpRequestDispatcher {
 
 	public static void dispatch(RequestHandler rh, HttpRequest request, HttpResponse response) throws IOException {
 		HttpVerb method = request.getMethod();
-		System.out.println("method: " + method);
+		logger.debug("method: {}", method);
 		try {
 			switch (method) {
 			case GET:
@@ -35,7 +35,7 @@ public class HttpRequestDispatcher {
 			case TRACE:
 			case CONNECT:
 			default:
-				logger.warn("Unimplemented Http metod received: {}", method);
+				logger.warn("Unimplemented HTTP method received: {}", method);
 				//TODO send "not supported page (501) back to client"
 			}
 		} catch (HttpException he) {

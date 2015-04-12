@@ -185,7 +185,7 @@ public class AsynchronousHttpClient {
 			String[] header = headers[i].split(": ");
 			response.setHeader(header[0], header[1]);
 		}
-		System.out.println("cl-ahttpc");
+		logger.debug("cl-ahttpc");
 		String contentLength = response.getHeader("Content-Length");
 		startTimeout();
 		if (contentLength != null) {

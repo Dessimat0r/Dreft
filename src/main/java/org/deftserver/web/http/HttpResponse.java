@@ -155,7 +155,7 @@ public class HttpResponse {
 		if (responseData.position() > 0) {
 			setHeader("Etag", HttpUtil.getEtag(responseData.array()));
 		}
-		System.out.println("cl-httpresp1");
+		logger.debug("cl-httpresp1");
 		setHeader("Content-Length", String.valueOf(responseData.position()));
 	}
 	
@@ -176,7 +176,7 @@ public class HttpResponse {
 	public long write(ByteBuffer data) throws IOException {
 		SocketChannel sc = ((SocketChannel) key.channel());
 		long size = data.remaining();
-		System.out.println("cl-httpresp4");
+		logger.debug("cl-httpresp4");
 		setHeader("Content-Length", String.valueOf(size));
 		long bytesWritten = 0;
 		flush(); // write initial line + headers
@@ -202,7 +202,7 @@ public class HttpResponse {
 	 */
 	public long write(File file) throws IOException {
 		//setHeader("Etag", HttpUtil.getEtag(file));
-		System.out.println("cl-httpresp3");
+		logger.debug("cl-httpresp3");
 		setHeader("Content-Length", String.valueOf(file.length()));
 		long bytesWritten = 0;
 		flush(); // write initial line + headers

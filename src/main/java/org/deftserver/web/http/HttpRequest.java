@@ -20,12 +20,15 @@ import org.deftserver.io.IOLoop;
 import org.deftserver.io.stream.ByteBufferBackedInputStream;
 import org.deftserver.web.Application;
 import org.deftserver.web.HttpVerb;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Charsets;
 import com.google.common.collect.ImmutableMultimap;
 
 public class HttpRequest {
 	private IOLoop ioLoop;
+	private static final Logger logger = LoggerFactory.getLogger(HttpRequest.class);
 	
 	private final String requestLine;
 	private final HttpVerb method;
@@ -174,7 +177,7 @@ public class HttpRequest {
 						throw new ProtocolException("Expected mp boundary string, got " + contentTypeArr[1]);
 					}
 					multipartBoundary = mparr[1];
-					System.out.println("got multipart boundary: " + multipartBoundary);
+					logger.debug("got multipart boundary: {}", multipartBoundary);
 					multipartBoundaryB = multipartBoundary.getBytes(Charsets.ISO_8859_1);
 					mpBoundaryBStart  = ("--" + multipartBoundary + "\r\n").getBytes(Charsets.ISO_8859_1);
 					mpBoundaryBActual  = ("\r\n--" + multipartBoundary + "\r\n").getBytes(Charsets.ISO_8859_1);
@@ -237,7 +240,7 @@ public class HttpRequest {
 			boolean foundSep = findInBB(buffer, HTTP_HEAD_TERM_BYTES);
 			if (!foundSep) {
 				String raw = new String(buffer.array(), 0, buffer.limit(), Charsets.ISO_8859_1);
-				System.out.println("raw httpreq. (of), pos: " + buffer.position() + ", limit: " + buffer.limit() + ", buf: " + raw);
+				logger.debug("raw httpreq. (of), pos: {}, limit: {}, buf: {}", buffer.position(), buffer.limit(), raw);
 				throw new ProtocolException("Expected body seperator for initial HTTP req, none found");
 			}
 			int buflimit = buffer.limit();
@@ -259,7 +262,7 @@ public class HttpRequest {
 					if (requestLine == null || (requestLine = requestLine.trim()).isEmpty()) {
 						throw new ProtocolException("Request line is empty/missing!");
 					}
-					System.out.println("got req. line: " + requestLine);
+					logger.debug("got req. line: {}", requestLine);
 					while ((line = br.readLine()) != null) {
 						if (line.contains(": ")) {
 							//TODO: optimise this
@@ -278,7 +281,7 @@ public class HttpRequest {
 				
 				buffer.limit(buflimit);
 				buffer.position(bodystartpos);
-				System.out.println("buffer remaining: " + buffer.remaining());
+				logger.debug("buffer remaining: {}", buffer.remaining());
 			}
 		}
 		return new HttpRequest(app.nextHttpReqNum(), requestLine, generalHeaders, buffer);
@@ -313,10 +316,10 @@ public class HttpRequest {
 		// put the buffer into rawbody, then put the limit to the current position, position back to before the buffer was fed in
 		// to set it up for reading that new data.
 		int oldRawPos = rawBody.position();
-		System.out.println("rawbody pos (pre buffer dump): " + rawBody.position() + ", limit: " + rawBody.limit());
-		System.out.println("buffer remaining: " + buffer.remaining() + ", rawbody new pos: " + (rawBody.position() + buffer.remaining()));
+		logger.debug("rawbody pos (pre buffer dump): {}, limit: {}", rawBody.position(), rawBody.limit());
+		logger.debug("buffer remaining: {}, rawbody new pos: {}", buffer.remaining(), rawBody.position() + buffer.remaining());
 		rawBody.put(buffer);
-		System.out.println("rawbody pos (post buffer dump): " + rawBody.position() + ", limit: " + rawBody.limit());
+		logger.debug("rawbody pos (post buffer dump): {}, limit: {}", rawBody.position(), rawBody.limit());
 		if (!rawBody.hasRemaining()) {
 			flipRemain = buffer.remaining();
 			rawBody.flip();
@@ -327,7 +330,7 @@ public class HttpRequest {
 		}
 		if (!complete) return false;
 		
-		System.out.println("complete, now parsing");
+		logger.debug("complete, now parsing");
 		
 		//String raw = new String(rawBody.array(), 0, rawBody.limit(), Charsets.ISO_8859_1);
 		//System.out.println("raw putContentData. (of), pos: " + rawBody.position() + ", limit: " + rawBody.limit() + ", buf: " + raw);
@@ -336,8 +339,8 @@ public class HttpRequest {
 			boolean initial = true;
 			while (rawBody.hasRemaining()) {
 				if (!parsingBoundary) {
-					System.out.println("finding 'actual' mp boundary in rawBody: --" + multipartBoundary);
-					System.out.println("rawbody pos: " + rawBody.position() + ", limit: " + rawBody.limit());
+					logger.debug("finding 'actual' mp boundary in rawBody: --{}", multipartBoundary);
+					logger.debug("rawbody pos: {}, limit: {}", rawBody.position(), rawBody.limit());
 					boolean found = false;
 					if (initial) found = expectInBB(rawBody, mpBoundaryBStart, true);
 					else         found = findInBB  (rawBody, mpBoundaryBActual);
@@ -369,7 +372,7 @@ public class HttpRequest {
 						boolean gotSep = false;
 						String currMpLine = null;
 						while ((currMpLine = br.readLine()) != null) {
-							System.out.println("mp req line: " + (currMpLine.isEmpty() ? "(empty)" : currMpLine));
+							logger.debug("mp req line: {}", currMpLine.isEmpty() ? "(empty)" : currMpLine);
 							if (currMpLine.isEmpty()) {
 								gotSep = true;
 								break;
@@ -389,11 +392,11 @@ public class HttpRequest {
 						currPart.mapName = hkv.vals.get("name");
 						if (currPart.mapName == null) currPart.mapName = "#" + currPart.num;
 						
-						System.out.println("==== Part header #" + currPart.num + " (id: " + currPart.mapName + ") ====");
-						System.out.println("rawBufStartPos: " + currPart.rawBufStartPos);
-						System.out.println("rawBufEndPos  : " + currPart.rawBufEndPos);
-						System.out.println(currPart.headKeyVals);
-						System.out.println("================================================");
+						logger.debug("==== Part header #" + currPart.num + " (id: " + currPart.mapName + ") ====");
+						logger.debug("rawBufStartPos: " + currPart.rawBufStartPos);
+						logger.debug("rawBufEndPos  : " + currPart.rawBufEndPos);
+						logger.debug("" + currPart.headKeyVals);
+						logger.debug("================================================");
 						
 						mpParts.put(currPart.mapName, currPart);
 						rawBody.limit(oldlimit);
@@ -406,7 +409,7 @@ public class HttpRequest {
 					// check for boundary end token
 					
 					int oldpos = rawBody.position();
-					System.out.println("rawbody pos: " + rawBody.position() + ", limit: " + rawBody.limit());
+					logger.debug("rawbody pos: {}, limit: {}", rawBody.position(), rawBody.limit());
 					boolean found = findInBB(rawBody, mpBoundaryBFinish);
 					if (found) {
 						// multipart totally finished
@@ -481,7 +484,7 @@ public class HttpRequest {
 	}
 	
 	HeadKeyVals parseHeadKeyVals(String line) throws IllegalArgumentException {
-		System.out.println("hv line: " + line);
+		logger.debug("hv line: {}", line);
 		String[] lineSplit = line.split(": ", 2);
 		if (lineSplit.length != 2) {
 			throw new IllegalArgumentException("Expecting id and val for header line");
@@ -496,7 +499,7 @@ public class HttpRequest {
 				key = false;
 				continue;
 			}
-			System.out.println("lnsp2 val: " + val);
+			logger.debug("lnsp2 val: {}", val);
 			String[] spl = val.split("=", 2);
 			if (spl.length != 2) {
 				throw new IllegalArgumentException("Expecting id and val in header line (for sub-val)");
@@ -507,7 +510,7 @@ public class HttpRequest {
 			}
 			hkv.vals.put(spl[0], splval);
 		}
-		System.out.println("hkv: " + hkv);
+		logger.debug("hkv: {}", hkv);
 		return hkv;
 	}
 	

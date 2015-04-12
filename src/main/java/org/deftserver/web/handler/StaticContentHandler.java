@@ -49,10 +49,10 @@ public class StaticContentHandler extends RequestHandler {
 	 * @param hasBody <code>true</code> to write the message body; <code>false</code> oth	erwise.
 	 */
 	private void perform(final HttpRequest request, final HttpResponse response, boolean hasBody) throws IOException {
-		System.out.println("req: " + request + ", resp: " + response + ", body: " + hasBody);
+		logger.debug("req: {}, resp: {}, body: {}", request, response, hasBody);
 		final String path = request.getRequestedPath();
 		final File file = new File(path.substring(1));	// remove the leading '/'
-		System.out.println(file);
+		logger.debug("file: {}", file);
 		if (!file.exists()) {
 			throw new HttpException(404, "Not found", "Requested resource: <tt>" + path +  "</tt> was not found.");
 		} else if (!file.isFile()) {
