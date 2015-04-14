@@ -64,7 +64,7 @@ public class HttpProtocol implements IOHandler {
 
 	@Override
 	public void handleRead(SelectionKey key) throws IOException {
-		logger.debug("handle read... key: " + key);
+		logger.debug("handle read... key: {}", key);
 		SocketChannel clientChannel = (SocketChannel) key.channel();
 		logger.debug("handle read 2...");
 		HttpRequest request = getHttpRequest(key, clientChannel);
@@ -72,7 +72,7 @@ public class HttpProtocol implements IOHandler {
 			logger.debug("null request (no data)");
 			return;
 		}
-		logger.debug("handle read 3..., req class: " + request.getClass().toString() + ", req: " + request);
+		logger.debug("handle read 3..., req class: {}, req: {}", request.getClass(), request);
 		
 		final boolean keepAlive;
 		
