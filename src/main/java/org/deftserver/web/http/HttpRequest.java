@@ -130,6 +130,8 @@ public class HttpRequest {
 	
 	public static final byte[] SPACE_BYTES = " ".getBytes(Charsets.ISO_8859_1);
 	public static final byte[] MP_SEP_BYTES = "--".getBytes(Charsets.ISO_8859_1);
+	public static final byte[] MP_SEP_END_BYTES = "--\r\n".getBytes(Charsets.ISO_8859_1);
+	public static final byte[] MP_END_BYTES = "\r\n".getBytes(Charsets.ISO_8859_1);
 	
 	protected ByteBuffer rawBody            = null;
 	protected int        contentLength      = -1;
@@ -138,6 +140,7 @@ public class HttpRequest {
 	protected String     multipartBoundary  = null;
 	protected byte[]     multipartBoundaryB = null;
 	protected byte[]     mpBoundaryBStart   = null;
+	protected byte[]     mpBoundaryBPre     = null;
 	protected byte[]     mpBoundaryBActual  = null;
 	protected byte[]     mpBoundaryBFinish  = null;
 	protected boolean    complete           = false;
@@ -179,9 +182,10 @@ public class HttpRequest {
 					multipartBoundary = mparr[1];
 					logger.debug("got multipart boundary: {}", multipartBoundary);
 					multipartBoundaryB = multipartBoundary.getBytes(Charsets.ISO_8859_1);
+					mpBoundaryBPre    = ("\r\n--" + multipartBoundary).getBytes(Charsets.ISO_8859_1);
 					mpBoundaryBStart  = ("--" + multipartBoundary + "\r\n").getBytes(Charsets.ISO_8859_1);
-					mpBoundaryBActual  = ("\r\n--" + multipartBoundary + "\r\n").getBytes(Charsets.ISO_8859_1);
-					mpBoundaryBFinish  = ("\r\n--" + multipartBoundary + "--\r\n").getBytes(Charsets.ISO_8859_1);
+					mpBoundaryBActual = (mpBoundaryBPre + "\r\n").getBytes(Charsets.ISO_8859_1);
+					mpBoundaryBFinish = (mpBoundaryBPre + "--\r\n").getBytes(Charsets.ISO_8859_1);
 					multipart = true;
 					mpParts = new LinkedHashMap<String, HttpRequest.Part>();
 					um_mpParts = Collections.unmodifiableMap(mpParts);
@@ -233,14 +237,14 @@ public class HttpRequest {
 		Map<String, String> generalHeaders = null;
 		if (buffer.hasRemaining()) {
 			// not basic keep-alive
-			//String raw = new String(buffer.array(), 0, buffer.limit(), Charsets.ISO_8859_1);
-			//System.out.println("raw httpreq. (of), pos: " + buffer.position() + ", limit: " + buffer.limit() + ", buf: " + raw);
+			String raw = new String(buffer.array(), 0, buffer.limit(), Charsets.ISO_8859_1);
+			logger.debug("raw httpreq. (of), pos: {}, limit: {}, buf: {}", buffer.position(), buffer.limit(), raw);
 			
 			int oldpos = buffer.position();
 			boolean foundSep = findInBB(buffer, HTTP_HEAD_TERM_BYTES);
 			if (!foundSep) {
-				String raw = new String(buffer.array(), 0, buffer.limit(), Charsets.ISO_8859_1);
-				logger.debug("raw httpreq. (of), pos: {}, limit: {}, buf: {}", buffer.position(), buffer.limit(), raw);
+				raw = new String(buffer.array(), 0, buffer.limit(), Charsets.ISO_8859_1);
+				logger.debug("raw httpreq #1. (of), pos: {}, limit: {}, buf: {}", buffer.position(), buffer.limit(), raw);
 				throw new ProtocolException("Expected body seperator for initial HTTP req, none found");
 			}
 			int buflimit = buffer.limit();
@@ -337,7 +341,7 @@ public class HttpRequest {
 		
 		try (ByteBufferBackedInputStream bbbis = new ByteBufferBackedInputStream(rawBody)) {
 			boolean initial = true;
-			while (rawBody.hasRemaining()) {
+			while (!mpFinished && rawBody.hasRemaining()) {
 				if (!parsingBoundary) {
 					logger.debug("finding 'actual' mp boundary in rawBody: --{}", multipartBoundary);
 					logger.debug("rawbody pos: {}, limit: {}", rawBody.position(), rawBody.limit());
@@ -345,7 +349,7 @@ public class HttpRequest {
 					if (initial) found = expectInBB(rawBody, mpBoundaryBStart, true);
 					else         found = findInBB  (rawBody, mpBoundaryBActual);
 					if (!found) {
-						throw new ProtocolException("Trying to find mp boundary when not parsing but not found");
+						throw new ProtocolException("Trying to find mp boundary but not found");
 					}
 					initial = false;
 					int segstartpos = rawBody.position();
@@ -410,21 +414,37 @@ public class HttpRequest {
 					
 					int oldpos = rawBody.position();
 					logger.debug("rawbody pos: {}, limit: {}", rawBody.position(), rawBody.limit());
-					boolean found = findInBB(rawBody, mpBoundaryBFinish);
+					boolean found = findInBB(rawBody, mpBoundaryBPre);
+					int oldpos2 = rawBody.position();
 					if (found) {
-						// multipart totally finished
-						mpFinished = true;
-						nextBoundaryPos = rawBody.position() - mpBoundaryBFinish.length;
-						//TODO: we may have newline before mpart finish mark, detect if possible
-					} else {
-						rawBody.position(oldpos);
-						found = findInBB(rawBody, multipartBoundaryB);
-						if (found) {
-							nextBoundaryPos = rawBody.position() - multipartBoundaryB.length;
+						found = expectInBB(rawBody, MP_SEP_END_BYTES, true);
+						if (!found) {
+							logger.debug("not found expected MP_SEP_END_BYTES, checking for normal part end");
+							rawBody.position(oldpos2);
+							// check for normal end marker
+							found = expectInBB(rawBody, MP_END_BYTES, true);
+							if (found) {
+								logger.debug("found MP_END_BYTES");
+								nextBoundaryPos = rawBody.position() - MP_END_BYTES.length - mpBoundaryBPre.length;
+							} else {
+								logger.debug("not found expected MP_END_BYTES");
+							}
+							//TODO: we may have newline before mpart seg mark, detect if possible
+						} else {
+							logger.debug("found expected MP_SEP_END_BYTES, checking for total multipart end");
+							found = expectInBB(rawBody, MP_END_BYTES, true);
+							if (found) {
+								logger.debug("found expected MP_END_BYTES");
+								// multipart totally finished
+								mpFinished = true;
+								nextBoundaryPos = rawBody.position() - MP_SEP_END_BYTES.length - MP_END_BYTES.length - mpBoundaryBPre.length;
+							} else {
+								logger.debug("not found expected MP_END_BYTES");
+							}
+							//TODO: we may have newline before mpart finish mark, detect if possible							
 						}
-						//TODO: we may have newline before mpart seg mark, detect if possible
 					}
-					if (!found) throw new IOException("Couldn't find multipart segment end.");
+					if (!found) throw new ProtocolException("Couldn't find multipart segment end.");
 					currPart.rawBufEndPos = nextBoundaryPos;
 					int rawBodyOldPos   = rawBody.position();
 					int rawBodyOldLimit = rawBody.limit();
@@ -444,7 +464,7 @@ public class HttpRequest {
 				}
 			}
 			if (parsingBoundary) {
-				throw new IOException("Finished while still parsing multipart.");
+				throw new ProtocolException("Finished while still parsing multipart.");
 			}
 		}
 		return true;
