@@ -485,7 +485,7 @@ public class HttpRequest {
 	}
 	
 	public Map<String, String> getHeaders() {
-		return headers == null ? null : Collections.unmodifiableMap(headers);
+		return um_headers;
 	}
 	
 	public String getHeader(String name) {
