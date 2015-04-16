@@ -387,6 +387,16 @@ public class HttpRequest {
 					rawBody.position(rawBodyOldPos);
 					currPart.complete = true;
 					mpParts.put(currPart.mapName, currPart);
+					
+					logger.debug(
+						"Completed part header #{} (id: {}) ~ " +
+						"rawBufStartPos: {}, " +
+						"rawBufEndPos  : {}, " +
+						"hkvs: {}",
+						currPart.num, currPart.mapName, currPart.rawBufStartPos,
+						currPart.rawBufEndPos, currPart.headKeyVals
+					);
+					
 					currPart = null;
 				}
 				if (mpFinished) {
@@ -438,11 +448,14 @@ public class HttpRequest {
 				currPart.mapName = hkv.vals.get("name");
 				if (currPart.mapName == null) currPart.mapName = "#" + currPart.num;
 				
-				logger.debug("==== Part header #" + currPart.num + " (id: " + currPart.mapName + ") ====");
-				logger.debug("rawBufStartPos: " + currPart.rawBufStartPos);
-				logger.debug("rawBufEndPos  : " + currPart.rawBufEndPos);
-				logger.debug("" + currPart.headKeyVals);
-				logger.debug("================================================");
+				logger.debug(
+					"Created part header #{} (id: {}) ~ " +
+					"rawBufStartPos: {}, " +
+					"rawBufEndPos  : {}, " +
+					"hkvs: {}",
+					currPart.num, currPart.mapName, currPart.rawBufStartPos,
+					currPart.rawBufEndPos, currPart.headKeyVals
+				);
 				
 				rawBody.limit(oldlimit);
 				rawBody.position(datapos);
