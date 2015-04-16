@@ -391,7 +391,7 @@ public class HttpRequest {
 					logger.debug(
 						"Completed part header #{} (id: {}) ~ " +
 						"rawBufStartPos: {}, " +
-						"rawBufEndPos  : {}, " +
+						"rawBufEndPos: {}, " +
 						"hkvs: {}",
 						currPart.num, currPart.mapName, currPart.rawBufStartPos,
 						currPart.rawBufEndPos, currPart.headKeyVals
@@ -426,7 +426,7 @@ public class HttpRequest {
 				BufferedReader br = new BufferedReader(isr)
 			) {			
 				currPart = new Part();
-				currPart.num = mpParts.size() + 1;
+				currPart.num = mpParts.size();
 				currPart.rawBufStartPos = datapos;
 				
 				boolean gotSep = false;
@@ -451,7 +451,7 @@ public class HttpRequest {
 				logger.debug(
 					"Created part header #{} (id: {}) ~ " +
 					"rawBufStartPos: {}, " +
-					"rawBufEndPos  : {}, " +
+					"rawBufEndPos: {}, " +
 					"hkvs: {}",
 					currPart.num, currPart.mapName, currPart.rawBufStartPos,
 					currPart.rawBufEndPos, currPart.headKeyVals
