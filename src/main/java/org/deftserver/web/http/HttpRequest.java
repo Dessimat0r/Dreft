@@ -135,7 +135,7 @@ public class HttpRequest {
 	
 	protected ByteBuffer rawBody            = null;
 	protected int        contentLength      = -1;
-	protected String[]   contentTypeArr     = null;
+	protected String     contentType        = null;
 	protected boolean    multipart          = false;
 	protected String     multipartBoundary  = null;
 	protected byte[]     multipartBoundaryB = null;
@@ -148,6 +148,8 @@ public class HttpRequest {
 	protected Map<String, Part> mpParts     = null;
 	protected Map<String, Part> um_mpParts  = null;
 	protected final int         requestNum;
+
+	protected ImmutableMultimap<String, String> postParameters = null;
 	
 	/**
 	 * Creates a new HttpRequest 
@@ -169,9 +171,9 @@ public class HttpRequest {
 			if (method == HttpVerb.POST) {
 				String ctype = headers.get("content-type");
 				if (ctype == null) throw new ProtocolException("no content type for POST");
-				contentTypeArr = HEADER_VAL_SPLIT_PATTERN.split(ctype);
-				contentTypeArr[0] = contentTypeArr[0].trim();
-				if (contentTypeArr[0].equals("multipart/form-data")) {
+				String[] contentTypeArr = HEADER_VAL_SPLIT_PATTERN.split(ctype);
+				contentType = contentTypeArr[0].trim();
+				if (contentType.equals("multipart/form-data")) {
 					String[] mparr = contentTypeArr[1].split("=");
 					if (mparr.length < 2 || !mparr[0].equals("boundary")) {
 						throw new ProtocolException("Expected mp boundary string, got " + contentTypeArr[1]);
@@ -253,7 +255,7 @@ public class HttpRequest {
 			try (
 				ByteBufferBackedInputStream bbbis = new ByteBufferBackedInputStream(buffer);
 			) {
-				boolean sepfound = false;				
+				boolean sepfound = false;
 				try (
 					InputStreamReader isr = new InputStreamReader(bbbis, Charsets.ISO_8859_1);
 					BufferedReader br = new BufferedReader(isr)
@@ -337,59 +339,122 @@ public class HttpRequest {
 		//String raw = new String(rawBody.array(), 0, rawBody.limit(), Charsets.ISO_8859_1);
 		//System.out.println("raw putContentData. (of), pos: " + rawBody.position() + ", limit: " + rawBody.limit() + ", buf: " + raw);
 		
-		boolean parsingBoundary = false;
-		Part    currPart        = null;
-		boolean mpFinished      = false;
-		while (!mpFinished && rawBody.hasRemaining()) {
-			boolean found = false;
-			if (!parsingBoundary) {
-				logger.debug("rawbody pos: {}, limit: {}", rawBody.position(), rawBody.limit());
-				found = expectInBB(rawBody, mpBoundaryBStart, true);
-				if (!found) {
-					throw new ProtocolException("Expecting initial mp start boundary, but not found");
-				}
-				parsingBoundary = true;
-			} else {
-				int rbpos = -1;
-				found = findInBB(rawBody, mpBoundaryBPre);
-				if (!found) {
-					throw new ProtocolException("next part/finish boundary marker not found");
-				}
-				int prepos = rawBody.position();
-				// check if mp boundary start (newline) or end indicator (-- and newline)
-				found = expectInBB(rawBody, MP_END_BYTES, true);
-				if (found) {
-					// mp boundary start
-					rbpos = rawBody.position() - mpBoundaryBPre.length - MP_END_BYTES.length;
-				} else {
-					rawBody.position(prepos);
-					// mp end indicator
-					found = expectInBB(rawBody, MP_SEP_END_BYTES, true);
+		if (!multipart) {
+			postParameters = parseParameters2(body);
+		} else {
+			boolean parsingBoundary = false;
+			Part    currPart        = null;
+			boolean mpFinished      = false;
+			while (!mpFinished && rawBody.hasRemaining()) {
+				boolean found = false;
+				if (!parsingBoundary) {
+					logger.debug("rawbody pos: {}, limit: {}", rawBody.position(), rawBody.limit());
+					found = expectInBB(rawBody, mpBoundaryBStart, true);
 					if (!found) {
-						throw new ProtocolException("Expecting mp end indicator when didn't find new line, but not found");
+						throw new ProtocolException("Expecting initial mp start boundary, but not found");
 					}
-					parsingBoundary = false;
-					rbpos = rawBody.position() - mpBoundaryBPre.length - MP_SEP_END_BYTES.length;
-					mpFinished = true;
+					parsingBoundary = true;
+				} else {
+					int rbpos = -1;
+					found = findInBB(rawBody, mpBoundaryBPre);
+					if (!found) {
+						throw new ProtocolException("next part/finish boundary marker not found");
+					}
+					int prepos = rawBody.position();
+					// check if mp boundary start (newline) or end indicator (-- and newline)
+					found = expectInBB(rawBody, MP_END_BYTES, true);
+					if (found) {
+						// mp boundary start
+						rbpos = rawBody.position() - mpBoundaryBPre.length - MP_END_BYTES.length;
+					} else {
+						rawBody.position(prepos);
+						// mp end indicator
+						found = expectInBB(rawBody, MP_SEP_END_BYTES, true);
+						if (!found) {
+							throw new ProtocolException("Expecting mp end indicator when didn't find new line, but not found");
+						}
+						parsingBoundary = false;
+						rbpos = rawBody.position() - mpBoundaryBPre.length - MP_SEP_END_BYTES.length;
+						mpFinished = true;
+					}
+					// if we have a current part, finish it
+					if (currPart != null) {
+						currPart.rawBufEndPos = rbpos;
+						int rawBodyOldLimit = rawBody.limit();
+						int rawBodyOldPos   = rawBody.position();
+						rawBody.limit(currPart.rawBufEndPos);
+						rawBody.position(currPart.rawBufStartPos);
+						ByteBuffer bb = ByteBuffer.allocate(currPart.rawBufEndPos-currPart.rawBufStartPos);
+						bb.put(rawBody);
+						currPart.rawData = bb.array();
+						currPart.data    = new String(bb.array(), Charsets.ISO_8859_1);
+						rawBody.limit(rawBodyOldLimit);
+						rawBody.position(rawBodyOldPos);
+						currPart.complete = true;
+						mpParts.put(currPart.mapName, currPart);
+						
+						logger.debug(
+							"Completed part header #{} (id: {}) ~ " +
+							"rawBufStartPos: {}, " +
+							"rawBufEndPos: {}, " +
+							"hkvs: {}",
+							currPart.num, currPart.mapName, currPart.rawBufStartPos,
+							currPart.rawBufEndPos, currPart.headKeyVals
+						);
+						
+						currPart = null;
+					}
+					if (mpFinished) {
+						logger.debug("mp finished");
+						rawBody.position(rawBody.limit());
+						return true;
+					}
 				}
-				// if we have a current part, finish it
-				if (currPart != null) {
-					currPart.rawBufEndPos = rbpos;
-					int rawBodyOldLimit = rawBody.limit();
-					int rawBodyOldPos   = rawBody.position();
-					rawBody.limit(currPart.rawBufEndPos);
-					rawBody.position(currPart.rawBufStartPos);
-					ByteBuffer bb = ByteBuffer.allocate(currPart.rawBufEndPos-currPart.rawBufStartPos);
-					bb.put(rawBody);
-					currPart.rawData = bb.array();
-					currPart.data    = new String(bb.array(), Charsets.ISO_8859_1);
-					rawBody.limit(rawBodyOldLimit);
-					rawBody.position(rawBodyOldPos);
-					currPart.complete = true;
-					mpParts.put(currPart.mapName, currPart);
+				
+				if (!parsingBoundary) throw new IllegalStateException("Not parsing boundary & adding part");
+				
+				// add new part				
+				int oldlimit = rawBody.limit();
+				int headerStartPos = rawBody.position();
+				found = findInBB(rawBody, HTTP_HEAD_TERM_BYTES);
+				if (!found) {
+					throw new ProtocolException("Couldn't find multipart header separator");
+				}
+				int datapos = rawBody.position();
+				rawBody.limit(datapos);
+				rawBody.position(headerStartPos);
+					
+				// parse mp headers
+				try (
+					ByteBufferBackedInputStream bbbis = new ByteBufferBackedInputStream(rawBody);
+					InputStreamReader isr = new InputStreamReader(bbbis, Charsets.ISO_8859_1);
+					BufferedReader br = new BufferedReader(isr)
+				) {			
+					currPart = new Part();
+					currPart.num = mpParts.size();
+					currPart.rawBufStartPos = datapos;
+					
+					boolean gotSep = false;
+					String currMpLine = null;
+					while ((currMpLine = br.readLine()) != null) {
+						logger.debug("mp req line: {}", currMpLine.isEmpty() ? "(empty)" : currMpLine);
+						if (currMpLine.isEmpty()) {
+							gotSep = true;
+							break;
+						}
+						HeadKeyVals hkv = parseHeadKeyVals(currMpLine);
+						currPart.headKeyVals.put(hkv.key, hkv);
+					}
+					// check we got content-disposition..
+					HeadKeyVals hkv = currPart.headKeyVals.get("Content-Disposition");
+					if (hkv == null) {
+						throw new ProtocolException("Content-Disposition line doesn't exist in part header");
+					}
+					currPart.mapName = hkv.vals.get("name");
+					if (currPart.mapName == null) currPart.mapName = "#" + currPart.num;
 					
 					logger.debug(
-						"Completed part header #{} (id: {}) ~ " +
+						"Created part header #{} (id: {}) ~ " +
 						"rawBufStartPos: {}, " +
 						"rawBufEndPos: {}, " +
 						"hkvs: {}",
@@ -397,68 +462,9 @@ public class HttpRequest {
 						currPart.rawBufEndPos, currPart.headKeyVals
 					);
 					
-					currPart = null;
+					rawBody.limit(oldlimit);
+					rawBody.position(datapos);
 				}
-				if (mpFinished) {
-					logger.debug("mp finished");
-					rawBody.position(rawBody.limit());
-					return true;
-				}
-			}
-			
-			if (!parsingBoundary) throw new IllegalStateException("Not parsing boundary & adding part");
-			
-			// add new part				
-			int oldlimit = rawBody.limit();
-			int headerStartPos = rawBody.position();
-			found = findInBB(rawBody, HTTP_HEAD_TERM_BYTES);
-			if (!found) {
-				throw new ProtocolException("Couldn't find multipart header separator");
-			}
-			int datapos = rawBody.position();
-			rawBody.limit(datapos);
-			rawBody.position(headerStartPos);
-				
-			// parse mp headers
-			try (
-				ByteBufferBackedInputStream bbbis = new ByteBufferBackedInputStream(rawBody);
-				InputStreamReader isr = new InputStreamReader(bbbis, Charsets.ISO_8859_1);
-				BufferedReader br = new BufferedReader(isr)
-			) {			
-				currPart = new Part();
-				currPart.num = mpParts.size();
-				currPart.rawBufStartPos = datapos;
-				
-				boolean gotSep = false;
-				String currMpLine = null;
-				while ((currMpLine = br.readLine()) != null) {
-					logger.debug("mp req line: {}", currMpLine.isEmpty() ? "(empty)" : currMpLine);
-					if (currMpLine.isEmpty()) {
-						gotSep = true;
-						break;
-					}
-					HeadKeyVals hkv = parseHeadKeyVals(currMpLine);
-					currPart.headKeyVals.put(hkv.key, hkv);
-				}
-				// check we got content-disposition..
-				HeadKeyVals hkv = currPart.headKeyVals.get("Content-Disposition");
-				if (hkv == null) {
-					throw new ProtocolException("Content-Disposition line doesn't exist in part header");
-				}
-				currPart.mapName = hkv.vals.get("name");
-				if (currPart.mapName == null) currPart.mapName = "#" + currPart.num;
-				
-				logger.debug(
-					"Created part header #{} (id: {}) ~ " +
-					"rawBufStartPos: {}, " +
-					"rawBufEndPos: {}, " +
-					"hkvs: {}",
-					currPart.num, currPart.mapName, currPart.rawBufStartPos,
-					currPart.rawBufEndPos, currPart.headKeyVals
-				);
-				
-				rawBody.limit(oldlimit);
-				rawBody.position(datapos);
 			}
 		}
 		return true;
@@ -495,6 +501,10 @@ public class HttpRequest {
 	
 	public HttpVerb getMethod() {
 		return method;
+	}
+	
+	public Map<String, Collection<String>> getPostParameters() {
+		return postParameters.asMap();
 	}
 	
 	HeadKeyVals parseHeadKeyVals(String line) throws IllegalArgumentException {
@@ -545,9 +555,22 @@ public class HttpRequest {
 		return values.isEmpty() ? null : values.iterator().next();
 	}
 	
+	/**
+	 * Returns the value of a post parameter as a String, or null if the parameter does not exist. 
+	 *
+	 * You should only use this method when you are sure the parameter has only one value. If the parameter 
+	 * might have more than one value, use getParameterValues(java.lang.String).
+     * If you use this method with a multi-valued parameter, the value returned is equal to the first value in
+     * the array returned by getParameterValues. 
+	 */
+	public String getPostParameter(String name) {
+		Collection<String> values = postParameters.get(name);		
+		return values.isEmpty() ? null : values.iterator().next();
+	}	
+	
 	public Map<String, Collection<String>> getParameters() {
 		return parameters.asMap();
-	}	
+	}
 	
 	public String getBody() {
 		return body;
@@ -593,6 +616,14 @@ public class HttpRequest {
 		return parameters.get(name);
 	}
 	
+	/**
+	 * Returns a collection of all values associated with the provided post parameter.
+	 * If no values are found and empty collection is returned.
+	 */
+	public Collection<String> getPostParameterValues(String name) {
+		return postParameters.get(name);
+	}
+	
 	public boolean isKeepAlive() {
 		return keepAlive;
 	}
@@ -622,22 +653,27 @@ public class HttpRequest {
 
 	
 	private ImmutableMultimap<String, String> parseParameters(String requestLine) {
-		ImmutableMultimap.Builder<String, String> builder = ImmutableMultimap.builder();
 		String[] str = QUERY_STRING_PATTERN.split(requestLine);
-		
 		//Parameters exist
 		if (str.length > 1) {
-			String[] paramArray = PARAM_STRING_PATTERN.split(str[1]); 
-			for (String keyValue : paramArray) {
-				String[] keyValueArray = KEY_VALUE_PATTERN.split(keyValue);				
-				//We need to check if the parameter has a value associated with it.
-				if (keyValueArray.length > 1) {
-					builder.put(keyValueArray[0], keyValueArray[1]); //name, value
-				}
+			return parseParameters2(str[1]);
+		}
+		return (ImmutableMultimap.<String, String>builder()).build();
+	}
+	
+	private ImmutableMultimap<String, String> parseParameters2(String line) {
+		ImmutableMultimap.Builder<String, String> builder = ImmutableMultimap.builder();
+		//Parameters exist
+		String[] paramArray = PARAM_STRING_PATTERN.split(line); 
+		for (String keyValue : paramArray) {
+			String[] keyValueArray = KEY_VALUE_PATTERN.split(keyValue);
+			//We need to check if the parameter has a value associated with it.
+			if (keyValueArray.length > 1) {
+				builder.put(keyValueArray[0], keyValueArray[1]); //name, value
 			}
 		}
 		return builder.build();
-	}
+	}	
 	
 	public static final boolean findInBB(ByteBuffer buffer, byte[] bytes) {
 		byte[] temp = new byte[bytes.length];
