@@ -327,7 +327,7 @@ public class HttpProtocol implements IOHandler {
 				}
 			} catch (IOException e) {
 				request = MalFormedHttpRequest.instance;
-				logger.debug("malformed HttpRequest");
+				logger.debug("malformed HttpRequest", e);
 			}
 		}
 		//set extra request info

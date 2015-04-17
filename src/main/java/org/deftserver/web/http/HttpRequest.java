@@ -168,34 +168,40 @@ public class HttpRequest {
 			this.headers = new HashMap<String, String>(headers);
 			this.um_headers = Collections.unmodifiableMap(this.headers);
 			
+			parameters = parseParameters(elements[1]);
 			if (method == HttpVerb.POST) {
 				String ctype = headers.get("content-type");
 				if (ctype == null) throw new ProtocolException("no content type for POST");
 				String[] contentTypeArr = HEADER_VAL_SPLIT_PATTERN.split(ctype);
 				contentType = contentTypeArr[0].trim();
-				if (contentType.equals("multipart/form-data")) {
-					String[] mparr = contentTypeArr[1].split("=");
-					if (mparr.length < 2 || !mparr[0].equals("boundary")) {
-						throw new ProtocolException("Expected mp boundary string, got " + contentTypeArr[1]);
-					}
-					multipartBoundary = mparr[1];
-					logger.debug("got multipart boundary: {}", multipartBoundary);
-					multipartBoundaryB = multipartBoundary.getBytes(Charsets.ISO_8859_1);
-					mpBoundaryBPre    = ("\r\n--" + multipartBoundary).getBytes(Charsets.ISO_8859_1);
-					mpBoundaryBStart  = ("--" + multipartBoundary + "\r\n").getBytes(Charsets.ISO_8859_1);
-					mpBoundaryBActual = (mpBoundaryBPre + "\r\n").getBytes(Charsets.ISO_8859_1);
-					mpBoundaryBFinish = (mpBoundaryBPre + "--\r\n").getBytes(Charsets.ISO_8859_1);
-					multipart = true;
-					mpParts = new LinkedHashMap<String, HttpRequest.Part>();
-					um_mpParts = Collections.unmodifiableMap(mpParts);
-				}
 				String clen = headers.get("content-length");
-				if (clen == null) throw new ProtocolException("no content length for POST");
-				contentLength = Integer.parseInt(clen);
-				if (contentLength <= 0) throw new ProtocolException("content-length <= 0!");
-				rawBody = ByteBuffer.allocate(contentLength);
+				if (!clen.isEmpty()) contentLength = Integer.parseInt(clen);
+				if ((contentType == null || contentType.isEmpty()) && contentLength > 0) {
+					throw new ProtocolException("No POST content type given and has content length!");
+				} else {
+					if (contentType.equals("multipart/form-data")) {
+						String[] mparr = contentTypeArr[1].split("=");
+						if (mparr.length < 2 || !mparr[0].equals("boundary")) {
+							throw new ProtocolException("Expected mp boundary string, got " + contentTypeArr[1]);
+						}
+						multipartBoundary = mparr[1];
+						logger.debug("got multipart boundary: {}", multipartBoundary);
+						multipartBoundaryB = multipartBoundary.getBytes(Charsets.ISO_8859_1);
+						mpBoundaryBPre    = ("\r\n--" + multipartBoundary).getBytes(Charsets.ISO_8859_1);
+						mpBoundaryBStart  = ("--" + multipartBoundary + "\r\n").getBytes(Charsets.ISO_8859_1);
+						mpBoundaryBActual = (mpBoundaryBPre + "\r\n").getBytes(Charsets.ISO_8859_1);
+						mpBoundaryBFinish = (mpBoundaryBPre + "--\r\n").getBytes(Charsets.ISO_8859_1);
+						multipart = true;
+						mpParts = new LinkedHashMap<String, HttpRequest.Part>();
+						um_mpParts = Collections.unmodifiableMap(mpParts);
+					} else if (contentType.equals("application/x-www-form-urlencoded")) {
+						multipart = false;
+					} else {
+						throw new ProtocolException("Unsupported POST content type: " + contentType);
+					}
+					rawBody = ByteBuffer.allocate(contentLength);
+				}
 			}
-			parameters = parseParameters(elements[1]);
 		} else {
 			version = null;
 			requestedPath = null;
@@ -316,6 +322,11 @@ public class HttpRequest {
 		if (method != HttpVerb.POST) {
 			throw new IllegalStateException("Method not POST");
 		}
+		if (contentLength == 0) {
+			complete = true;
+			return true;			
+		}
+		
 		// put the buffer into rawbody, then put the limit to the current position, position back to before the buffer was fed in
 		// to set it up for reading that new data.
 		int oldRawPos = rawBody.position();
