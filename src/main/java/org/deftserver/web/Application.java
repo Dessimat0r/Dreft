@@ -1,18 +1,18 @@
 package org.deftserver.web;
 
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
 import org.deftserver.util.HttpUtil;
 import org.deftserver.web.handler.BadRequestRequestHandler;
+import org.deftserver.web.handler.CorsPreflightRequestHandler;
 import org.deftserver.web.handler.ForbiddenRequestHandler;
 import org.deftserver.web.handler.NotFoundRequestHandler;
 import org.deftserver.web.handler.RequestHandler;
 import org.deftserver.web.handler.StaticContentHandler;
 import org.deftserver.web.http.HttpRequest;
-
-import com.google.common.collect.ImmutableMap;
 
 public class Application {
 	public final AtomicInteger requestNum = new AtomicInteger(0);
@@ -21,28 +21,30 @@ public class Application {
 	 * "Normal/Absolute" (non group capturing) RequestHandlers
 	 * e.g. "/", "/persons"
 	 */
-	private final ImmutableMap<String, RequestHandler> absoluteHandlers;
+	private final Map<String, RequestHandler> absoluteHandlers;
 
 	/**
 	 * Group capturing RequestHandlers
 	 * e.g. "/persons/([0-9]+)", "/persons/(\\d{1,3})"  
 	 */
-	private final ImmutableMap<String, RequestHandler> capturingHandlers;
+	private final Map<String, RequestHandler> capturingHandlers;
 	
 	/**
 	 * A mapping between group capturing RequestHandlers and their corresponding pattern ( e.g. "([0-9]+)" )
 	 */
-	private final ImmutableMap<RequestHandler, Pattern> patterns;
+	private final Map<RequestHandler, Pattern> patterns;
 	
 	/**
 	 * The directory where static content (files) will be served from.
 	 */
 	private String staticContentDir;
+	private java.nio.file.Path staticContentRoot;
+	private boolean staticContentDirIsAbsolute;
 	
 	public Application(Map<String, RequestHandler> handlers) {
-		ImmutableMap.Builder<String, RequestHandler> builder = new ImmutableMap.Builder<String, RequestHandler>();
-		ImmutableMap.Builder<String, RequestHandler> capturingBuilder = new ImmutableMap.Builder<String, RequestHandler>();
-		ImmutableMap.Builder<RequestHandler, Pattern> patternsBuilder = new ImmutableMap.Builder<RequestHandler, Pattern>();
+		Map<String, RequestHandler> builder = new HashMap<>();
+		Map<String, RequestHandler> capturingBuilder = new HashMap<>();
+		Map<RequestHandler, Pattern> patternsBuilder = new HashMap<>();
 
 		for (String path : handlers.keySet()) {
 			int index = path.lastIndexOf("/");
@@ -56,9 +58,9 @@ public class Application {
 				builder.put(path, handlers.get(path));
 			}
 		}
-		absoluteHandlers = builder.build();
-		capturingHandlers = capturingBuilder.build();
-		patterns = patternsBuilder.build();
+		absoluteHandlers = Map.copyOf(builder);
+		capturingHandlers = Map.copyOf(capturingBuilder);
+		patterns = Map.copyOf(patternsBuilder);
 	}
 
 	/**
@@ -84,9 +86,21 @@ public class Application {
 		if (!HttpUtil.verifyRequest(request)) {
 			return BadRequestRequestHandler.getInstance(); 
 		}
+		
+		RequestHandler rh = getHandler(request.getRequestedPath());
+		
+		// Intercept CORS preflight request
+		if (request.getMethod() == HttpVerb.OPTIONS && 
+			request.getHeader("Origin") != null && 
+			request.getHeader("Access-Control-Request-Method") != null) {
+			if (rh != null && rh != NotFoundRequestHandler.getInstance() && rh.getCorsConfig() != null) {
+				return rh;
+			}
+			return CorsPreflightRequestHandler.getInstance();
+		}
+		
 		// if @Authenticated annotation is present, make sure that the request/user is authenticated 
 		// (i.e RequestHandler.getCurrentUser() != null).
-		RequestHandler rh = getHandler(request.getRequestedPath());
 		if (rh == null) return NotFoundRequestHandler.getInstance();
 		if (rh.isMethodAuthenticated(request.getMethod()) && rh.getCurrentUser(request) == null) {
 			return ForbiddenRequestHandler.getInstance();
@@ -121,11 +135,18 @@ public class Application {
 	}
 	
 	private RequestHandler getStaticContentHandler(String path) {
-		if (staticContentDir == null || path.length() <= staticContentDir.length()) {
+		if (staticContentDir == null || staticContentRoot == null || path.length() <= staticContentDir.length()) {
 			return null;	// quick reject (no static dir or simple contradiction)
 		}
 		
-		if (path.substring(1).startsWith(staticContentDir)) {
+		java.nio.file.Path requested;
+		if (staticContentDirIsAbsolute) {
+			requested = java.nio.file.Path.of(path).toAbsolutePath().normalize();
+		} else {
+			requested = java.nio.file.Path.of(path.substring(1)).toAbsolutePath().normalize();
+		}
+		
+		if (requested.startsWith(staticContentRoot)) {
 			return StaticContentHandler.getInstance();
 		} else {
 			return null;
@@ -134,6 +155,14 @@ public class Application {
 	
 	public void setStaticContentDir(String scd) {
 		this.staticContentDir = scd;
+		if (scd != null) {
+			this.staticContentRoot = java.nio.file.Path.of(scd).toAbsolutePath().normalize();
+			this.staticContentDirIsAbsolute = java.nio.file.Path.of(scd).isAbsolute();
+		} else {
+			this.staticContentRoot = null;
+			this.staticContentDirIsAbsolute = false;
+		}
+		StaticContentHandler.getInstance().setStaticContentDir(scd);
 	}
 
 }

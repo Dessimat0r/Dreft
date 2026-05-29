@@ -2,12 +2,9 @@ package org.deftserver.example.kv;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.nio.ByteBuffer;
-import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
 
 import org.deftserver.io.AsynchronousSocket;
-import org.deftserver.io.IOLoop;
 import org.deftserver.web.AsyncCallback;
 import org.deftserver.web.AsyncResult;
 import org.slf4j.Logger;
@@ -32,7 +29,6 @@ public class KeyValueStoreClient {
 			channel = SocketChannel.open(new InetSocketAddress(host, port));
 			channel.configureBlocking(false);
 			socket = new AsynchronousSocket(channel);
-			IOLoop.INSTANCE.addHandler(channel, socket, SelectionKey.OP_READ, ByteBuffer.allocate(1024));
 		} catch (IOException e) {
 			e.printStackTrace();
 		}

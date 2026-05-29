@@ -81,12 +81,15 @@ public class AsynchronousHttpClient {
 	
 	private void doFetch(AsyncResult<Response> cb, long requestStarted) {
 		this.requestStarted = requestStarted;
-		try {
-			socket = new AsynchronousSocket(SocketChannel.open().configureBlocking(false));
-		} catch (IOException e) {
-			logger.error("Error opening SocketChannel: {}" + e.getMessage());
-		}
 		responseCallback = cb;
+		try {
+			socket = new AsynchronousSocket(ioLoop, SocketChannel.open());
+		} catch (IOException e) {
+			logger.error("Error opening SocketChannel: {}", e.getMessage());
+			responseCallback = nopAsyncResult;
+			cb.onFailure(e);
+			return;
+		}
 		int port = request.getURL().getPort();
 		port = port == -1 ? 80 : port;
 		startTimeout();
@@ -182,8 +185,13 @@ public class AsynchronousHttpClient {
 		String[] headers = result.split("\r\n");
 		response.setStatuLine(headers[0]);	// first entry contains status line (e.g. HTTP/1.1 200 OK)
 		for (int i = 1; i < headers.length; i++) {
-			String[] header = headers[i].split(": ");
-			response.setHeader(header[0], header[1]);
+			String headerLine = headers[i];
+			int colonIndex = headerLine.indexOf(':');
+			if (colonIndex != -1) {
+				String key = headerLine.substring(0, colonIndex).trim();
+				String value = headerLine.substring(colonIndex + 1).trim();
+				response.setHeader(key, value);
+			}
 		}
 		logger.debug("cl-ahttpc");
 		String contentLength = response.getHeader("Content-Length");
@@ -258,6 +266,11 @@ public class AsynchronousHttpClient {
 		@Override
 		public void onFailure(Throwable caught) {
 			logger.debug("onFailure: {}", caught);
+			cancelTimeout();
+			AsyncResult<Response> cb = responseCallback;
+			responseCallback = nopAsyncResult;
+			cb.onFailure(caught);
+			close();
 		}
 		
 	}

@@ -16,8 +16,12 @@ public class Closeables {
 	public static void closeQuietly(IOLoop ioLoop, SelectableChannel channel) {
 		try {
 			ioLoop.removeHandler(channel);
-			com.google.common.io.Closeables.close(channel, true);
-		} catch (IOException ignore) { }
+		} catch (Exception ignore) {}
+		if (channel != null) {
+			try {
+				channel.close();
+			} catch (IOException ignore) { }
+		}
 	}
 	
 }

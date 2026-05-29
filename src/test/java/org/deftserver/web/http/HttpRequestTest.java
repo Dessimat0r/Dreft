@@ -6,6 +6,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -354,6 +355,119 @@ public class HttpRequestTest {
 		HttpRequest request = new HttpRequest(requestLine, new HashMap<String, String>());
 		Assert.assertEquals("/foobar/", request.getRequestedPath());
 	}
+
+	@Test
+	public void parsesHeadersWithOptionalWhitespace() {
+		HttpRequest request = HttpRequest.of(raw("""
+				GET / HTTP/1.1\r
+				Host:localhost\r
+				X-Test:   value\r
+				\r
+				"""));
+
+		assertEquals("localhost", request.getHeader("host"));
+		assertEquals("value", request.getHeader("x-test"));
+	}
+
+	@Test
+	public void rejectsConflictingContentLengthHeaders() {
+		HttpRequest request = HttpRequest.of(raw("""
+				POST / HTTP/1.1\r
+				Host: localhost\r
+				Content-Length: 1\r
+				Content-Length: 2\r
+				\r
+				a"""));
+
+		assertTrue(request instanceof MalFormedHttpRequest);
+	}
+
+	@Test
+	public void parsesChunkedRequestBody() {
+		HttpRequest request = HttpRequest.of(raw("""
+				POST /echo HTTP/1.1\r
+				Host: localhost\r
+				Transfer-Encoding: chunked\r
+				Content-Type: text/plain\r
+				\r
+				4\r
+				Wiki\r
+				5\r
+				pedia\r
+				0\r
+				\r
+				"""));
+
+		assertTrue(request.isComplete());
+		assertEquals("Wikipedia", request.getBody());
+	}
+
+	@Test
+	public void allowsBodiesForPutAndPatch() {
+		HttpRequest put = HttpRequest.of(raw("""
+				PUT /resource HTTP/1.1\r
+				Host: localhost\r
+				Content-Type: text/plain\r
+				Content-Length: 3\r
+				\r
+				put"""));
+		HttpRequest patch = HttpRequest.of(raw("""
+				PATCH /resource HTTP/1.1\r
+				Host: localhost\r
+				Content-Type: text/plain\r
+				Content-Length: 5\r
+				\r
+				patch"""));
+
+		assertEquals("put", put.getBody());
+		assertEquals("patch", patch.getBody());
+	}
+
+	@Test
+	public void unknownMethodsDoNotCrashParser() {
+		HttpRequest request = HttpRequest.of(raw("""
+				PROPFIND /resource HTTP/1.1\r
+				Host: localhost\r
+				\r
+				"""));
+
+		assertEquals(org.deftserver.web.HttpVerb.UNKNOWN, request.getMethod());
+	}
+	@Test
+	public void testFindInBB() {
+		// Empty search term
+		ByteBuffer buf = ByteBuffer.wrap("abc".getBytes(StandardCharsets.ISO_8859_1));
+		assertTrue(HttpRequest.findInBB(buf, new byte[0]));
+		assertEquals(0, buf.position());
+
+		// Search term exists at start
+		buf = ByteBuffer.wrap("abcdef".getBytes(StandardCharsets.ISO_8859_1));
+		assertTrue(HttpRequest.findInBB(buf, "abc".getBytes(StandardCharsets.ISO_8859_1)));
+		assertEquals(3, buf.position());
+
+		// Search term exists in middle
+		buf = ByteBuffer.wrap("abcdef".getBytes(StandardCharsets.ISO_8859_1));
+		assertTrue(HttpRequest.findInBB(buf, "cde".getBytes(StandardCharsets.ISO_8859_1)));
+		assertEquals(5, buf.position());
+
+		// Search term exists at end
+		buf = ByteBuffer.wrap("abcdef".getBytes(StandardCharsets.ISO_8859_1));
+		assertTrue(HttpRequest.findInBB(buf, "def".getBytes(StandardCharsets.ISO_8859_1)));
+		assertEquals(6, buf.position());
+
+		// Search term does not exist
+		buf = ByteBuffer.wrap("abcdef".getBytes(StandardCharsets.ISO_8859_1));
+		assertFalse(HttpRequest.findInBB(buf, "xyz".getBytes(StandardCharsets.ISO_8859_1)));
+		assertEquals(6, buf.position());
+
+		// Partial/overlapping matches that succeed
+		buf = ByteBuffer.wrap("ababcde".getBytes(StandardCharsets.ISO_8859_1));
+		assertTrue(HttpRequest.findInBB(buf, "abc".getBytes(StandardCharsets.ISO_8859_1)));
+		assertEquals(5, buf.position());
+	}
 	
+	private static ByteBuffer raw(String data) {
+		return ByteBuffer.wrap(data.getBytes(StandardCharsets.ISO_8859_1));
+	}
 
 }

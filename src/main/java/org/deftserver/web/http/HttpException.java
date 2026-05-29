@@ -10,6 +10,10 @@ public class HttpException extends RuntimeException {
 		this(statusCode, Integer.toString(statusCode), Integer.toString(statusCode));
 	}
 
+	public HttpException(int statusCode, String message) {
+		this(statusCode, message, message);
+	}
+
 	public HttpException(int statusCode, String briefMsg, String longHTMLMessage) {
 		super(briefMsg);
 		this.statusCode = statusCode;

@@ -2,14 +2,15 @@ package org.deftserver.web.http.client;
 
 import java.util.Map;
 
-import com.google.common.collect.Maps;
+import java.util.HashMap;
 
 public class Response {
 	
 	private final long requestTime;
 	private String statusLine;
-	private final Map<String, String> headers = Maps.newHashMap();
-	private String body = "";
+	private final Map<String, String> headers = new HashMap<>();
+	private final StringBuilder bodyBuilder = new StringBuilder();
+	private String body = null;
 	
 	public Response(long requestStarted) {
 		requestTime = System.currentTimeMillis() - requestStarted;
@@ -36,6 +37,9 @@ public class Response {
 	}
 	
 	public String getBody() {
+		if (body == null) {
+			body = bodyBuilder.toString();
+		}
 		return body;
 	}
 	
@@ -48,12 +52,12 @@ public class Response {
 	
 	@Override
 	public String toString() {
-		return "HttpResponse [body=" + body + ", headers=" + headers
+		return "HttpResponse [body=" + getBody() + ", headers=" + headers
 				+ "\n, statusLine=" + statusLine + "]\n" + ", request time: " + requestTime +"ms";
 	}
 
-	void addChunk(String chunk) {
-		body += chunk;
+	public void addChunk(String chunk) {
+		bodyBuilder.append(chunk);
 	}
 	
 }

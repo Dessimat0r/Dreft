@@ -10,23 +10,31 @@ import org.deftserver.web.HttpVerb;
 import org.deftserver.web.http.HttpRequest;
 import org.deftserver.web.http.HttpResponse;
 
-import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Maps;
+import java.util.HashMap;
 
 public abstract class RequestHandler {
 
-	private final ImmutableMap<HttpVerb, Boolean> asynchVerbs;
-	private final ImmutableMap<HttpVerb, Boolean> authVerbs;
+	private final Map<HttpVerb, Boolean> asynchVerbs;
+	private final Map<HttpVerb, Boolean> authVerbs;
+	private org.deftserver.web.http.CorsConfig corsConfig;
+
+	public org.deftserver.web.http.CorsConfig getCorsConfig() {
+		return corsConfig;
+	}
+
+	public void setCorsConfig(org.deftserver.web.http.CorsConfig corsConfig) {
+		this.corsConfig = corsConfig;
+	}
 
 	public RequestHandler() {
-		Map<HttpVerb, Boolean> asyncV = Maps.newHashMap();
-		Map<HttpVerb, Boolean> authV = Maps.newHashMap();
+		Map<HttpVerb, Boolean> asyncV = new HashMap<>();
+		Map<HttpVerb, Boolean> authV = new HashMap<>();
 		for (HttpVerb verb : HttpVerb.values()) {
 			authV.put(verb, isMethodAnnotated(verb, Authenticated.class));
 			asyncV.put(verb, isMethodAnnotated(verb, Asynchronous.class));
 		}
-		asynchVerbs = ImmutableMap.copyOf(asyncV);
-		authVerbs = ImmutableMap.copyOf(authV);
+		asynchVerbs = Map.copyOf(asyncV);
+		authVerbs = Map.copyOf(authV);
 	}
 
 	private boolean isMethodAnnotated(HttpVerb verb, Class<? extends Annotation> annotation) {
@@ -39,11 +47,13 @@ public abstract class RequestHandler {
 	}
 	
 	public boolean isMethodAsynchronous(HttpVerb verb) {
-		return asynchVerbs.get(verb);
+		HttpVerb effective = (verb == HttpVerb.HEAD) ? HttpVerb.GET : verb;
+		return asynchVerbs.get(effective);
 	}
 	
 	public boolean isMethodAuthenticated(HttpVerb verb) {
-		return authVerbs.get(verb);
+		HttpVerb effective = (verb == HttpVerb.HEAD) ? HttpVerb.GET : verb;
+		return authVerbs.get(effective);
 	}
 
 	//Default implementation of HttpMethods return a 501 page
@@ -62,12 +72,31 @@ public abstract class RequestHandler {
 		response.write("");
 	}
 
+	public void patch(HttpRequest request, HttpResponse response) throws IOException {
+		response.setStatusCode(501);
+		response.write("");
+	}
+
 	public void delete(HttpRequest request, HttpResponse response) throws IOException { 
 		response.setStatusCode(501);
 		response.write("");
 	}
 
 	public void head(HttpRequest request, HttpResponse response) throws IOException { 
+		get(request, response);
+	}
+
+	public void options(HttpRequest request, HttpResponse response) throws IOException { 
+		response.setStatusCode(501);
+		response.write("");
+	}
+
+	public void trace(HttpRequest request, HttpResponse response) throws IOException { 
+		response.setStatusCode(501);
+		response.write("");
+	}
+
+	public void connect(HttpRequest request, HttpResponse response) throws IOException { 
 		response.setStatusCode(501);
 		response.write("");
 	}

@@ -22,24 +22,23 @@ public class KeyValueStoreExample {
 	
 	private static class KeyValueStoreExampleRequestHandler extends RequestHandler {
 
-		private final KeyValueStoreClient client = new KeyValueStoreClient(KeyValueStore.HOST, KeyValueStore.PORT);
+		private final int port;
 		
 		public KeyValueStoreExampleRequestHandler() {
-			new KeyValueStore().start();
-			client.connect();
+			KeyValueStore store = new KeyValueStore();
+			store.start();
+			port = store.getPort();
 		}
 		
 		@Override
 		@Asynchronous
 		public void get(HttpRequest request, final HttpResponse response) throws IOException {
+			KeyValueStoreClient client = new KeyValueStoreClient(KeyValueStore.HOST, port);
+			client.connect();
 			client.get("deft", new AsyncResult<String>() {
 				@Override public void onFailure(Throwable caught) { /* ignore */}
 				@Override public void onSuccess(String result) { 
-					try {
-						response.write(result).finish();
-					} catch (IOException e) {
-						e.printStackTrace();
-					}
+					response.write(result).finish();
 				}
 			});
 		}

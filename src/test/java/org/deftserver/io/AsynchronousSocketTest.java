@@ -24,54 +24,56 @@ import org.junit.Test;
 public class AsynchronousSocketTest {
 
 	public static final String HOST = "localhost";
-	public static final int PORT = 6228;
+	private int port;
+	private IOLoop ioLoop;
+	private AsynchronousSocket socket;
+	private CountDownLatch latch;
 
 	@Before
-	public void setup() throws InterruptedException {
+	public void setup() throws Exception {
+		ioLoop = new IOLoop();
+		SelectableChannel channel = SocketChannel.open();
+		channel.configureBlocking(false);
+		socket = new AsynchronousSocket(ioLoop, channel);
+		latch = new CountDownLatch(3);	// 3 op/callbacks (connect, write, read)
+
 		// start the IOLoop from a new thread so we dont block this test.
-		new Thread(new Runnable() {
-			@Override public void run() { IOLoop.INSTANCE.start(); }
-		}).start();
+		Thread.ofPlatform().start(() -> ioLoop.start());
 		Thread.sleep(300);	// hack to avoid SLF4J warning
 		
 		final CountDownLatch latch = new CountDownLatch(1);	
-		new Thread(new Runnable() {
+		final ServerSocket server = new ServerSocket(0);
+		port = server.getLocalPort();
+		Thread.ofPlatform().start(() -> {
+			InputStream is = null;
+			DataOutputStream os = null;
+			try {
+				System.out.println("waiting for client...");
+				latch.countDown();
+				Socket client = server.accept();
+				System.out.println("client connected..");
+				is = client.getInputStream();
+				os = new DataOutputStream(client.getOutputStream());
 
-			@Override
-			public void run() {
-				DataInputStream is = null;
-				DataOutputStream os = null;
-				try {
-					System.out.println("waiting for client...");
-					ServerSocket server = new ServerSocket(PORT);
-					latch.countDown();
-					Socket client = server.accept();
-					System.out.println("client connected..");
-					is = new DataInputStream(client.getInputStream());
-					os = new DataOutputStream(client.getOutputStream());
-
-					String recevied = is.readLine();
-					System.out.println("about to send: " + recevied);
-					os.writeBytes(recevied.toUpperCase());
-					System.out.println("sent data to client, shutdown server...");
-					server.close();
-				} catch (Exception e) {
-					e.printStackTrace();
-				} finally {
-					closeQuietly(is, os);
-				}
+				java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(is));
+				String recevied = reader.readLine();
+				System.out.println("about to send: " + recevied);
+				os.writeBytes(recevied.toUpperCase());
+				System.out.println("sent data to client, shutdown server...");
+				server.close();
+			} catch (Exception e) {
+				e.printStackTrace();
+			} finally {
+				closeQuietly(is, os);
 			}
-		}).start();
+		});
 		
 		latch.await(5, TimeUnit.SECONDS);
 	}
 	
 	@After
 	public void tearDown() throws InterruptedException {
-		IOLoop.INSTANCE.addCallback(new AsyncCallback() {
-			@Override
-			public void onCallback() { IOLoop.INSTANCE.stop(); }
-		});
+		ioLoop.addCallback(() -> ioLoop.stop());
 		Thread.sleep(300);	// give the IOLoop thread some time to gracefully shutdown
 	}
 
@@ -84,22 +86,13 @@ public class AsynchronousSocketTest {
 		}
 	}
 
-	private final AsynchronousSocket socket;
-	private final CountDownLatch latch = new CountDownLatch(3);	// 3 op/callbacks (connect, write, read)
-	
-	public AsynchronousSocketTest() throws IOException {
-		SelectableChannel channel = SocketChannel.open();
-		channel.configureBlocking(false);
-		socket = new AsynchronousSocket(channel);
-	}
-	
 	@Test
 	public void connectWriteAndReadCallbackTest() throws InterruptedException, IOException {
 		AsyncResult<Boolean> ccb = new AsyncResult<Boolean>() {
 			public void onFailure(Throwable caught) { }
 			public void onSuccess(Boolean result) { onConnect(); }
 		};
-		socket.connect(HOST, PORT, ccb);
+		socket.connect(HOST, port, ccb);
 		
 		latch.await(5, TimeUnit.SECONDS);
 		

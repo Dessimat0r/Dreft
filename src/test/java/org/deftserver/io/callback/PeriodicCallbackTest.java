@@ -6,31 +6,27 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import org.deftserver.io.IOLoop;
-import org.deftserver.web.AsyncCallback;
 import org.junit.Test;
 
 public class PeriodicCallbackTest {
 	
 	@Test
 	public void testPeriodicCallback() throws InterruptedException {
+		final IOLoop ioLoop;
+		try {
+			ioLoop = new IOLoop();
+		} catch (java.io.IOException e) {
+			throw new AssertionError(e);
+		}
 		// start the IOLoop from a new thread so we dont block this test.
-		new Thread(new Runnable() {
-
-			@Override public void run() { IOLoop.INSTANCE.start(); }
+		Thread.ofPlatform().start(() -> ioLoop.start());
 		
-		}).start();
-		
-		final CountDownLatch latch = new CountDownLatch(200);
+		final CountDownLatch latch = new CountDownLatch(10);
 		long period = 10; // 10ms (=> ~100times / s)
-		AsyncCallback cb = new AsyncCallback() {
-			@Override public void onCallback() { latch.countDown(); }
-		};
-		final PeriodicCallback pcb = new PeriodicCallback(cb, period);
-		IOLoop.INSTANCE.addCallback(new AsyncCallback() { public void onCallback() { pcb.start(); }});
+		ioLoop.addCallback(() -> new PeriodicCallback(ioLoop, latch::countDown, period).start());
 		
-		latch.await(5, TimeUnit.SECONDS);
-		pcb.cancel();
-		IOLoop.INSTANCE.stop();
+		latch.await(1, TimeUnit.SECONDS);
+		ioLoop.stop();
 		// TODO wait?
 		assertEquals(0, latch.getCount());
 	}

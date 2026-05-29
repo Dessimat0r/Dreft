@@ -12,7 +12,7 @@ import org.deftserver.web.http.HttpResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.collect.Maps;
+import java.util.HashMap;
 
 
 
@@ -36,7 +36,7 @@ public class DeftServerExample {
 	}
 
 	public static void main(String[] args) {
-		Map<String, RequestHandler> handlers = Maps.newHashMap();
+		Map<String, RequestHandler> handlers = new HashMap<>();
 		handlers.put("/", new ExampleRequestHandler());
 		
 		Application application = new Application(handlers);

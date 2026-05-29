@@ -1,23 +1,23 @@
 package org.deftserver.io.timeout;
 
 import java.nio.channels.SelectableChannel;
-import java.util.Iterator;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.deftserver.util.MXBeanUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.collect.Maps;
-import com.google.common.collect.TreeMultiset;
-
-
 public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManagerMXBean {
 
 	private final Logger logger = LoggerFactory.getLogger(JMXDebuggableTimeoutManager.class);
 
-	private final TreeMultiset<DecoratedTimeout> timeouts = TreeMultiset.create();
-	private final Map<SelectableChannel, DecoratedTimeout> index = Maps.newHashMap();
+	private final PriorityQueue<DecoratedTimeout> timeouts = new PriorityQueue<>();
+	private final Map<SelectableChannel, DecoratedTimeout> index = new HashMap<>();
+
+	private static final AtomicLong seqGenerator = new AtomicLong(0);
 
 	{ 	// instance initialization block
 		MXBeanUtil.registerMXBean(this, "TimeoutManager"); 
@@ -28,7 +28,7 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 		logger.debug("added keep-alive timeout: {}", timeout);
 		DecoratedTimeout oldTimeout = index.get(channel);
 		if (oldTimeout != null) {
-			timeouts.remove(oldTimeout);
+			oldTimeout.timeout.cancel(); // O(1) cancel instead of O(N) timeouts.remove(oldTimeout)
 		}
 		DecoratedTimeout decorated = new DecoratedTimeout(channel, timeout);
 		timeouts.add(decorated);
@@ -48,23 +48,34 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 
 	@Override
 	public long execute() {
-		// makes a defensive copy to avoid (1) CME (new timeouts are added this iteration) and (2) IO starvation.
-		TreeMultiset<DecoratedTimeout> defensive = TreeMultiset.create(timeouts);
-		Iterator<DecoratedTimeout> iter = defensive.iterator();
-		final long now = System.currentTimeMillis();
-		while (iter.hasNext()) {
-			DecoratedTimeout candidate = iter.next();
-			if (candidate.timeout.getTimeout() > now) { break; }
-			candidate.timeout.getCallback().onCallback();
-			index.remove(candidate.channel);
-			iter.remove();
-			timeouts.remove(candidate);
-			logger.debug("Timeout triggered: {}", candidate.timeout);
-		}
-		return timeouts.isEmpty() ? Long.MAX_VALUE : Math.max(1, timeouts.iterator().next().timeout.getTimeout() - now);
+		return execute(System.currentTimeMillis());
 	}
 
-	// implements TimoutMXBean
+	public long execute(long now) {
+		while (!timeouts.isEmpty()) {
+			DecoratedTimeout candidate = timeouts.peek();
+			if (candidate.timeout.getTimeout() > now) { 
+				break; 
+			}
+			timeouts.poll();
+			try {
+				candidate.timeout.getCallback().onCallback();
+			} catch (RuntimeException e) {
+				// A bad callback must not abort the rest of the timeout queue.
+				logger.error("RuntimeException in timeout callback — skipping and continuing", e);
+			}
+			if (candidate.channel != null) {
+				DecoratedTimeout current = index.get(candidate.channel);
+				if (current == candidate) {
+					index.remove(candidate.channel);
+				}
+			}
+			logger.debug("Timeout triggered: {}", candidate.timeout);
+		}
+		return timeouts.isEmpty() ? Long.MAX_VALUE : Math.max(1, timeouts.peek().timeout.getTimeout() - now);
+	}
+
+	// implements TimeoutMXBean
 	@Override
 	public int getNumberOfKeepAliveTimeouts() {
 		return index.size();
@@ -79,6 +90,7 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 
 		public final SelectableChannel channel;
 		public final Timeout timeout;
+		private final long sequenceNumber = seqGenerator.getAndIncrement();
 
 		public DecoratedTimeout(SelectableChannel channel, Timeout timeout) {
 			this.channel = channel;
@@ -91,21 +103,14 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 
 		@Override
 		public int compareTo(DecoratedTimeout that) {
-			long diff = timeout.getTimeout() - that.timeout.getTimeout();
-			if (diff < 0) {
-				return -1;
-			} else if (diff > 0) {
-				return 1; 
-			} 
-			if (channel != null && that.channel != null) {
-				return channel.hashCode() - that.channel.hashCode(); 
-			} else if (channel == null && that.channel != null){
-				return -1;
-			} else if (channel != null && that.channel == null){
-				return -1;
-			} else {
+			if (this == that) {
 				return 0;
 			}
+			int diff = Long.compare(this.timeout.getTimeout(), that.timeout.getTimeout());
+			if (diff != 0) {
+				return diff;
+			}
+			return Long.compare(this.sequenceNumber, that.sequenceNumber);
 		}
 		
 	}

@@ -9,13 +9,12 @@ import org.deftserver.web.AsyncCallback;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.collect.Lists;
 
 public class JMXDebuggableCallbackManager implements CallbackManager, CallbackManagerMXBean {
 
 	private final Logger logger = LoggerFactory.getLogger(JMXDebuggableCallbackManager.class);
 	
-	private final AbstractCollection<AsyncCallback> callbacks = new ConcurrentLinkedQueue<AsyncCallback>();
+	private final java.util.Queue<AsyncCallback> callbacks = new java.util.concurrent.ConcurrentLinkedQueue<AsyncCallback>();
 	
 	{ 	// instance initialization block
 		MXBeanUtil.registerMXBean(this, "CallbackManager"); 
@@ -34,12 +33,19 @@ public class JMXDebuggableCallbackManager implements CallbackManager, CallbackMa
 
 	@Override
 	public boolean execute() {
-		// makes a defensive copy to avoid (1) CME (new callbacks are added this iteration) and (2) IO starvation.
-		List<AsyncCallback> defensive = Lists.newLinkedList(callbacks);
-		callbacks.clear();
-		for (AsyncCallback callback : defensive) {
-			callback.onCallback();
-			logger.debug("Callback executed");
+		int size = callbacks.size();
+		if (size == 0) {
+			return false;
+		}
+		for (int i = 0; i < size; i++) {
+			AsyncCallback cb = callbacks.poll();
+			if (cb == null) {
+				break;
+			}
+			cb.onCallback();
+			if (logger.isDebugEnabled()) {
+				logger.debug("Callback executed");
+			}
 		}
 		return !callbacks.isEmpty();
 	}

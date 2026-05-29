@@ -1,12 +1,12 @@
 package org.deftserver.util;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
-
-import com.google.common.collect.HashMultimap;
-import com.google.common.collect.Multimap;
 
 /**
  * This class can be used to create HttpRequests (and corresponding byte representations)
@@ -34,7 +34,7 @@ From: abcde@qwert.com
 	private String version = "1.1";
 	private String requestedPath = "/";
 	private Map<String, String> headers = new HashMap<String, String>();
-	private Multimap<String, String> getParameters = HashMultimap.create();
+	private Map<String, List<String>> getParameters = new LinkedHashMap<>();
 	
 	public HttpRequestHelper() {
 		headers.put("Host", "localhost:8080");
@@ -70,7 +70,7 @@ From: abcde@qwert.com
 	}
 	
 	public boolean addGetParameter(String name, String value) {
-		return getParameters.put(name, value);
+		return getParameters.computeIfAbsent(name, k -> new ArrayList<>()).add(value);
 	}
 	
 	public void setRequestedPath(String path) {

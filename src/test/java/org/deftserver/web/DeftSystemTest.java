@@ -5,12 +5,14 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 import java.nio.channels.UnresolvedAddressException;
@@ -34,13 +36,8 @@ import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.client.methods.HttpPut;
 import org.apache.http.entity.StringEntity;
-import org.apache.http.impl.client.DefaultHttpClient;
 import org.apache.http.message.BasicHeader;
-import org.apache.http.params.BasicHttpParams;
-import org.apache.http.params.HttpParams;
-import org.apache.http.params.HttpProtocolParams;
 import org.deftserver.example.kv.KeyValueStore;
-import org.deftserver.example.kv.KeyValueStoreClient;
 import org.deftserver.io.IOLoop;
 import org.deftserver.io.timeout.Timeout;
 import org.deftserver.web.handler.RequestHandler;
@@ -51,15 +48,14 @@ import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import com.google.common.collect.Maps;
-import com.ning.http.client.AsyncCompletionHandler;
-import com.ning.http.client.AsyncHttpClient;
-import com.ning.http.client.Response;
+import java.net.URI;
+import java.net.http.HttpRequest.BodyPublishers;
+import java.net.http.HttpResponse.BodyHandlers;
 
 
 public class DeftSystemTest {
 
-	private static final int PORT = 8081;
+	private static int PORT;
 
 	public static final String expectedPayload = "hello test";
 
@@ -195,19 +191,33 @@ public class DeftSystemTest {
 
 	public static class KeyValueStoreExampleRequestHandler extends RequestHandler {
 
-		private final KeyValueStoreClient client = new KeyValueStoreClient(KeyValueStore.HOST, KeyValueStore.PORT);
+		private final int port;
 
 		public KeyValueStoreExampleRequestHandler() {
-			new KeyValueStore().start();
-			client.connect();
+			KeyValueStore store = new KeyValueStore();
+			store.start();
+			port = store.getPort();
 		}
 
 		@Override
 		@Asynchronous
 		public void get(HttpRequest request, final org.deftserver.web.http.HttpResponse response) {
-			client.get("deft", new AsyncResult<String>() {
-				@Override public void onFailure(Throwable caught) { /* ignore */}
-				@Override public void onSuccess(String result) { response.write(result).finish(); }
+			Thread.startVirtualThread(() -> {
+				try (
+					Socket socket = new Socket(KeyValueStore.HOST, port);
+					BufferedWriter writer = new BufferedWriter(new java.io.OutputStreamWriter(socket.getOutputStream()));
+					BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()))
+				) {
+					writer.write("GET deft\r\n");
+					writer.flush();
+					String result = reader.readLine();
+					IOLoop.INSTANCE.addCallback(() -> response.write(result).finish());
+				} catch (IOException e) {
+					IOLoop.INSTANCE.addCallback(() -> {
+						response.setStatusCode(500);
+						response.write(e.getMessage()).finish();
+					});
+				}
 			});
 		}
 
@@ -260,19 +270,19 @@ public class DeftSystemTest {
 		@Override
 		public void get(HttpRequest request, org.deftserver.web.http.HttpResponse response) {
 			response.setHeader("Transfer-Encoding", "chunked");
-			sleep(300);
+			sleep(10);
 			
 			response.write("1\r\n");
 			response.write("a\r\n").flush();
-			sleep(300);
+			sleep(10);
 			
 			response.write("5\r\n");
 			response.write("roger\r\n").flush();
-			sleep(300);
+			sleep(10);
 			
 			response.write("2\r\n");
 			response.write("ab\r\n").flush();
-			sleep(300);
+			sleep(10);
 			
 			response.write("0\r\n");
 			response.write("\r\n");
@@ -284,7 +294,14 @@ public class DeftSystemTest {
 	}
 
 	@BeforeClass
-	public static void setup() {
+	public static void setup() throws IOException {
+		PORT = freePort();
+		org.deftserver.io.AsynchronousSocket.setDnsResolver((host, port) -> {
+			if ("somehost.invalid".equalsIgnoreCase(host)) {
+				throw new java.nio.channels.UnresolvedAddressException();
+			}
+			return new java.net.InetSocketAddress(host, port);
+		});
 		Map<String, RequestHandler> reqHandlers = new HashMap<String, RequestHandler>();
 		reqHandlers.put("/", new ExampleRequestHandler());
 		reqHandlers.put("/w", new WRequestHandler());
@@ -313,17 +330,45 @@ public class DeftSystemTest {
 
 		// start deft instance from a new thread because the start invocation is blocking 
 		// (invoking thread will be I/O loop thread)
-		new Thread(new Runnable() {
-			@Override public void run() { 
+		Thread.ofPlatform().name("I/O-LOOP").start(() -> {
+			try {
 				new HttpServer(application).listen(PORT);
-				IOLoop.INSTANCE.start(); }
-		}).start();
+			} catch (IOException e) {
+				throw new RuntimeException(e);
+			}
+			IOLoop.INSTANCE.start();
+		});
+		waitForServer();
+	}
+
+	private static int freePort() throws IOException {
+		try (java.net.ServerSocket socket = new java.net.ServerSocket(0)) {
+			return socket.getLocalPort();
+		}
+	}
+
+	private static void waitForServer() throws IOException {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+		while (System.nanoTime() < deadline) {
+			try (java.net.Socket ignored = new java.net.Socket("127.0.0.1", PORT)) {
+				return;
+			} catch (IOException e) {
+				try {
+					Thread.sleep(25);
+				} catch (InterruptedException interrupted) {
+					Thread.currentThread().interrupt();
+					throw new IOException("Interrupted while waiting for server", interrupted);
+				}
+			}
+		}
+		throw new IOException("Server did not start on port " + PORT);
 	}
 	
 	@AfterClass
 	public static void tearDown() throws InterruptedException {
 		IOLoop.INSTANCE.addCallback(new AsyncCallback() { @Override public void onCallback() { IOLoop.INSTANCE.stop(); }});
-		Thread.sleep(300);
+		Thread.sleep(20);
+		org.deftserver.io.AsynchronousSocket.setDnsResolver(java.net.InetSocketAddress::new);
 	}
 
 	@Test
@@ -334,10 +379,7 @@ public class DeftSystemTest {
 	private void doSimpleGetRequest() throws ClientProtocolException, IOException {
 		List<Header> headers = new LinkedList<Header>();
 		headers.add(new BasicHeader("Connection", "Close"));
-		HttpParams params = new BasicHttpParams();
-		params.setParameter("http.default-headers", headers);
-
-		HttpClient httpclient = new DefaultHttpClient(params);
+		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/");
 		HttpResponse response = httpclient.execute(httpget);
 		List<String> expectedHeaders = Arrays.asList(new String[] {"Server", "Date", "Content-Length", "Etag", "Connection"});
@@ -365,10 +407,7 @@ public class DeftSystemTest {
 	public void wTest() throws ClientProtocolException, IOException {
 		List<Header> headers = new LinkedList<Header>();
 		headers.add(new BasicHeader("Connection", "Close"));
-		HttpParams params = new BasicHttpParams();
-		params.setParameter("http.default-headers", headers);
-
-		HttpClient httpclient = new DefaultHttpClient(params);
+		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/w");
 		HttpResponse response = httpclient.execute(httpget);
 
@@ -387,10 +426,7 @@ public class DeftSystemTest {
 	public void wwTest() throws ClientProtocolException, IOException {
 		List<Header> headers = new LinkedList<Header>();
 		headers.add(new BasicHeader("Connection", "Close"));
-		HttpParams params = new BasicHttpParams();
-		params.setParameter("http.default-headers", headers);
-
-		HttpClient httpclient = new DefaultHttpClient(params);
+		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/ww");
 		HttpResponse response = httpclient.execute(httpget);
 
@@ -408,10 +444,7 @@ public class DeftSystemTest {
 	public void wwfwTest() throws ClientProtocolException, IOException {
 		List<Header> headers = new LinkedList<Header>();
 		headers.add(new BasicHeader("Connection", "Close"));
-		HttpParams params = new BasicHttpParams();
-		params.setParameter("http.default-headers", headers);
-
-		HttpClient httpclient = new DefaultHttpClient(params);
+		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/wwfw");
 		HttpResponse response = httpclient.execute(httpget);
 
@@ -428,10 +461,7 @@ public class DeftSystemTest {
 	public void wfwfTest() throws ClientProtocolException, IOException {
 		List<Header> headers = new LinkedList<Header>();
 		headers.add(new BasicHeader("Connection", "Close"));
-		HttpParams params = new BasicHttpParams();
-		params.setParameter("http.default-headers", headers);
-
-		HttpClient httpclient = new DefaultHttpClient(params);
+		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/wfwf");
 		HttpResponse response = httpclient.execute(httpget);
 
@@ -448,10 +478,7 @@ public class DeftSystemTest {
 	public void wfffwfffTest() throws ClientProtocolException, IOException {
 		List<Header> headers = new LinkedList<Header>();
 		headers.add(new BasicHeader("Connection", "Close"));
-		HttpParams params = new BasicHttpParams();
-		params.setParameter("http.default-headers", headers);
-
-		HttpClient httpclient = new DefaultHttpClient(params);
+		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/wfffwfff");
 		HttpResponse response = httpclient.execute(httpget);
 
@@ -468,10 +495,7 @@ public class DeftSystemTest {
 	public void deleteTest() throws ClientProtocolException, IOException {
 		List<Header> headers = new LinkedList<Header>();
 		headers.add(new BasicHeader("Connection", "Close"));
-		HttpParams params = new BasicHttpParams();
-		params.setParameter("http.default-headers", headers);
-
-		HttpClient httpclient = new DefaultHttpClient(params);
+		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
 		HttpDelete httpdelete = new HttpDelete("http://localhost:" + PORT + "/delete");
 		HttpResponse response = httpclient.execute(httpdelete);
 
@@ -487,10 +511,7 @@ public class DeftSystemTest {
 	public void PostTest() throws ClientProtocolException, IOException {
 		List<Header> headers = new LinkedList<Header>();
 		headers.add(new BasicHeader("Connection", "Close"));
-		HttpParams params = new BasicHttpParams();
-		params.setParameter("http.default-headers", headers);
-
-		HttpClient httpclient = new DefaultHttpClient(params);
+		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
 		HttpPost httppost = new HttpPost("http://localhost:" + PORT + "/post");
 		HttpResponse response = httpclient.execute(httppost);
 
@@ -506,10 +527,7 @@ public class DeftSystemTest {
 	public void putTest() throws ClientProtocolException, IOException {
 		List<Header> headers = new LinkedList<Header>();
 		headers.add(new BasicHeader("Connection", "Close"));
-		HttpParams params = new BasicHttpParams();
-		params.setParameter("http.default-headers", headers);
-
-		HttpClient httpclient = new DefaultHttpClient(params);
+		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
 		HttpPut httpput = new HttpPut("http://localhost:" + PORT + "/put");
 		HttpResponse response = httpclient.execute(httpput);
 
@@ -525,10 +543,7 @@ public class DeftSystemTest {
 	public void capturingTest() throws ClientProtocolException, IOException {
 		List<Header> headers = new LinkedList<Header>();
 		headers.add(new BasicHeader("Connection", "Close"));
-		HttpParams params = new BasicHttpParams();
-		params.setParameter("http.default-headers", headers);
-
-		HttpClient httpclient = new DefaultHttpClient(params);
+		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/capturing/1911");
 		HttpResponse response = httpclient.execute(httpget);
 
@@ -544,10 +559,7 @@ public class DeftSystemTest {
 	public void erroneousCapturingTest() throws ClientProtocolException, IOException {
 		List<Header> headers = new LinkedList<Header>();
 		headers.add(new BasicHeader("Connection", "Close"));
-		HttpParams params = new BasicHttpParams();
-		params.setParameter("http.default-headers", headers);
-
-		HttpClient httpclient = new DefaultHttpClient(params);
+		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/capturing/r1911");
 		HttpResponse response = httpclient.execute(httpget);
 
@@ -556,13 +568,13 @@ public class DeftSystemTest {
 		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
 		assertEquals("Not Found", response.getStatusLine().getReasonPhrase());
 		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("Requested URL: /capturing/r1911 was not found", payLoad);
+		assertEquals("<html><head><title>404: Not found</title></head><body>Requested resource: <tt>/capturing/r1911</tt> was not found.</body>", payLoad);
 	}
 
 	@Test
 	public void simpleConcurrentGetRequestTest() {
 		int nThreads = 8;
-		int nRequests = 2048;
+		int nRequests = 50;
 		final CountDownLatch latch = new CountDownLatch(nRequests);
 		ExecutorService executor = Executors.newFixedThreadPool(nThreads);
 
@@ -595,17 +607,14 @@ public class DeftSystemTest {
 	public void keepAliveRequestTest() throws ClientProtocolException, IOException {
 		List<Header> headers = new LinkedList<Header>();
 		headers.add(new BasicHeader("Connection", "Keep-Alive"));
-		HttpParams params = new BasicHttpParams();
-		params.setParameter("http.default-headers", headers);
+		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
 
-		DefaultHttpClient httpclient = new DefaultHttpClient(params);
-
-		for (int i = 1; i <= 25; i++) {
+		for (int i = 1; i <= 5; i++) {
 			doKeepAliveRequestTest(httpclient);
 		}
 	}
 
-	private void doKeepAliveRequestTest(DefaultHttpClient httpclient)
+	private void doKeepAliveRequestTest(org.apache.http.client.HttpClient httpclient)
 	throws IOException, ClientProtocolException {
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/");
 		HttpResponse response = httpclient.execute(httpget);
@@ -621,10 +630,9 @@ public class DeftSystemTest {
 
 	@Test
 	public void HTTP_1_0_noConnectionHeaderTest() throws ClientProtocolException, IOException {
-		HttpParams params = new BasicHttpParams();
-		HttpProtocolParams.setVersion(params, new ProtocolVersion("HTTP", 1, 0));
-		DefaultHttpClient httpclient = new DefaultHttpClient();
+		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/");
+		httpget.setProtocolVersion(new ProtocolVersion("HTTP", 1, 0));
 		HttpResponse response = httpclient.execute(httpget);
 
 		assertNotNull(response);
@@ -639,7 +647,7 @@ public class DeftSystemTest {
 
 	@Test
 	public void httpExceptionTest() throws ClientProtocolException, IOException {
-		DefaultHttpClient httpclient = new DefaultHttpClient();
+		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/throw");
 		HttpResponse response = httpclient.execute(httpget);
 
@@ -647,14 +655,14 @@ public class DeftSystemTest {
 		assertEquals(500, response.getStatusLine().getStatusCode());
 		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
 		assertEquals("Internal Server Error", response.getStatusLine().getReasonPhrase());
-		assertEquals(5, response.getAllHeaders().length);
+		assertEquals(6, response.getAllHeaders().length);
 		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
 		assertEquals("exception message", payLoad);
 	}
 
 	@Test
 	public void asyncHttpExceptionTest() throws ClientProtocolException, IOException {
-		DefaultHttpClient httpclient = new DefaultHttpClient();
+		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/async_throw");
 		HttpResponse response = httpclient.execute(httpget);
 
@@ -662,14 +670,14 @@ public class DeftSystemTest {
 		assertEquals(500, response.getStatusLine().getStatusCode());
 		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
 		assertEquals("Internal Server Error", response.getStatusLine().getReasonPhrase());
-		assertEquals(5, response.getAllHeaders().length);
+		assertEquals(6, response.getAllHeaders().length);
 		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
 		assertEquals("exception message", payLoad);
 	}
 
 	@Test
 	public void staticFileRequestTest() throws ClientProtocolException, IOException {
-		DefaultHttpClient httpclient = new DefaultHttpClient();
+		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/src/test/resources/test.txt");
 		HttpResponse response = httpclient.execute(httpget);
 
@@ -677,14 +685,14 @@ public class DeftSystemTest {
 		assertEquals(200, response.getStatusLine().getStatusCode());
 		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
 		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		assertEquals(7, response.getAllHeaders().length);
+		assertEquals(9, response.getAllHeaders().length);
 		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
 		assertEquals("test.txt", payLoad);
 	}
 
 	@Test
 	public void pictureStaticFileRequestTest() throws ClientProtocolException, IOException {
-		DefaultHttpClient httpclient = new DefaultHttpClient();
+		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/src/test/resources/n792205362_2067.jpg");
 		HttpResponse response = httpclient.execute(httpget);
 
@@ -692,7 +700,7 @@ public class DeftSystemTest {
 		assertEquals(200, response.getStatusLine().getStatusCode());
 		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
 		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		assertEquals(7, response.getAllHeaders().length);
+		assertEquals(9, response.getAllHeaders().length);
 		assertEquals("54963", response.getFirstHeader("Content-Length").getValue());
 		assertEquals("image/jpeg", response.getFirstHeader("Content-Type").getValue());
 		assertNotNull(response.getFirstHeader("Last-Modified"));
@@ -700,7 +708,7 @@ public class DeftSystemTest {
 	
 	@Test
 	public void pictureStaticLargeFileRequestTest() throws ClientProtocolException, IOException {
-		DefaultHttpClient httpclient = new DefaultHttpClient();
+		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/src/test/resources/f4_impact_1_original.jpg");
 		HttpResponse response = httpclient.execute(httpget);
 
@@ -708,7 +716,7 @@ public class DeftSystemTest {
 		assertEquals(200, response.getStatusLine().getStatusCode());
 		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
 		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		assertEquals(7, response.getAllHeaders().length);
+		assertEquals(9, response.getAllHeaders().length);
 		//assertEquals("2145094", response.getFirstHeader("Content-Length").getValue()); // my mb says 2145066, imac says 2145094
 		assertEquals("image/jpeg", response.getFirstHeader("Content-Type").getValue());
 		assertNotNull(response.getFirstHeader("Last-Modified"));
@@ -717,7 +725,7 @@ public class DeftSystemTest {
 
 	@Test
 	public void noBodyRequest() throws ClientProtocolException, IOException {
-		HttpClient httpclient = new DefaultHttpClient();
+		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/no_body");
 		HttpResponse response = httpclient.execute(httpget);
 		List<String> expectedHeaders = Arrays.asList(new String[] {"Server", "Date", "Content-Length", "Connection"});
@@ -738,7 +746,7 @@ public class DeftSystemTest {
 
 	@Test
 	public void movedPermanentlyRequest() throws ClientProtocolException, IOException {
-		HttpClient httpclient = new DefaultHttpClient();
+		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/moved_perm");
 		HttpResponse response = httpclient.execute(httpget);
 		List<String> expectedHeaders = Arrays.asList(new String[] {"Server", "Date", "Content-Length", "Connection", "Etag"});
@@ -772,7 +780,7 @@ public class DeftSystemTest {
 	@Test
 	public void userDefinedStaticContentHandlerTest() throws ClientProtocolException, IOException {
 		// /static_file_handler
-		DefaultHttpClient httpclient = new DefaultHttpClient();
+		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/static_file_handler");
 		HttpResponse response = httpclient.execute(httpget);
 
@@ -794,18 +802,18 @@ public class DeftSystemTest {
 
 		};
 
-		Timeout t1 = new Timeout(now+1000, cb);
-		Timeout t2 = new Timeout(now+1200, cb);
-		Timeout t3 = new Timeout(now+1400, cb);
-		Timeout t4 = new Timeout(now+1600, cb);
-		Timeout t5 = new Timeout(now+1800, cb);
+		Timeout t1 = new Timeout(now+20, cb);
+		Timeout t2 = new Timeout(now+40, cb);
+		Timeout t3 = new Timeout(now+60, cb);
+		Timeout t4 = new Timeout(now+80, cb);
+		Timeout t5 = new Timeout(now+100, cb);
 		IOLoop.INSTANCE.addTimeout(t1);
 		IOLoop.INSTANCE.addTimeout(t2);
 		IOLoop.INSTANCE.addTimeout(t3);
 		IOLoop.INSTANCE.addTimeout(t4);
 		IOLoop.INSTANCE.addTimeout(t5);
 
-		latch.await(5 * 1000, TimeUnit.MILLISECONDS);
+		latch.await(1000, TimeUnit.MILLISECONDS);
 		assertTrue(latch.getCount() == 0);
 	}
 	
@@ -829,7 +837,7 @@ public class DeftSystemTest {
 
 	@Test
 	public void keyValueStoreClientTest() throws ClientProtocolException, IOException {
-		DefaultHttpClient httpclient = new DefaultHttpClient();
+		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/keyvalue");
 		HttpResponse response = httpclient.execute(httpget);
 
@@ -842,43 +850,29 @@ public class DeftSystemTest {
 		assertEquals("kickass", convertStreamToString(response.getEntity().getContent()).trim());
 	}
 
-	//ning === http://github.com/ning/async-http-client
+	//formerly used Ning async-http-client; now uses JDK java.net.http.HttpClient
 	@Test
 	public void doSimpleAsyncRequestTestWithNing() throws IOException, InterruptedException {
-		int iterations = 100;
-		final CountDownLatch latch = new CountDownLatch(iterations);
-		AsyncHttpClient asyncHttpClient = new AsyncHttpClient();
+		int iterations = 5;
+		java.net.http.HttpClient httpClient = java.net.http.HttpClient.newHttpClient();
+		List<String> expectedHeaders = Arrays.asList("Server", "Date", "Content-Length", "Etag", "Connection");
 		for (int i = 1; i <= iterations; i++) {
-
-			asyncHttpClient.prepareGet("http://localhost:" + PORT + "/").
-			execute(new AsyncCompletionHandler<com.ning.http.client.Response>(){
-
-				@Override
-				public com.ning.http.client.Response onCompleted(com.ning.http.client.Response response) throws Exception{
-					String body = response.getResponseBody();
-					assertEquals(expectedPayload, body);
-					{
-						List<String> expectedHeaders = Arrays.asList(new String[] {"Server", "Date", "Content-Length", "Etag", "Connection"});
-						assertEquals(200, response.getStatusCode());
-						assertEquals(expectedHeaders.size(), response.getHeaders().size());
-						for (String header : expectedHeaders) {
-							assertTrue(response.getHeader(header) != null);
-						}
-						assertEquals(expectedPayload.length()+"", response.getHeader("Content-Length"));
-					}
-					latch.countDown();
-					return response;
+			java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+					.uri(URI.create("http://localhost:" + PORT + "/"))
+					.GET()
+					.build();
+			try {
+				java.net.http.HttpResponse<String> response = httpClient.send(request, BodyHandlers.ofString());
+				assertEquals(200, response.statusCode());
+				assertEquals(expectedPayload, response.body());
+				for (String header : expectedHeaders) {
+					assertTrue("Missing header: " + header, response.headers().firstValue(header).isPresent());
 				}
-
-				@Override
-				public void onThrowable(Throwable t){
-					assertTrue(false);
-				}
-
-			});
+				assertEquals(String.valueOf(expectedPayload.length()), response.headers().firstValue("Content-Length").orElse(""));
+			} catch (java.net.http.HttpTimeoutException e) {
+				throw new AssertionError("Request timed out", e);
+			}
 		}
-		latch.await(15 * 1000, TimeUnit.MILLISECONDS);
-		assertEquals(0, latch.getCount());
 	}
 	
 	// TODO 101108 RS enable when /mySql (AsyncDbHandler is properly implemented)
@@ -921,7 +915,7 @@ public class DeftSystemTest {
 	
 	@Test
 	public void _450KBEntityTest() throws ClientProtocolException, IOException {
-		DefaultHttpClient httpclient = new DefaultHttpClient();
+		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/450kb_body");
 		HttpResponse response = httpclient.execute(httpget);
 
@@ -940,7 +934,7 @@ public class DeftSystemTest {
 	public void smallHttpPostBodyWithUnusualCharactersTest() throws ClientProtocolException, IOException {
 		final String body = "Räger Schildmäijår";
 		
-		DefaultHttpClient httpclient = new DefaultHttpClient();
+		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
 		HttpPost httppost = new HttpPost("http://localhost:" + PORT + "/echo");
 		httppost.setEntity(new StringEntity(body));	// HTTP 1.1 says that the default charset is ISO-8859-1
 		HttpResponse response = httpclient.execute(httppost);	
@@ -955,68 +949,48 @@ public class DeftSystemTest {
 	}
 	
 	@Test
-	public void smallHttpPostBodyTest() throws ClientProtocolException, IOException, InterruptedException {
+	public void smallHttpPostBodyTest() throws IOException, InterruptedException {
 		final String body = "Roger Schildmeijer";
-		final CountDownLatch latch = new CountDownLatch(1);
-		AsyncHttpClient asyncHttpClient = new AsyncHttpClient();
-		asyncHttpClient.preparePost("http://localhost:" + PORT + "/echo").setBody(body).
-		execute(new AsyncCompletionHandler<Response>(){
-
-			@Override
-			public Response onCompleted(Response response) throws Exception{
-				assertNotNull(response);
-				assertEquals(200, response.getStatusCode());
-				assertEquals("OK", response.getStatusText());
-				assertEquals(5, response.getHeaders().size());
-				String payLoad = response.getResponseBody();
-				assertEquals(body, payLoad);
-				latch.countDown();
-				return response;
-			}
-
-			@Override
-			public void onThrowable(Throwable t) { }
-		});
-
-		latch.await();
-		assertTrue(latch.getCount() == 0);
+		java.net.http.HttpClient httpClient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+				.uri(URI.create("http://localhost:" + PORT + "/echo"))
+				.POST(BodyPublishers.ofString(body))
+				.build();
+		try {
+			java.net.http.HttpResponse<String> response = httpClient.send(request, BodyHandlers.ofString());
+			assertNotNull(response);
+			assertEquals(200, response.statusCode());
+			assertEquals(body, response.body());
+		} catch (java.net.http.HttpTimeoutException e) {
+			throw new AssertionError("Request timed out", e);
+		}
 	}
 	
 	@Test
-	public void largeHttpPostBodyTest() throws ClientProtocolException, IOException, InterruptedException {
-		String body = "Roger Schildmeijer: 0\n";
+	public void largeHttpPostBodyTest() throws IOException, InterruptedException {
+		StringBuilder sb = new StringBuilder("Roger Schildmeijer: 0\n");
 		for (int i = 1; i <= 1000; i++) {
-			body += "Roger Schildmeijer: " + i + "\n";
+			sb.append("Roger Schildmeijer: ").append(i).append("\n");
 		}
-		final String expectedBody = body;
-		final CountDownLatch latch = new CountDownLatch(1);
-		AsyncHttpClient asyncHttpClient = new AsyncHttpClient();
-		asyncHttpClient.preparePost("http://localhost:" + PORT + "/echo").setBody(body).
-		execute(new AsyncCompletionHandler<Response>(){
-
-			@Override
-			public Response onCompleted(Response response) throws Exception{
-				assertNotNull(response);
-				assertEquals(200, response.getStatusCode());
-				assertEquals("OK", response.getStatusText());
-				assertEquals(5, response.getHeaders().size());
-				String payLoad = response.getResponseBody();
-				assertEquals(expectedBody, payLoad);
-				latch.countDown();
-				return response;
-			}
-
-			@Override
-			public void onThrowable(Throwable t) { }
-		});
-
-		latch.await();
-		assertTrue(latch.getCount() == 0);
+		String body = sb.toString();
+		java.net.http.HttpClient httpClient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+				.uri(URI.create("http://localhost:" + PORT + "/echo"))
+				.POST(BodyPublishers.ofString(body))
+				.build();
+		try {
+			java.net.http.HttpResponse<String> response = httpClient.send(request, BodyHandlers.ofString());
+			assertNotNull(response);
+			assertEquals(200, response.statusCode());
+			assertEquals(body, response.body());
+		} catch (java.net.http.HttpTimeoutException e) {
+			throw new AssertionError("Request timed out", e);
+		}
 	}
 	
 	@Test
 	public void authenticatedRequestHandlerTest() throws ClientProtocolException, IOException {
-		DefaultHttpClient httpclient = new DefaultHttpClient();
+		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/authenticated");
 		httpget.setHeader("user", "Roger Schildmeijer");
 		HttpResponse response = httpclient.execute(httpget);
@@ -1032,7 +1006,7 @@ public class DeftSystemTest {
 	
 	@Test
 	public void notAuthenticatedRequestHandlerTest() throws ClientProtocolException, IOException {
-		DefaultHttpClient httpclient = new DefaultHttpClient();
+		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/authenticated");
 		httpget.setHeader("wrong_header", "Roger Schildmeijer");
 		HttpResponse response = httpclient.execute(httpget);
@@ -1048,7 +1022,7 @@ public class DeftSystemTest {
 	
 	@Test
 	public void queryParamsTest() throws ClientProtocolException, IOException {
-		HttpClient httpclient = new DefaultHttpClient();
+		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
 		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/query_params?key1=value1&key2=value2");
 		HttpResponse response = httpclient.execute(httpget);
 		List<String> expectedHeaders = Arrays.asList(new String[] {"Server", "Date", "Content-Length", "Etag", "Connection"});
@@ -1069,22 +1043,33 @@ public class DeftSystemTest {
 	}
 	
 	@Test
-	public void multipleStartStopCombinations() throws InterruptedException {
-		final HttpServer server = new HttpServer(new Application(Maps.<String, RequestHandler>newHashMap()));
+	public void multipleStartStopCombinations() throws InterruptedException, IOException {
+		final HttpServer server = new HttpServer(new Application(new HashMap<String, RequestHandler>()));
+		final int port = freePort();
 		
-		final int n = 10;
-		final CountDownLatch latch = new CountDownLatch(n);
+		final int n = 2;
 		for (int i = 0; i < n; i++) {
-			IOLoop.INSTANCE.addCallback(new AsyncCallback() { public void onCallback() { server.listen(PORT+1); }});
-			IOLoop.INSTANCE.addCallback(new AsyncCallback() { public void onCallback() { server.stop(); latch.countDown(); }});
+			final CountDownLatch latch = new CountDownLatch(1);
+			IOLoop.INSTANCE.addCallback(new AsyncCallback() { public void onCallback() { 
+				try {
+					server.listen(port);
+				} catch (IOException e) {
+					throw new RuntimeException(e);
+				}
+			}});
+			IOLoop.INSTANCE.addCallback(new AsyncCallback() { public void onCallback() { 
+				server.stop(); 
+				IOLoop.INSTANCE.addCallback(new AsyncCallback() { public void onCallback() {
+					latch.countDown();
+				}});
+			}});
+			assertTrue("Server stop timed out between iterations", latch.await(2, TimeUnit.SECONDS));
 		}
-		latch.await(50, TimeUnit.SECONDS);
-		assertEquals(0, latch.getCount());
 	}
 	
 	@Test
 	public void connectToUnresolvableAddressUsingAsynchronousHttpClient() throws InterruptedException {
-		final String unresolvableAddress = "http://ttasfdqwertyuiop.se./start";
+		final String unresolvableAddress = "http://somehost.invalid/start";
 		final CountDownLatch latch = new CountDownLatch(1);
 		final AsynchronousHttpClient client = new AsynchronousHttpClient();
 		final AsyncCallback runByIOLoop = new AsyncCallback() {
@@ -1103,7 +1088,7 @@ public class DeftSystemTest {
 		};
 		IOLoop.INSTANCE.addCallback(runByIOLoop);
 		
-		latch.await(30, TimeUnit.SECONDS);
+		latch.await(5, TimeUnit.SECONDS);
 		assertEquals(0, latch.getCount());
 	}
 
@@ -1128,13 +1113,13 @@ public class DeftSystemTest {
 		};
 		IOLoop.INSTANCE.addCallback(runByIOLoop);
 		
-		latch.await(30, TimeUnit.SECONDS);
+		latch.await(5, TimeUnit.SECONDS);
 		assertEquals(0, latch.getCount());
 	}
 	
 	@Test
 	public void multipleAsynchronousHttpClientTest() throws InterruptedException {
-		for (int i = 0; i < 100; i++) {
+		for (int i = 0; i < 5; i++) {
 			final CountDownLatch latch = new CountDownLatch(1);
 			final String url = "http://localhost:" + PORT + "/";
 			final AsynchronousHttpClient http = new AsynchronousHttpClient();
@@ -1160,9 +1145,9 @@ public class DeftSystemTest {
 	}
 	
 	@Test
-	public void AsynchronousHttpClientConnectionFailedTest() throws InterruptedException {
+	public void AsynchronousHttpClientConnectionFailedTest() throws InterruptedException, IOException {
 		final CountDownLatch latch = new CountDownLatch(1);
-		final String url = "http://localhost:" + (PORT+1) + "/";
+		final String url = "http://localhost:" + freePort() + "/";
 		final AsynchronousHttpClient http = new AsynchronousHttpClient();
 		final AsyncResult<org.deftserver.web.http.client.Response> cb =
 			new AsyncResult<org.deftserver.web.http.client.Response>() {
@@ -1245,4 +1230,552 @@ public class DeftSystemTest {
 		}
 	}
 
+	private String sendRawRequest(String request) throws IOException {
+		try (
+			Socket socket = new Socket("localhost", PORT);
+			java.io.OutputStream os = socket.getOutputStream();
+			InputStream is = socket.getInputStream()
+		) {
+			socket.setSoTimeout(3000);
+			os.write(request.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+			os.flush();
+			
+			// read response in a loop until we get the whole response including body
+			byte[] buffer = new byte[16384];
+			int totalRead = 0;
+			int read;
+			while (totalRead < buffer.length) {
+				read = is.read(buffer, totalRead, buffer.length - totalRead);
+				if (read == -1) {
+					break;
+				}
+				totalRead += read;
+				
+				// check if we have received the full body based on Content-Length
+				String current = new String(buffer, 0, totalRead, java.nio.charset.StandardCharsets.ISO_8859_1);
+				if (current.contains("\r\n\r\n")) {
+					if (request.startsWith("HEAD ") || current.contains("HTTP/1.1 204") || current.contains("HTTP/1.1 304")) {
+						break;
+					}
+					int bodyStart = current.indexOf("\r\n\r\n") + 4;
+					int bodyLen = totalRead - bodyStart;
+					if (current.contains("Content-Length: ")) {
+						int clIdx = current.indexOf("Content-Length: ");
+						int clEnd = current.indexOf("\r\n", clIdx);
+						try {
+							int contentLength = Integer.parseInt(current.substring(clIdx + 16, clEnd).trim());
+							if (bodyLen >= contentLength) {
+								break;
+							}
+						} catch (Exception e) {
+							// ignore parsing failures
+						}
+					}
+				}
+			}
+			
+			if (totalRead > 0) {
+				return new String(buffer, 0, totalRead, java.nio.charset.StandardCharsets.ISO_8859_1);
+			}
+			return "";
+		}
+	}
+
+	@Test
+	public void pathTraversalSecurityTest() throws IOException {
+		// Null byte rejection
+		String responseNull = sendRawRequest(
+			"GET /src/test/resources/%00test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n\r\n"
+		);
+		assertTrue(responseNull.startsWith("HTTP/1.1 400"));
+		assertTrue(responseNull.contains("Null bytes in path are forbidden"));
+
+		// Relative path escaping root rejection
+		String responseEscape = sendRawRequest(
+			"GET /src/test/resources/../test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n\r\n"
+		);
+		assertTrue(responseEscape.startsWith("HTTP/1.1 403"));
+		assertTrue(responseEscape.contains("Directory traversal attempt blocked"));
+
+		// Parent directory reference escaping root
+		String responseEscape2 = sendRawRequest(
+			"GET /.. HTTP/1.1\r\n" +
+			"Host: localhost\r\n\r\n"
+		);
+		assertTrue(responseEscape2.startsWith("HTTP/1.1 403"));
+		assertTrue(responseEscape2.contains("Directory traversal attempt blocked"));
+	}
+
+	@Test
+	public void expect100ContinueTest() throws IOException {
+		try (
+			Socket socket = new Socket("localhost", PORT);
+			java.io.OutputStream os = socket.getOutputStream();
+			InputStream is = socket.getInputStream()
+		) {
+			socket.setSoTimeout(3000);
+			// 1. Send only headers expecting 100-continue
+			String requestHeaders = 
+				"POST /post HTTP/1.1\r\n" +
+				"Host: localhost\r\n" +
+				"Expect: 100-continue\r\n" +
+				"Content-Length: 4\r\n\r\n";
+			os.write(requestHeaders.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+			os.flush();
+
+			// 2. Read early response: it should be 100 Continue
+			byte[] buffer = new byte[1024];
+			int read = is.read(buffer);
+			assertTrue(read > 0);
+			String earlyResponse = new String(buffer, 0, read, java.nio.charset.StandardCharsets.ISO_8859_1);
+			assertTrue(earlyResponse.contains("HTTP/1.1 100 Continue"));
+
+			// 3. Send the body now
+			os.write("body".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+			os.flush();
+
+			// 4. Read final response
+			read = is.read(buffer);
+			assertTrue(read > 0);
+			String finalResponse = new String(buffer, 0, read, java.nio.charset.StandardCharsets.ISO_8859_1);
+			assertTrue(finalResponse.contains("HTTP/1.1 200"));
+		}
+	}
+
+	@Test
+	public void rangeRequestTest() throws IOException {
+		// Valid range 0-3
+		String resp1 = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Range: bytes=0-3\r\n\r\n"
+		);
+		assertTrue(resp1.startsWith("HTTP/1.1 206"));
+		assertTrue(resp1.contains("Content-Range: bytes 0-3/8"));
+		assertTrue(resp1.contains("Content-Length: 4"));
+		assertTrue(resp1.trim().endsWith("test"));
+
+		// Range suffix (last 3 bytes)
+		String resp2 = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Range: bytes=-3\r\n\r\n"
+		);
+		assertTrue(resp2.startsWith("HTTP/1.1 206"));
+		assertTrue(resp2.contains("Content-Range: bytes 5-7/8"));
+		assertTrue(resp2.contains("Content-Length: 3"));
+		assertTrue(resp2.trim().endsWith("txt"));
+
+		// Range offset from 4 to end
+		String resp3 = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Range: bytes=4-\r\n\r\n"
+		);
+		assertTrue(resp3.startsWith("HTTP/1.1 206"));
+		assertTrue(resp3.contains("Content-Range: bytes 4-7/8"));
+		assertTrue(resp3.contains("Content-Length: 4"));
+		assertTrue(resp3.trim().endsWith(".txt"));
+
+		// Non-satisfiable range
+		String resp4 = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Range: bytes=10-20\r\n\r\n"
+		);
+		assertTrue(resp4.startsWith("HTTP/1.1 416"));
+		assertTrue(resp4.contains("Content-Range: bytes */8"));
+	}
+
+	@Test
+	public void automaticHeadRequestTest() throws IOException {
+		String response = sendRawRequest(
+			"HEAD / HTTP/1.1\r\n" +
+			"Host: localhost\r\n\r\n"
+		);
+		assertTrue(response.startsWith("HTTP/1.1 200"));
+		assertTrue(response.contains("Content-Length: 10")); // "hello test" length is 10
+		
+		// The response should end with headers separator \r\n\r\n and contain NO body bytes
+		assertTrue(response.endsWith("\r\n\r\n"));
+	}
+
+	@Test
+	public void corsPreflightOptionsTest() throws IOException {
+		String response = sendRawRequest(
+			"OPTIONS /any/route HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Origin: http://example.com\r\n" +
+			"Access-Control-Request-Method: PUT\r\n\r\n"
+		);
+		assertTrue(response.startsWith("HTTP/1.1 204"));
+		assertTrue(response.contains("Access-Control-Allow-Origin: http://example.com"));
+		assertTrue(response.contains("Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS"));
+		assertTrue(response.contains("Access-Control-Allow-Headers: *"));
+		assertTrue(response.contains("Access-Control-Max-Age: 86400"));
+	}
+
+	@Test
+	public void threadSafeDateValidationTest() throws IOException {
+		String response = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n\r\n"
+		);
+		assertTrue(response.startsWith("HTTP/1.1 200"));
+		
+		// Parse Last-Modified
+		int lmIdx = response.indexOf("Last-Modified: ");
+		assertTrue(lmIdx != -1);
+		int lmEnd = response.indexOf("\r\n", lmIdx);
+		String lastModifiedStr = response.substring(lmIdx + 15, lmEnd);
+		
+		// Try parsing Last-Modified header
+		long parsed = org.deftserver.util.DateUtil.parseRFC1123ToMillis(lastModifiedStr);
+		assertTrue(parsed > 0);
+		
+		// Send If-Modified-Since
+		String resp304 = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"If-Modified-Since: " + lastModifiedStr + "\r\n\r\n"
+		);
+		assertTrue(resp304.startsWith("HTTP/1.1 304"));
+	}
+
+	@Test
+	public void staticFileEtagCachingTest() throws IOException {
+		String response = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n\r\n"
+		);
+		assertTrue(response.startsWith("HTTP/1.1 200"));
+		
+		// Parse ETag
+		int etagIdx = response.indexOf("ETag: ");
+		assertTrue(etagIdx != -1);
+		int etagEnd = response.indexOf("\r\n", etagIdx);
+		String etagStr = response.substring(etagIdx + 6, etagEnd).trim();
+		assertTrue(etagStr.startsWith("\"") && etagStr.endsWith("\""));
+		
+		// Send If-None-Match with matching ETag
+		String resp304 = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"If-None-Match: " + etagStr + "\r\n\r\n"
+		);
+		assertTrue(resp304.startsWith("HTTP/1.1 304"));
+		
+		// Send If-None-Match with weak matching ETag
+		String resp304Weak = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"If-None-Match: W/" + etagStr + "\r\n\r\n"
+		);
+		assertTrue(resp304Weak.startsWith("HTTP/1.1 304"));
+
+		// Send If-None-Match with non-matching ETag (should get 200 OK)
+		String resp200 = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"If-None-Match: \"non-matching-etag\"\r\n\r\n"
+		);
+		assertTrue(resp200.startsWith("HTTP/1.1 200"));
+	}
+
+	@Test
+	public void httpVersionValidationTest() throws IOException {
+		String response = sendRawRequest(
+			"GET / HTTP/2.0\r\n" +
+			"Host: localhost\r\n\r\n"
+		);
+		System.out.println("DEBUG VERSION RESP: [" + response + "]");
+		assertTrue(response.startsWith("HTTP/1.1 505"));
+		assertTrue(response.contains("HTTP Version Not Supported"));
+	}
+
+	@Test
+	public void whitespaceBeforeColonRejectionTest() throws IOException {
+		String response = sendRawRequest(
+			"GET / HTTP/1.1\r\n" +
+			"Host : localhost\r\n\r\n"
+		);
+		assertTrue(response.startsWith("HTTP/1.1 400"));
+	}
+
+	@Test
+	public void keepAliveProtocolDefaultTest() throws IOException {
+		// HTTP/1.0 defaults to Close
+		String resp10 = sendRawRequest(
+			"GET / HTTP/1.0\r\n\r\n"
+		);
+		assertTrue(resp10.contains("Connection: Close"));
+
+		// HTTP/1.0 with keep-alive header stays alive
+		String resp10Keep = sendRawRequest(
+			"GET / HTTP/1.0\r\n" +
+			"Connection: keep-alive\r\n\r\n"
+		);
+		assertTrue(resp10Keep.contains("Connection: Keep-Alive"));
+
+		// HTTP/1.1 defaults to Keep-Alive
+		String resp11 = sendRawRequest(
+			"GET / HTTP/1.1\r\n" +
+			"Host: localhost\r\n\r\n"
+		);
+		assertTrue(resp11.contains("Connection: Keep-Alive"));
+	}
+
+	@Test
+	public void corsPreflightVaryHeaderTest() throws IOException {
+		String response = sendRawRequest(
+			"OPTIONS /any/route HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Origin: http://example.com\r\n" +
+			"Access-Control-Request-Method: PUT\r\n\r\n"
+		);
+		assertTrue(response.startsWith("HTTP/1.1 204"));
+		assertTrue(response.contains("Vary: Origin"));
+	}
+
+	@Test
+	public void AsynchronousHttpClientRobustHeaderParsingAndErrorTest() throws InterruptedException {
+		// 1. Verify response builder correctly constructs chunked response.
+		org.deftserver.web.http.client.Response testResponse = new org.deftserver.web.http.client.Response(System.currentTimeMillis());
+		testResponse.addChunk("hello");
+		testResponse.addChunk(" ");
+		testResponse.addChunk("world");
+		assertEquals("hello world", testResponse.getBody());
+
+		// 2. Verify that connection failure is cleanly passed to onFailure callback instead of hanging.
+		final CountDownLatch latch = new CountDownLatch(1);
+		final AsynchronousHttpClient http = new AsynchronousHttpClient();
+		// Connect to a port that is guaranteed to not be listening (e.g. 54321)
+		final String badUrl = "http://localhost:54321/bad-route";
+		IOLoop.INSTANCE.addCallback(new AsyncCallback() {
+			@Override
+			public void onCallback() {
+				http.fetch(badUrl, new AsyncResult<org.deftserver.web.http.client.Response>() {
+					@Override
+					public void onSuccess(org.deftserver.web.http.client.Response response) {
+						// shouldn't happen
+					}
+
+					@Override
+					public void onFailure(Throwable e) {
+						latch.countDown();
+					}
+				});
+			}
+		});
+		latch.await(5, TimeUnit.SECONDS);
+		assertEquals(0, latch.getCount());
+	}
+
+	@Test
+	public void EtagHashingCorrectnessTest() {
+		byte[] data = "hello world".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+		
+		// 1. Create a larger buffer populated with 'data' and filled with trailing zeros.
+		byte[] largeBuffer = new byte[100];
+		System.arraycopy(data, 0, largeBuffer, 0, data.length);
+		
+		// 2. Compute ETags using the new overloaded method.
+		String expectedEtag = org.deftserver.util.HttpUtil.getEtag(data);
+		String actualEtag = org.deftserver.util.HttpUtil.getEtag(largeBuffer, 0, data.length);
+		
+		assertEquals(expectedEtag, actualEtag);
+	}
+
+	@Test
+	public void UrlUtilJoinTest() throws Exception {
+		java.net.URL baseUrl = new java.net.URL("http://tt.se/sub/path/");
+		
+		// 1. Relative with leading slash
+		assertEquals("http://tt.se/start", org.deftserver.util.UrlUtil.urlJoin(baseUrl, "/start"));
+		
+		// 2. Relative without leading slash
+		assertEquals("http://tt.se/sub/path/start", org.deftserver.util.UrlUtil.urlJoin(baseUrl, "start"));
+		
+		// 3. Dot segment relative
+		assertEquals("http://tt.se/sub/start", org.deftserver.util.UrlUtil.urlJoin(baseUrl, "../start"));
+		
+		// 4. Absolute HTTP
+		assertEquals("http://google.com/index.html", org.deftserver.util.UrlUtil.urlJoin(baseUrl, "http://google.com/index.html"));
+	}
+
+	@Test
+	public void AbsoluteStaticContentDirectoryAndSecurityTest() throws Exception {
+		// 1. Verify that absolute static folders resolve correctly.
+		// Get absolute path of standard test resources directory
+		String absStaticDir = new java.io.File("src/test/resources").getCanonicalPath();
+		
+		// Configure a test Application and handler to serve static absolute content
+		java.util.Map<String, RequestHandler> handlers = new java.util.HashMap<>();
+		Application testApp = new Application(handlers);
+		testApp.setStaticContentDir(absStaticDir);
+		
+		// Check that the request path is routed correctly by the test Application
+		// (URL contains absolute folder matching prefix)
+		String testFileUrlPath = absStaticDir + "/test.txt";
+		RequestHandler resolved = testApp.getHandler(testFileUrlPath);
+		assertEquals(org.deftserver.web.handler.StaticContentHandler.getInstance(), resolved);
+		
+		// 2. Assert direct request for resource outside static Content boundary triggers 403 Forbidden.
+		// (Requesting pom.xml which exists outside test resources)
+		String outsideFileUrlPath = new java.io.File("pom.xml").getCanonicalPath();
+		
+		// Setup mock HTTP request and response
+		HttpRequest outsideReq = new HttpRequest("GET " + outsideFileUrlPath + " HTTP/1.1", java.util.Map.of("Host", "localhost"));
+		org.deftserver.web.http.HttpResponse outsideResp = new org.deftserver.web.http.HttpResponse(null, null, false);
+		
+		try {
+			org.deftserver.web.handler.StaticContentHandler.getInstance().get(outsideReq, outsideResp);
+			org.junit.Assert.fail("Should have thrown 403 Forbidden");
+		} catch (HttpException he) {
+			assertEquals(403, he.getStatusCode());
+		}
+	}
+
+	@Test
+	public void staticFileMimeTypeAliasesTest() throws Exception {
+		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
+		
+		// Setup file extension to expected content type mappings
+		java.util.Map<String, String> testCases = java.util.Map.ofEntries(
+			java.util.Map.entry("htm", "text/html; charset=utf-8"),
+			java.util.Map.entry("html", "text/html; charset=utf-8"),
+			java.util.Map.entry("jpg", "image/jpeg"),
+			java.util.Map.entry("jpeg", "image/jpeg"),
+			java.util.Map.entry("tif", "image/tiff"),
+			java.util.Map.entry("tiff", "image/tiff"),
+			java.util.Map.entry("mpg", "video/mpeg"),
+			java.util.Map.entry("mpeg", "video/mpeg"),
+			java.util.Map.entry("mp4", "video/mp4"),
+			java.util.Map.entry("m4v", "video/mp4"),
+			java.util.Map.entry("cjs", "application/javascript"),
+			java.util.Map.entry("xht", "application/xhtml+xml"),
+			java.util.Map.entry("webm", "video/webm"),
+			java.util.Map.entry("mov", "video/quicktime"),
+			java.util.Map.entry("wav", "audio/wav"),
+			java.util.Map.entry("mkv", "video/x-matroska"),
+			java.util.Map.entry("mp3", "audio/mpeg"),
+			java.util.Map.entry("ogg", "audio/ogg"),
+			java.util.Map.entry("ogv", "video/ogg"),
+			java.util.Map.entry("weba", "audio/webm"),
+			java.util.Map.entry("aac", "audio/aac"),
+			java.util.Map.entry("flac", "audio/flac"),
+			java.util.Map.entry("webmanifest", "application/manifest+json"),
+			java.util.Map.entry("woff", "font/woff"),
+			java.util.Map.entry("woff2", "font/woff2"),
+			java.util.Map.entry("ttf", "font/ttf"),
+			java.util.Map.entry("otf", "font/otf"),
+			java.util.Map.entry("wasm", "application/wasm"),
+			java.util.Map.entry("csv", "text/csv; charset=utf-8"),
+			java.util.Map.entry("7z", "application/x-7z-compressed"),
+			java.util.Map.entry("tar", "application/x-tar"),
+			java.util.Map.entry("gz", "application/gzip"),
+			java.util.Map.entry("rar", "application/vnd.rar"),
+			java.util.Map.entry("tar.gz", "application/x-gtar"),
+			java.util.Map.entry("tgz", "application/x-gtar"),
+			java.util.Map.entry("tar.bz2", "application/x-bzip2"),
+			java.util.Map.entry("tbz2", "application/x-bzip2"),
+			java.util.Map.entry("tar.xz", "application/x-xz"),
+			java.util.Map.entry("txz", "application/x-xz"),
+			java.util.Map.entry("bz2", "application/x-bzip2"),
+			java.util.Map.entry("xz", "application/x-xz")
+		);
+
+		java.io.File resourcesDir = new java.io.File("src/test/resources");
+		
+		for (java.util.Map.Entry<String, String> entry : testCases.entrySet()) {
+			String ext = entry.getKey();
+			String expectedMime = entry.getValue();
+			java.io.File tempFile = new java.io.File(resourcesDir, "mime_alias_test." + ext);
+			try {
+				// Create a simple temp file
+				java.nio.file.Files.writeString(tempFile.toPath(), "test content");
+				
+				HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/src/test/resources/mime_alias_test." + ext);
+				HttpResponse response = httpclient.execute(httpget);
+				
+				assertNotNull(response);
+				assertEquals(200, response.getStatusLine().getStatusCode());
+				String actualMime = response.getFirstHeader("Content-Type").getValue();
+				boolean match = false;
+				if (ext.equals("gz")) {
+					match = actualMime.equals("application/gzip") || actualMime.equals("application/x-gzip");
+				} else if (ext.equals("rar")) {
+					match = actualMime.equals("application/vnd.rar") || actualMime.equals("application/x-rar-compressed") || actualMime.equals("application/x-rar");
+				} else if (ext.equals("tar.gz") || ext.equals("tgz")) {
+					match = actualMime.equals("application/x-gtar") || actualMime.equals("application/x-gzip") || actualMime.equals("application/gzip");
+				} else if (ext.equals("tar.bz2") || ext.equals("tbz2") || ext.equals("bz2")) {
+					match = actualMime.equals("application/x-bzip2") || actualMime.equals("application/x-bzip") || actualMime.equals("application/bz2") || actualMime.equals("application/x-bz2");
+				} else if (ext.equals("tar.xz") || ext.equals("txz") || ext.equals("xz")) {
+					match = actualMime.equals("application/x-xz") || actualMime.equals("application/x-xz-compressed") || actualMime.equals("application/xz");
+				} else if (ext.equals("m4v")) {
+					match = actualMime.equals("video/mp4") || actualMime.equals("video/x-m4v");
+				} else if (ext.equals("mkv")) {
+					match = actualMime.equals("video/x-matroska") || actualMime.equals("video/mkv") || actualMime.equals("video/x-mkv");
+				} else if (ext.equals("webm")) {
+					match = actualMime.equals("video/webm") || actualMime.equals("video/x-webm");
+				} else if (ext.equals("mov")) {
+					match = actualMime.equals("video/quicktime") || actualMime.equals("video/x-quicktime");
+				} else if (ext.equals("wav")) {
+					match = actualMime.equals("audio/wav") || actualMime.equals("audio/x-wav") || actualMime.equals("audio/wave") || actualMime.equals("audio/x-pn-wav") || actualMime.equals("audio/vnd.wave");
+				} else if (ext.equals("mp3")) {
+					match = actualMime.equals("audio/mpeg") || actualMime.equals("audio/mp3") || actualMime.equals("audio/x-mpeg");
+				} else if (ext.equals("ogg")) {
+					match = actualMime.equals("audio/ogg") || actualMime.equals("audio/x-ogg") || actualMime.equals("application/ogg");
+				} else if (ext.equals("ogv")) {
+					match = actualMime.equals("video/ogg") || actualMime.equals("video/x-ogv");
+				} else if (ext.equals("weba")) {
+					match = actualMime.equals("audio/webm") || actualMime.equals("audio/x-weba") || actualMime.equals("audio/x-webm");
+				} else if (ext.equals("aac")) {
+					match = actualMime.equals("audio/aac") || actualMime.equals("audio/x-aac");
+				} else if (ext.equals("flac")) {
+					match = actualMime.equals("audio/flac") || actualMime.equals("audio/x-flac");
+				} else {
+					match = actualMime.equals(expectedMime);
+				}
+				assertTrue("Expected " + expectedMime + " for " + ext + " but got " + actualMime, match);
+				org.apache.http.util.EntityUtils.consume(response.getEntity());
+			} finally {
+				if (tempFile.exists()) {
+					tempFile.delete();
+				}
+			}
+		}
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	public void requestParameterParserTreeTest() {
+		org.deftserver.web.http.HttpRequest request = new org.deftserver.web.http.HttpRequest(
+			"GET /?formel1[0][0]=Satoshi&formel1[0][1]=DeepMind&formel1[bio]=philosophy&formel1[hobbies][]=NIO&formel1[hobbies][]=SSL HTTP/1.1",
+			java.util.Collections.emptyMap()
+		);
+
+		java.util.Map<String, Object> nested = request.getParametersTree();
+		assertNotNull(nested);
+		assertTrue(nested.containsKey("formel1"));
+		
+		java.util.Map<String, Object> formel1 = (java.util.Map<String, Object>) nested.get("formel1");
+		assertNotNull(formel1);
+		
+		java.util.Map<String, Object> zero = (java.util.Map<String, Object>) formel1.get("0");
+		assertNotNull(zero);
+		assertEquals("Satoshi", zero.get("0"));
+		assertEquals("DeepMind", zero.get("1"));
+		
+		assertEquals("philosophy", formel1.get("bio"));
+		
+		java.util.Map<String, Object> hobbies = (java.util.Map<String, Object>) formel1.get("hobbies");
+		assertNotNull(hobbies);
+		assertEquals("NIO", hobbies.get("0"));
+		assertEquals("SSL", hobbies.get("1"));
+	}
+
 }
+

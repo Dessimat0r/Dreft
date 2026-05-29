@@ -40,14 +40,11 @@ public class JMXDebuggableTimeoutManagerTest {
 		assertEquals(11, tm.getNumberOfTimeouts());
 		assertEquals(3, tm.getNumberOfKeepAliveTimeouts());
 
-		Thread.sleep(200);
-	
-		tm.execute();
-		assertEquals(6, tm.getNumberOfTimeouts());
+		tm.execute(now + 200);
+		assertEquals(3, tm.getNumberOfTimeouts());
 		assertEquals(0, tm.getNumberOfKeepAliveTimeouts());
 	
-		Thread.sleep(2000);
-		tm.execute();
+		tm.execute(now + 2000);
 		assertEquals(0, tm.getNumberOfTimeouts());
 		assertEquals(0, tm.getNumberOfKeepAliveTimeouts());
 	}
@@ -94,7 +91,7 @@ public class JMXDebuggableTimeoutManagerTest {
 	
 	private void addRecursiveTimeout(final long timeout) {
 		final Timeout t = new Timeout(timeout, new AsyncCallback() {
-			@Override public void onCallback() { addNopTimeout(System.currentTimeMillis()); }
+			@Override public void onCallback() { addNopTimeout(System.currentTimeMillis() + 100); }
 		});
 		tm.addTimeout(t);	
 	}

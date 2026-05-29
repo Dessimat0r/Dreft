@@ -21,9 +21,9 @@ public class Request {
 	 */
 	public Request(String url, HttpVerb verb) {
 		try {
-			this.url = new URL(url);
+			this.url = java.net.URI.create(url).toURL();
 			this.verb = verb;
-		} catch (MalformedURLException e) {
+		} catch (MalformedURLException | IllegalArgumentException e) {
 			logger.error("Malformed URL: {}", e.getMessage());
 			throw new RuntimeException(e);
 		}

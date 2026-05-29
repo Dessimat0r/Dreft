@@ -18,7 +18,7 @@ import org.deftserver.web.AsyncResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Charsets;
+import java.nio.charset.StandardCharsets;
 
 public class AsynchronousSocket implements IOHandler {
 	
@@ -30,6 +30,16 @@ public class AsynchronousSocket implements IOHandler {
 	
 	private final AsyncResult<String> nopAsyncStringResult = NopAsyncResult.of(String.class).nopAsyncResult;
 	private final AsyncResult<Boolean> nopAsyncBooleanResult = NopAsyncResult.of(Boolean.class).nopAsyncResult;
+
+	public interface DnsResolver {
+		java.net.InetSocketAddress resolve(String host, int port) throws Exception;
+	}
+
+	private static DnsResolver dnsResolver = java.net.InetSocketAddress::new;
+
+	public static void setDnsResolver(DnsResolver resolver) {
+		dnsResolver = resolver;
+	}
 	
 	private final SelectableChannel channel;
 	private int interestOps;
@@ -43,7 +53,7 @@ public class AsynchronousSocket implements IOHandler {
 	private AsyncCallback writeCallback = AsyncCallback.nopCb;
 	
 	private final StringBuilder readBuffer = new StringBuilder();
-	private final StringBuilder writeBuffer = new StringBuilder();
+	private final org.deftserver.io.buffer.DynamicByteBuffer writeBuffer = org.deftserver.io.buffer.DynamicByteBuffer.allocate(DEFAULT_BYTEBUFFER_SIZE);
 	
 	private boolean reachedEOF = false;
 	
@@ -105,15 +115,24 @@ public class AsynchronousSocket implements IOHandler {
 		ioLoop.updateHandler(channel, interestOps |= SelectionKey.OP_CONNECT);
 		connectCallback = ccb;
 		if (channel instanceof SocketChannel) {
-			try {
-				((SocketChannel) channel).connect(new InetSocketAddress(host, port));
-			} catch (IOException e) {
-				logger.error("Failed to connect to: {}, message: {} ", host, e.getMessage());
-				invokeConnectFailureCallback(e);
-			} catch (UnresolvedAddressException e) {
-				logger.warn("Unresolvable host: {}", host);
-				invokeConnectFailureCallback(e);
-			}
+			Thread.startVirtualThread(() -> {
+				try {
+					final InetSocketAddress address = dnsResolver.resolve(host, port);
+					ioLoop.addCallback(() -> {
+						try {
+							((SocketChannel) channel).connect(address);
+						} catch (IOException e) {
+							logger.error("Failed to connect to: {}, message: {} ", host, e.getMessage());
+							invokeConnectFailureCallback(e);
+						} catch (UnresolvedAddressException e) {
+							logger.warn("Unresolvable host: {}", host);
+							invokeConnectFailureCallback(e);
+						}
+					});
+				} catch (Exception e) {
+					ioLoop.addCallback(() -> invokeConnectFailureCallback(e));
+				}
+			});
 		}
 	}
 	
@@ -160,7 +179,9 @@ public class AsynchronousSocket implements IOHandler {
 		}
 	}
 	
-	protected static final ByteBuffer READ_BUFFER = ByteBuffer.allocate(DEFAULT_BYTEBUFFER_SIZE);
+	private final ByteBuffer READ_BUFFER = ByteBuffer.allocate(DEFAULT_BYTEBUFFER_SIZE);
+	private static final ThreadLocal<java.nio.charset.CharsetDecoder> DECODER =
+		ThreadLocal.withInitial(() -> StandardCharsets.ISO_8859_1.newDecoder());
 	
 	/**
 	 * Should only be invoked by the IOLoop
@@ -181,10 +202,15 @@ public class AsynchronousSocket implements IOHandler {
 			} while (read > 0 && READ_BUFFER.hasRemaining());
 		}
 		READ_BUFFER.flip();
-		readBuffer.append(new String(READ_BUFFER.array(), 0, READ_BUFFER.limit(), Charsets.ISO_8859_1));
+		// Decode directly into a char[] via a reusable CharsetDecoder, avoiding an intermediate String allocation.
+		java.nio.CharBuffer decoded = DECODER.get().decode(READ_BUFFER);
+		readBuffer.append(decoded);
 		if (read == -1) {	// EOF
 			reachedEOF = true;
 			ioLoop.updateHandler(channel, interestOps &= ~SelectionKey.OP_READ);
+			if (readBuffer.length() > 0) {
+				checkReadState();
+			}
 			return;
 		}
 		logger.debug("readBuffer size: {}", readBuffer.length());
@@ -228,10 +254,6 @@ public class AsynchronousSocket implements IOHandler {
 	 *  Of if end-of-stream is reached => invoke readCallback (onFailure)
 	 */
 	private void checkReadState() {
-		if (reachedEOF) {
-			invokeReadFailureCallback(new EOFException("Reached end-of-stream"));
-			return;
-		}
 		int index = readBuffer.indexOf(readDelimiter);
 		if (index != -1 && !readDelimiter.isEmpty()) {
 			String result = readBuffer.substring(0, index /*+ readDelimiter.length()*/);
@@ -245,6 +267,8 @@ public class AsynchronousSocket implements IOHandler {
 			logger.debug("readBuffer size: {}", readBuffer.length());
 			readBytes = Integer.MAX_VALUE;
 			invokeReadSuccessfulCallback(result);
+		} else if (reachedEOF) {
+			invokeReadFailureCallback(new EOFException("Reached end-of-stream"));
 		}
 	}
 
@@ -290,8 +314,9 @@ public class AsynchronousSocket implements IOHandler {
 	 */
 	public void write(String data, AsyncCallback wcb) {
 		logger.debug("write data: {}", data);
-		writeBuffer.append(data);
-		logger.debug("writeBuffer size: {}", writeBuffer.length());
+		byte[] bytes = data.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+		writeBuffer.put(bytes);
+		logger.debug("writeBuffer size: {}", writeBuffer.position());
 		writeCallback = wcb;
 		doWrite();
 	}
@@ -302,23 +327,25 @@ public class AsynchronousSocket implements IOHandler {
 	private void doWrite() {
 		SocketChannel sc = (SocketChannel)channel;
 		int bytesWritten = 0;
-		if (sc.isConnected()) {
+		if (sc.isConnected() && writeBuffer.position() > 0) {
 			try {
+				ByteBuffer writeBuf = writeBuffer.getByteBuffer();
+				writeBuf.flip();
 				int written = 0;
 				do {
-					written = sc.write(ByteBuffer.wrap(writeBuffer.toString().getBytes(Charsets.ISO_8859_1)));
+					written = sc.write(writeBuf);
 					bytesWritten += written;
-				} while (written > 0 && sc.isConnected());
+				} while (written > 0 && sc.isConnected() && writeBuf.hasRemaining());
+				writeBuf.compact();
 			} catch (IOException e) {
 				logger.error("IOException during write: {}", e.getMessage());
 				invokeCloseCallback();
 				Closeables.closeQuietly(ioLoop, channel);
 			}
 		}
-		writeBuffer.delete(0, bytesWritten);
 		logger.debug("wrote: {} bytes", bytesWritten);
-		logger.debug("writeBuffer size: {}", writeBuffer.length());
-		if (writeBuffer.length() > 0) {
+		logger.debug("writeBuffer size: {}", writeBuffer.position());
+		if (writeBuffer.position() > 0) {
 			ioLoop.updateHandler(channel, interestOps |= SelectionKey.OP_WRITE);
 		} else {
 			ioLoop.updateHandler(channel, interestOps &= ~SelectionKey.OP_WRITE);

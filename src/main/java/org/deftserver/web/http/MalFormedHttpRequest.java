@@ -2,7 +2,7 @@ package org.deftserver.web.http;
 
 import java.io.IOException;
 
-import com.google.common.collect.Maps;
+import java.util.HashMap;
 
 
 public class MalFormedHttpRequest extends HttpRequest {
@@ -18,7 +18,7 @@ public class MalFormedHttpRequest extends HttpRequest {
 	
 	/* Dummy HttpRequest that represents a malformed client HTTP request */
 	private MalFormedHttpRequest() throws IOException {
-		super(-1, "GET / Malformed request\r\n", Maps.<String, String>newHashMap(), null);
+		super(-1, "GET / HTTP/1.1", new HashMap<>(), null);
 	}
 
 }

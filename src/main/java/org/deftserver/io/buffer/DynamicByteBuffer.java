@@ -5,7 +5,7 @@ import java.nio.ByteBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Charsets;
+import java.nio.charset.StandardCharsets;
 
 public class DynamicByteBuffer {
 	
@@ -45,26 +45,55 @@ public class DynamicByteBuffer {
 	 * Prepend the data. Will reallocate if needed.
 	 */
 	public long prepend(String data) {
-		byte[] bytes = data.getBytes(Charsets.UTF_8);
-		int newSize = bytes.length + backend.position();
-		byte[] newBuffer = new byte[newSize];
-		System.arraycopy(bytes, 0, newBuffer, 0, bytes.length);	// initial line and headers
-		System.arraycopy(backend.array(), 0, newBuffer, bytes.length, backend.position()); // body
-		backend = ByteBuffer.wrap(newBuffer);
-		backend.position(newSize);
-		return bytes.length;
+		byte[] bytes = data.getBytes(StandardCharsets.UTF_8);
+		int headerLen = bytes.length;
+		int bodyLen = backend.position();
+		ensureCapacity(headerLen, true);
+		
+		// Shift existing body bytes to the right by headerLen
+		System.arraycopy(backend.array(), 0, backend.array(), headerLen, bodyLen);
+		
+		// Copy header bytes to the beginning
+		System.arraycopy(bytes, 0, backend.array(), 0, headerLen);
+		
+		// Update position
+		backend.position(headerLen + bodyLen);
+		return headerLen;
+	}
+
+	/**
+	 * Prepend raw bytes. Will reallocate if needed.
+	 */
+	public void prepend(byte[] bytes) {
+		int headerLen = bytes.length;
+		int bodyLen = backend.position();
+		ensureCapacity(headerLen, true);
+		
+		// Shift existing body bytes to the right by headerLen
+		System.arraycopy(backend.array(), 0, backend.array(), headerLen, bodyLen);
+		
+		// Copy prepended bytes to the beginning
+		System.arraycopy(bytes, 0, backend.array(), 0, headerLen);
+		
+		// Update position
+		backend.position(headerLen + bodyLen);
 	}
 	
+	private void ensureCapacity(int size) {
+		ensureCapacity(size, false);
+	}
+
 	/**
 	 * Ensures that its safe to append size data to backend. 
 	 * @param size The size of the data that is about to be appended.
+	 * @param exact If true, reallocates to exactly the required size. If false, reallocates with 1.5x padding.
 	 */
-	private void ensureCapacity(int size) {
+	private void ensureCapacity(int size, boolean exact) {
 		int remaining = backend.remaining();
 		if (size > remaining) {
 			logger.debug("allocating new DynamicByteBuffer, old capacity {}: ", backend.capacity());
-            int missing = size - remaining;
-			int newSize =  (int) ((backend.capacity() + missing) * 1.5);
+			int missing = size - remaining;
+			int newSize = exact ? (backend.capacity() + missing) : (int) ((backend.capacity() + missing) * 1.5);
 			reallocate(newSize);
 		}
 	}

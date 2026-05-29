@@ -17,14 +17,10 @@ public class UrlUtil {
 	 */
 	public static String urlJoin(URL url, String locationHeader) {
 		try {
-			if (locationHeader.startsWith("http")) {
-				return new URL(locationHeader).toString();
-			}
-			return new URL(url.getProtocol() + "://" + url.getAuthority() + locationHeader).toString();
-		} catch (MalformedURLException e) {
+			return url.toURI().resolve(locationHeader).toURL().toString();
+		} catch (Exception e) {
 			return url.toString();
 		}
-
 	}
 
 }

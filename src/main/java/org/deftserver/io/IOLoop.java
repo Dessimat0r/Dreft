@@ -1,6 +1,5 @@
 package org.deftserver.io;
 
-import static com.google.common.collect.Collections2.transform;
 
 import java.io.EOFException;
 import java.io.IOException;
@@ -27,8 +26,6 @@ import org.deftserver.web.AsyncCallback;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Function;
-import com.google.common.collect.Lists;
 
 public class IOLoop implements IOLoopMXBean {
 	
@@ -49,7 +46,7 @@ public class IOLoop implements IOLoopMXBean {
 
 	private Selector selector;
 	
-	private final Map<SelectableChannel, IOHandler> handlers = new HashMap<>();
+	private final Map<SelectableChannel, IOHandler> handlers = new java.util.concurrent.ConcurrentHashMap<>();
 	
 	private final TimeoutManager tm = new JMXDebuggableTimeoutManager();
 	private final CallbackManager cm = new JMXDebuggableCallbackManager();
@@ -141,7 +138,17 @@ public class IOLoop implements IOLoopMXBean {
 					selectorTimeout = 1; 
 				}
 			} catch (IOException e) {
-				logger.error("IOException received in IOLoop", e);			
+				logger.error("IOException received in IOLoop", e);
+			} catch (RuntimeException e) {
+				// A RuntimeException from a handler, timeout, or callback must not
+				// kill the server thread — log it and continue serving other clients.
+				logger.error("Unexpected RuntimeException in IOLoop selector loop — continuing", e);
+			} catch (Error e) {
+				// OutOfMemoryError, InternalError, etc. — log and re-raise so the JVM
+				// or a supervising thread can decide whether to restart. We do NOT
+				// silently swallow hard JVM errors.
+				logger.error("Fatal Error in IOLoop selector loop — re-throwing", e);
+				throw e;
 			}
 		}
 	}
@@ -187,7 +194,12 @@ public class IOLoop implements IOLoopMXBean {
 	 */
 	public void updateHandler(SelectableChannel channel, int newInterestOps) {
 		if (handlers.containsKey(channel)) {
-			channel.keyFor(selector).interestOps(newInterestOps);
+			SelectionKey key = channel.keyFor(selector);
+			if (key != null && key.isValid()) {
+				key.interestOps(newInterestOps);
+			} else {
+				logger.debug("updateHandler: SelectionKey is null or cancelled for channel {} — skipping", channel);
+			}
 		} else {
 			logger.warn("Tried to update interestOps for an unknown SelectableChannel.");
 		}
@@ -223,6 +235,9 @@ public class IOLoop implements IOLoopMXBean {
 	 */
 	public void addCallback(AsyncCallback callback) {
 		cm.addCallback(callback);
+		if (selector != null) {
+			selector.wakeup();
+		}
 	}
 	
 // implements IOLoopMXBean
@@ -233,17 +248,25 @@ public class IOLoop implements IOLoopMXBean {
 
 	@Override
 	public List<String> getRegisteredIOHandlers() {
-		Map<SelectableChannel, IOHandler> defensive = new HashMap<SelectableChannel, IOHandler>(handlers);
-		Collection<String> readables = transform(defensive.values(), new Function<IOHandler, String>() {
-			@Override public String apply(IOHandler handler) { return handler.toString(); }
-		});
-		return Lists.newLinkedList(readables);
+		Map<SelectableChannel, IOHandler> defensive = new HashMap<>(handlers);
+		return defensive.values().stream()
+				.map(IOHandler::toString)
+				.collect(java.util.stream.Collectors.toList());
 	}
 	
 	public void dispose() {
-		for (Entry<SelectableChannel, IOHandler> he : handlers.entrySet()) {
-			Closeables.closeQuietly(this, he.getKey());
+		java.util.List<SelectableChannel> channels = new java.util.ArrayList<>(handlers.keySet());
+		for (SelectableChannel channel : channels) {
+			Closeables.closeQuietly(this, channel);
 		}
 		stop();
+		// Unregister MXBeans to prevent JMX memory/classloader leaks
+		MXBeanUtil.unregisterMXBean(this, "IOLoop");
+		if (tm instanceof JMXDebuggableTimeoutManager) {
+			MXBeanUtil.unregisterMXBean(tm, "TimeoutManager");
+		}
+		if (cm instanceof JMXDebuggableCallbackManager) {
+			MXBeanUtil.unregisterMXBean(cm, "CallbackManager");
+		}
 	}
 }
