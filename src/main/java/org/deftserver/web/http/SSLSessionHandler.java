@@ -122,14 +122,40 @@ public class SSLSessionHandler {
 		}
 	}
 
+	/**
+	 * Bound on how long we keep retrying a full-buffer non-blocking write before treating
+	 * the peer as dead. Forward progress resets the clock, so only a genuinely stalled
+	 * socket (which would otherwise spin the I/O-loop thread at 100% CPU forever) is dropped.
+	 */
+	private static final long WRITE_STALL_TIMEOUT_NS = 10L * 1_000_000_000L;
+
 	private int readEncrypted() throws IOException {
 		return socketChannel.read(netReadBuf);
 	}
 
-	private void writeEncrypted() throws IOException {
-		while (netWriteBuf.hasRemaining()) {
-			socketChannel.write(netWriteBuf);
+	/** Fully writes {@code buf} to the (non-blocking) channel, aborting if the socket makes
+	 *  zero progress for {@link #WRITE_STALL_TIMEOUT_NS}. */
+	private void writeFully(ByteBuffer buf) throws IOException {
+		long stallDeadline = 0;
+		while (buf.hasRemaining()) {
+			int n = socketChannel.write(buf);
+			if (n > 0) {
+				stallDeadline = 0;
+			} else {
+				long now = System.nanoTime();
+				if (stallDeadline == 0) {
+					stallDeadline = now + WRITE_STALL_TIMEOUT_NS;
+				} else if (now - stallDeadline > 0) {
+					throw new IOException("TLS socket write stalled (peer not reading); aborting");
+				}
+				// Park briefly instead of busy-spinning while the send buffer is full.
+				java.util.concurrent.locks.LockSupport.parkNanos(200_000L);
+			}
 		}
+	}
+
+	private void writeEncrypted() throws IOException {
+		writeFully(netWriteBuf);
 	}
 
 	public synchronized ByteBuffer unwrap(ByteBuffer src) throws IOException {
@@ -201,9 +227,7 @@ public class SSLSessionHandler {
 			SSLEngineResult result = engine.wrap(src, dst);
 			if (result.bytesProduced() > 0) {
 				dst.flip();
-				while (dst.hasRemaining()) {
-					socketChannel.write(dst);
-				}
+				writeFully(dst);
 			}
 		} catch (Exception e) {
 			// Ignore — channel may already be closed or broken

@@ -99,6 +99,15 @@ public class HttpResponse {
 		long bytesWritten = 0;
 		try {
 			if (!headersCreated) {
+				// Streaming case: a handler that flushes before finish() with neither a
+				// Content-Length nor chunked framing produces a response whose body can only be
+				// delimited by closing the connection. Force Connection: close so a keep-alive
+				// client isn't left mis-framed (finish() then tears the connection down). The
+				// normal write()+finish() path sets Content-Length before flushing, so it is
+				// unaffected and stays keep-alive.
+				if (!useChunked && !headers.containsKey("Content-Length") && !suppressBody) {
+					setHeader("Connection", "Close");
+				}
 				if (useChunked && responseData.position() > 0) {
 					int len = responseData.position();
 					String hex = Integer.toHexString(len);
@@ -106,7 +115,7 @@ public class HttpResponse {
 					responseData.prepend(prefix);
 					responseData.put("\r\n".getBytes(StandardCharsets.ISO_8859_1));
 				}
-				
+
 				String initial = createInitalLineAndHeaders();
 				if (suppressBody) {
 					responseData.clear(); // discard any body bytes
@@ -133,7 +142,9 @@ public class HttpResponse {
 			}
 		} catch (IOException e) {
 			logger.debug("Client disconnected during flush (broken pipe): {}", e.getMessage());
-			try { ((SocketChannel) key.channel()).close(); } catch (IOException ignore) {}
+			// Route through closeChannel so the protocol's channel set / per-channel maps are
+			// cleaned (a bare channel.close() would leak the active-connection accounting).
+			protocol.closeChannel((SocketChannel) key.channel());
 			return 0;
 		} finally {
 			if (!responseData.hasRemaining()) {
@@ -193,33 +204,38 @@ public class HttpResponse {
 				}
 				// close (or register for read) if all data has been written.
 				// If OP_WRITE is interested, a write is pending, so we must wait until the buffer is fully sent.
+				// If the response declared Connection: close (e.g. a 404/400/403 or error page on an
+				// otherwise keep-alive connection), close once the body is fully written instead of
+				// keeping the socket open — otherwise the server contradicts its own header and holds
+				// the connection until the keep-alive timeout.
+				boolean closeConnection = "close".equalsIgnoreCase(headers.get("Connection"));
 				boolean isWriting = key.isValid() && (key.interestOps() & SelectionKey.OP_WRITE) != 0;
 				if (isWriting) {
 					if (key.attachment() instanceof DynamicByteBuffer) {
 						DynamicByteBuffer dbb = (DynamicByteBuffer) key.attachment();
 						if (!dbb.hasRemaining()) {
-							protocol.registerForRead(key);
+							finishConnection(closeConnection);
 						}
 					} else if (key.attachment() instanceof ByteBuffer) {
 						ByteBuffer bb = (ByteBuffer) key.attachment();
 						if (!bb.hasRemaining()) {
-							protocol.registerForRead(key);
+							finishConnection(closeConnection);
 						}
 					}
 				} else {
-					protocol.registerForRead(key);
+					finishConnection(closeConnection);
 				}
 			}
 			return bytesWritten;
 		} catch (IOException e) {
 			logger.debug("Client disconnected during finish (broken pipe): {}", e.getMessage());
-			try { ((SocketChannel) key.channel()).close(); } catch (IOException ignore) {}
+			protocol.closeChannel((SocketChannel) key.channel());
 			return 0;
 		}
 	}	
 
 	private void setEtagAndContentLength() {
-		if (request != null && !isBodySuppressed()) {
+		if (request != null && !isBodySuppressed() && responseData.position() > 0) {
 			String acceptEncoding = request.getHeader("Accept-Encoding");
 			if (org.deftserver.util.HttpUtil.isGzipAcceptable(acceptEncoding)) {
 				String contentType = headers.get("Content-Type");
@@ -232,12 +248,20 @@ public class HttpResponse {
 					useChunked = true;
 					setHeader("Content-Encoding", "gzip");
 					setHeader("Transfer-Encoding", "chunked");
+					// The representation now depends on Accept-Encoding; tell caches so they
+					// don't serve gzipped bytes to a client that didn't ask for them.
+					String existingVary = headers.get("Vary");
+					if (existingVary == null || existingVary.isEmpty()) {
+						setHeader("Vary", "Accept-Encoding");
+					} else if (!existingVary.toLowerCase(java.util.Locale.ROOT).contains("accept-encoding")) {
+						setHeader("Vary", existingVary + ", Accept-Encoding");
+					}
 				}
 			}
 		}
 
 		if (statusCode / 100 == 1 || statusCode == 204 || statusCode == 304) {
-			setHeader("Content-Length", "0");
+			markBodiless();
 			return;
 		}
 
@@ -255,34 +279,34 @@ public class HttpResponse {
 
 		String etag = null;
 		if (responseData.position() > 0) {
-			etag = HttpUtil.getEtag(responseData.array(), 0, responseData.position());
+			// RFC 9110 §8.8.3: an ETag is a quoted-string. Quoting is also required for
+			// If-None-Match / If-Match to match, since clients echo the quoted value back.
+			etag = "\"" + HttpUtil.getEtag(responseData.array(), 0, responseData.position()) + "\"";
 			setHeader("Etag", etag);
 		}
 
 		if (request != null) {
 			String inm = request.getHeader("If-None-Match");
-			if (inm != null && etag != null && (inm.equals(etag) || inm.equals("*"))) {
+			if (inm != null && etag != null && ifMatchHeaderMatches(inm, etag)) {
 				setStatusCode(304);
-				responseData.clear();
-				setHeader("Content-Length", "0");
+				markBodiless();
 				return;
 			}
 			String im = request.getHeader("If-Match");
-			if (im != null && etag != null && !im.equals(etag) && !im.equals("*")) {
+			if (im != null && etag != null && !ifMatchHeaderMatches(im, etag)) {
 				setStatusCode(412);
-				responseData.clear();
-				setHeader("Content-Length", "0");
+				markBodiless();
 				return;
 			}
 			String ims = request.getHeader("If-Modified-Since");
 			String lm = headers.get("Last-Modified");
-			if (ims != null && lm != null) {
+			// RFC 9110 §13.1.3: ignore If-Modified-Since when If-None-Match is present.
+			if (ims != null && lm != null && inm == null) {
 				long imsTime = DateUtil.parseRFC1123ToMillis(ims);
 				long lmTime = DateUtil.parseRFC1123ToMillis(lm);
 				if (imsTime != -1 && lmTime != -1 && lmTime <= imsTime) {
 					setStatusCode(304);
-					responseData.clear();
-					setHeader("Content-Length", "0");
+					markBodiless();
 					return;
 				}
 			}
@@ -292,8 +316,7 @@ public class HttpResponse {
 				long lmTime = DateUtil.parseRFC1123ToMillis(lm);
 				if (iusTime != -1 && lmTime != -1 && lmTime > iusTime) {
 					setStatusCode(412);
-					responseData.clear();
-					setHeader("Content-Length", "0");
+					markBodiless();
 					return;
 				}
 			}
@@ -302,17 +325,46 @@ public class HttpResponse {
 		if (useChunked) {
 			headers.remove("Content-Length");
 			setHeader("Transfer-Encoding", "chunked");
+		} else if (isBodySuppressed() && headers.containsKey("Content-Length")) {
+			// HEAD: keep the Content-Length the handler set (the size the GET body would be).
+			// The actual body bytes are absent, so don't overwrite it with the empty-buffer size.
 		} else {
 			setHeader("Content-Length", String.valueOf(responseData.position()));
 		}
 	}
 	
+	/**
+	 * Turns the response into a valid bodiless response (304/412/204/1xx): drops the buffered
+	 * body and clears any body-framing/encoding state that gzip may have enabled, so we never
+	 * emit a contradictory 304 carrying Transfer-Encoding: chunked + Content-Encoding: gzip +
+	 * Content-Length together (which would also make finish() write a stray chunk terminator).
+	 */
+	/** Either closes the connection (Connection: close) or re-arms it for the next keep-alive
+	 *  request, once the response body has been fully written. */
+	private void finishConnection(boolean closeConnection) throws IOException {
+		if (closeConnection) {
+			protocol.closeChannel((SocketChannel) key.channel());
+		} else {
+			protocol.registerForRead(key);
+		}
+	}
+
+	private void markBodiless() {
+		responseData.clear();
+		useChunked = false;
+		useGzip = false;
+		headers.remove("Transfer-Encoding");
+		headers.remove("Content-Encoding");
+		setHeader("Content-Length", "0");
+	}
+
 	private String createInitalLineAndHeaders() {
 		StringBuilder sb = new StringBuilder(HttpUtil.createInitialLine(statusCode));
 		for (Map.Entry<String, String> header : headers.entrySet()) {
-			sb.append(header.getKey());
+			// A header field is always "name ':' OWS value"; emitting the name alone (when the
+			// value is empty) produces a malformed, colon-less line.
+			sb.append(header.getKey()).append(": ");
 			if (!header.getValue().isEmpty()) {
-				sb.append(": ");
 				sb.append(header.getValue());
 			}
 			sb.append("\r\n");
@@ -325,43 +377,40 @@ public class HttpResponse {
 	}
 	
 	public long write(ByteBuffer data) {
-		try {
-			SocketChannel sc = ((SocketChannel) key.channel());
-			long size = data.remaining();
-			long bytesWritten = 0;
-			
-			if (!headersCreated) {
-				if (useChunked) {
-					setHeader("Transfer-Encoding", "chunked");
-					headers.remove("Content-Length");
-				} else {
-					setHeader("Content-Length", String.valueOf(size));
-				}
+		int size = data.remaining();
+
+		if (!headersCreated) {
+			if (useChunked) {
+				setHeader("Transfer-Encoding", "chunked");
+				headers.remove("Content-Length");
+			} else {
+				setHeader("Content-Length", String.valueOf(size));
 			}
-			
-			flush(); // write initial line + headers
-			if (isBodySuppressed()) {
-				return bytesWritten;
-			}
-			
-			if (data.hasRemaining()) {
-				if (useChunked) {
-					String hex = Integer.toHexString(data.remaining());
-					protocol.write(sc, ByteBuffer.wrap((hex + "\r\n").getBytes(StandardCharsets.ISO_8859_1)));
-				}
-				int written = 0;
-				do {
-					written = protocol.write(sc, data);
-					bytesWritten += written;
-				} while (written > 0 && data.hasRemaining());
-				if (useChunked) {
-					protocol.write(sc, ByteBuffer.wrap("\r\n".getBytes(StandardCharsets.ISO_8859_1)));
-				}
-			}
-			return bytesWritten;
-		} catch (IOException e) {
-			throw new java.io.UncheckedIOException(e);
 		}
+
+		// Emit the initial line + headers (and any previously-buffered body). flush() routes
+		// through the partial-write/OP_WRITE machinery, so nothing is lost on a full socket.
+		long bytesWritten = flush();
+		if (isBodySuppressed()) {
+			return bytesWritten;
+		}
+
+		// Buffer the body (with chunk framing if chunked) and flush. Previously the body and the
+		// chunk-size/CRLF markers were written straight to the socket in a loop that stopped on a
+		// 0-byte (buffer-full) write, silently dropping the remaining payload AND desynchronising
+		// the chunked stream. Buffering via responseData lets flush() defer the remainder to
+		// OP_WRITE instead.
+		if (data.hasRemaining()) {
+			if (useChunked) {
+				responseData.put((Integer.toHexString(data.remaining()) + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
+				responseData.put(data);
+				responseData.put("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+			} else {
+				responseData.put(data);
+			}
+			bytesWritten += flush();
+		}
+		return bytesWritten;
 	}
 	
 	/**
@@ -435,13 +484,26 @@ public class HttpResponse {
 		return suppressBody || statusCode / 100 == 1 || statusCode == 204 || statusCode == 304;
 	}
 
-	private static int findHeaderEnd(ByteBuffer buffer) {
-		for (int i = buffer.position(); i <= buffer.limit() - 4; i++) {
-			if (buffer.get(i) == '\r' && buffer.get(i + 1) == '\n'
-					&& buffer.get(i + 2) == '\r' && buffer.get(i + 3) == '\n') {
-				return i + 4;
+	/**
+	 * Returns true if an If-None-Match / If-Match header value (a comma-separated list of
+	 * entity-tags, or "*") matches the given ETag. Weak indicators are ignored (weak
+	 * comparison), which is correct for If-None-Match and a safe superset for If-Match here.
+	 */
+	private static boolean ifMatchHeaderMatches(String headerValue, String etag) {
+		if (headerValue == null || etag == null) return false;
+		headerValue = headerValue.trim();
+		if (headerValue.equals("*")) return true;
+		String target = stripWeak(etag);
+		for (String candidate : headerValue.split(",")) {
+			candidate = candidate.trim();
+			if (!candidate.isEmpty() && stripWeak(candidate).equals(target)) {
+				return true;
 			}
 		}
-		return -1;
+		return false;
+	}
+
+	private static String stripWeak(String etag) {
+		return etag.startsWith("W/") ? etag.substring(2) : etag;
 	}
 }

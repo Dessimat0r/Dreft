@@ -120,4 +120,29 @@ public class CookieApiTest {
 		assertTrue(foundSession);
 		assertTrue(foundTheme);
 	}
+
+	// --- Response-splitting / header-injection defence (CR/LF/control chars rejected) ---
+
+	@Test(expected = IllegalArgumentException.class)
+	public void testCookieValueRejectsCRLF() {
+		new Cookie("x", "a\r\nSet-Cookie: evil=1");
+	}
+
+	@Test(expected = IllegalArgumentException.class)
+	public void testCookieNameRejectsControlChar() {
+		new Cookie("a\nb", "v");
+	}
+
+	@Test(expected = IllegalArgumentException.class)
+	public void testCookiePathRejectsCRLF() {
+		Cookie c = new Cookie("x", "y");
+		c.setPath("/ok\r\nInjected: 1");
+	}
+
+	@Test
+	public void testCookieAllowsNullValue() {
+		// Null value is legal (renders empty); must not throw.
+		Cookie c = new Cookie("x", null);
+		assertTrue(c.toString().startsWith("x="));
+	}
 }

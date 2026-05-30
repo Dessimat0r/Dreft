@@ -130,4 +130,68 @@ public class WebSocketIntegrationTest {
 		// Assert that client-side close listener was notified
 		assertTrue(closeLatch.await(5, TimeUnit.SECONDS));
 	}
+
+	@Test
+	public void testLargeMessageExceedingReadBuffer() throws Exception {
+		// A message far larger than READ_BUFFER_SIZE (2048) must round-trip — the non-SSL WS
+		// read buffer has to grow to hold the whole frame instead of stalling.
+		String big = "x".repeat(5000);
+		CompletableFuture<String> messageFuture = new CompletableFuture<>();
+		StringBuilder received = new StringBuilder();
+
+		WebSocket.Listener listener = new WebSocket.Listener() {
+			@Override
+			public void onOpen(WebSocket webSocket) { webSocket.request(1); }
+			@Override
+			public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+				received.append(data);
+				if (last) messageFuture.complete(received.toString());
+				webSocket.request(1);
+				return null;
+			}
+		};
+
+		HttpClient client = HttpClient.newHttpClient();
+		WebSocket webSocket = client.newWebSocketBuilder()
+				.buildAsync(URI.create("ws://localhost:" + PORT + "/ws"), listener)
+				.get(5, TimeUnit.SECONDS);
+
+		webSocket.sendText(big, true);
+		String serverResponse = messageFuture.get(5, TimeUnit.SECONDS);
+		assertEquals("echo: " + big, serverResponse);
+		webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "Bye!").get(5, TimeUnit.SECONDS);
+	}
+
+	@Test
+	public void testFragmentedMessageIsReassembled() throws Exception {
+		CompletableFuture<String> messageFuture = new CompletableFuture<>();
+
+		WebSocket.Listener listener = new WebSocket.Listener() {
+			@Override
+			public void onOpen(WebSocket webSocket) {
+				webSocket.request(1);
+			}
+			@Override
+			public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+				messageFuture.complete(data.toString());
+				webSocket.request(1);
+				return null;
+			}
+		};
+
+		HttpClient client = HttpClient.newHttpClient();
+		WebSocket webSocket = client.newWebSocketBuilder()
+				.buildAsync(URI.create("ws://localhost:" + PORT + "/ws"), listener)
+				.get(5, TimeUnit.SECONDS);
+
+		// Send a single logical message in two fragments (last=false then last=true).
+		webSocket.sendText("Frag-", false).get(5, TimeUnit.SECONDS);
+		webSocket.sendText("mented", true).get(5, TimeUnit.SECONDS);
+
+		// The server must reassemble both fragments into one onMessage and echo it once.
+		String serverResponse = messageFuture.get(5, TimeUnit.SECONDS);
+		assertEquals("echo: Frag-mented", serverResponse);
+
+		webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "Bye!").get(5, TimeUnit.SECONDS);
+	}
 }

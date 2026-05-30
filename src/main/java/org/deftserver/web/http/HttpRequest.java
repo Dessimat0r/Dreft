@@ -3,7 +3,6 @@ package org.deftserver.web.http;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.InetAddress;
 import java.net.ProtocolException;
@@ -18,7 +17,6 @@ import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 import org.deftserver.io.IOLoop;
 import org.deftserver.io.stream.ByteBufferBackedInputStream;
@@ -99,7 +97,19 @@ public class HttpRequest {
 		public Map<String, HeadKeyVals> getHeadKeyVals() {
 			return um_headKeyVals;
 		}
-		
+
+		/** Case-insensitive lookup of a part header (HTTP header names are case-insensitive,
+		 *  so a part sending e.g. "content-disposition" must resolve the same as the usual
+		 *  "Content-Disposition"). */
+		public HeadKeyVals getHeadKeyVal(String name) {
+			for (Map.Entry<String, HeadKeyVals> e : headKeyVals.entrySet()) {
+				if (e.getKey().equalsIgnoreCase(name)) {
+					return e.getValue();
+				}
+			}
+			return null;
+		}
+
 		public byte[] getRawData() {
 			return rawData;
 		}
@@ -136,6 +146,9 @@ public class HttpRequest {
 	private static final int MAX_HEADER_SIZE = 64 * 1024;
 	private static final int MAX_HEADER_COUNT = 100;
 	static final int MAX_BODY_SIZE = 16 * 1024 * 1024;
+	/** Cap on the number of multipart parts, to bound the object/memory amplification a body of
+	 *  many tiny parts would otherwise cause (a 16 MiB body could hold ~300k minimal parts). */
+	static final int MAX_MULTIPART_PARTS = 10000;
 	
 	public static final String MP_START_TERM       = "\r\n";
 	public static final byte[] MP_START_TERM_BYTES = MP_START_TERM.getBytes(StandardCharsets.ISO_8859_1);
@@ -159,6 +172,11 @@ public class HttpRequest {
 	
 	protected Map<String, Part> mpParts     = null;
 	protected Map<String, Part> um_mpParts  = null;
+	// Every part in order, so parts that share a field name (multiple files, or a text field and a
+	// file field with the same name) aren't lost — getMultiParts()'s name->Part map keeps only the
+	// last for backwards compatibility, but getAllParts()/getParts(name) expose them all.
+	protected final List<Part>  mpPartsAll     = new ArrayList<>();
+	protected final List<Part>  um_mpPartsAll  = Collections.unmodifiableList(mpPartsAll);
 	protected final int         requestNum;
 
 	protected Map<String, List<String>> postParameters = null;
@@ -222,17 +240,14 @@ public class HttpRequest {
 		
 		String connection = getHeader("Connection");
 		if ("HTTP/1.1".equals(version)) {
-			if (connection != null && "close".equalsIgnoreCase(connection)) {
-				keepAlive = false;
-			} else {
-				keepAlive = true;
-			}
+			// HTTP/1.1 defaults to keep-alive unless the Connection header lists "close". The
+			// header is a comma-separated token list (e.g. "close, TE"), so check membership
+			// rather than equality of the whole value.
+			keepAlive = !connectionHasToken(connection, "close");
 		} else { // HTTP/1.0
-			if (connection != null && "keep-alive".equalsIgnoreCase(connection)) {
-				keepAlive = true;
-			} else {
-				keepAlive = false;
-			}
+			// HTTP/1.0 defaults to close unless "keep-alive" is listed; an explicit "close" token
+			// still wins if both are (contradictorily) present.
+			keepAlive = connectionHasToken(connection, "keep-alive") && !connectionHasToken(connection, "close");
 		}
 		chunked = false;
 	}
@@ -286,6 +301,15 @@ public class HttpRequest {
 			chunked = isChunked(headers.get("transfer-encoding"));
 			String clen = headers.get("content-length");
 			if (clen != null && !clen.isEmpty()) {
+				// RFC 9110 §8.6: Content-Length is 1*DIGIT. Reject anything else (e.g. "+5",
+				// "-5", "0x5", "5,5") strictly — Integer.parseInt would otherwise accept a
+				// leading sign, a classic request-smuggling discrepancy with stricter proxies.
+				for (int i = 0; i < clen.length(); i++) {
+					char c = clen.charAt(i);
+					if (c < '0' || c > '9') {
+						throw new ProtocolException("Invalid Content-Length: " + clen);
+					}
+				}
 				try {
 					contentLength = Integer.parseInt(clen);
 				} catch (NumberFormatException e) {
@@ -300,18 +324,32 @@ public class HttpRequest {
 			}
 			if (hasRequestBody()) {
 				String ctype = headers.get("content-type");
-				String[] contentTypeArr = ctype == null ? new String[] {""} : HEADER_VAL_SPLIT_PATTERN.split(ctype);
-				contentType = contentTypeArr[0].trim().toLowerCase(Locale.ROOT);
+				// Quote-aware, ';'-separated parse (handles "type;param" without a space and
+				// quoted parameter values). The media type is the first segment.
+				List<String> ctParts = ctype == null ? java.util.List.of("") : splitParamsRespectingQuotes(ctype);
+				contentType = ctParts.get(0).trim().toLowerCase(Locale.ROOT);
 				if (!contentType.isEmpty()) {
 					if (contentType.equals("multipart/form-data")) {
-						if (contentTypeArr.length < 2) {
+						// Find the boundary parameter (case-insensitive name, may be quoted, and
+						// need not be the first parameter — a charset may precede it).
+						String boundary = null;
+						for (int i = 1; i < ctParts.size(); i++) {
+							String param = ctParts.get(i).trim();
+							int eq = param.indexOf('=');
+							if (eq < 0) continue;
+							if (param.substring(0, eq).trim().equalsIgnoreCase("boundary")) {
+								String pVal = param.substring(eq + 1).trim();
+								if (pVal.length() >= 2 && pVal.charAt(0) == '"' && pVal.charAt(pVal.length() - 1) == '"') {
+									pVal = pVal.substring(1, pVal.length() - 1);
+								}
+								boundary = pVal;
+								break;
+							}
+						}
+						if (boundary == null || boundary.isEmpty()) {
 							throw new ProtocolException("Expected multipart boundary");
 						}
-						String[] mparr = contentTypeArr[1].split("=", 2);
-						if (mparr.length < 2 || !mparr[0].equals("boundary")) {
-							throw new ProtocolException("Expected mp boundary string, got " + contentTypeArr[1]);
-						}
-						multipartBoundary = mparr[1];
+						multipartBoundary = boundary;
 						logger.debug("got multipart boundary: {}", multipartBoundary);
 						multipartBoundaryB = multipartBoundary.getBytes(StandardCharsets.ISO_8859_1);
 						mpBoundaryBPre    = ("\r\n--" + multipartBoundary).getBytes(StandardCharsets.ISO_8859_1);
@@ -343,25 +381,16 @@ public class HttpRequest {
 		}
 		String connection = getHeader("Connection");
 		if ("HTTP/1.1".equals(version)) {
-			if (connection != null && "close".equalsIgnoreCase(connection)) {
-				keepAlive = false;
-			} else {
-				keepAlive = true;
-			}
+			// HTTP/1.1 defaults to keep-alive unless the Connection header lists "close". The
+			// header is a comma-separated token list (e.g. "close, TE"), so check membership
+			// rather than equality of the whole value.
+			keepAlive = !connectionHasToken(connection, "close");
 		} else { // HTTP/1.0
-			if (connection != null && "keep-alive".equalsIgnoreCase(connection)) {
-				keepAlive = true;
-			} else {
-				keepAlive = false;
-			}
+			// HTTP/1.0 defaults to close unless "keep-alive" is listed; an explicit "close" token
+			// still wins if both are (contradictorily) present.
+			keepAlive = connectionHasToken(connection, "keep-alive") && !connectionHasToken(connection, "close");
 		}
 		putContentData(false, buffer);
-	}
-	
-	public static String streamHeadersToString(final InputStream inputStream) throws IOException {
-		try (final BufferedReader br = new BufferedReader(new InputStreamReader(inputStream))) {
-			return br.lines().parallel().collect(Collectors.joining("\r\n"));
-		}
 	}
 	
 	public long getRemaining() {
@@ -419,6 +448,13 @@ public class HttpRequest {
 				if (line.isEmpty()) {
 					break;
 				}
+				// RFC 7230 §3.2.4: reject obsolete line folding (a header line starting with
+				// SP/HT is an obs-fold continuation). Accepting it risks parser disagreement
+				// with upstream proxies (request smuggling), so we reject with 400.
+				char first = line.charAt(0);
+				if (first == ' ' || first == '\t') {
+					throw new ProtocolException("Obsolete header line folding is not allowed");
+				}
 				if (++headerCount > MAX_HEADER_COUNT) {
 					throw new ProtocolException("Too many headers");
 				}
@@ -435,6 +471,15 @@ public class HttpRequest {
 				if (!isHeaderName(key)) {
 					throw new ProtocolException("Invalid header name");
 				}
+				// Reject embedded control characters (e.g. a bare CR or NUL that survived CRLF
+				// line splitting) in the value — HT is the only permitted control char in a
+				// field-value (RFC 9110 §5.5). Defends against header-injection/smuggling.
+				for (int c = 0; c < val.length(); c++) {
+					char ch = val.charAt(c);
+					if ((ch < 0x20 && ch != '\t') || ch == 0x7f) {
+						throw new ProtocolException("Control character in header value");
+					}
+				}
 				addHeader(generalHeaders, key, val);
 			}
 			logger.debug("buffer remaining: {}", buffer.remaining());
@@ -444,6 +489,24 @@ public class HttpRequest {
 	
 	public Map<String, Part> getMultiParts() {
 		return um_mpParts;
+	}
+
+	/** All multipart parts in wire order, including ones that share a field name (which the
+	 *  name-keyed {@link #getMultiParts()} map would otherwise collapse to the last). */
+	public List<Part> getAllParts() {
+		return um_mpPartsAll;
+	}
+
+	/** All parts submitted under the given field name (empty if none / not multipart). */
+	public List<Part> getParts(String name) {
+		if (name == null) return Collections.emptyList();
+		List<Part> matches = new ArrayList<>();
+		for (Part p : mpPartsAll) {
+			if (name.equals(p.getMapName())) {
+				matches.add(p);
+			}
+		}
+		return matches;
 	}
 	
 	public boolean isMultipart() {
@@ -487,6 +550,10 @@ public class HttpRequest {
 				if ("application/x-www-form-urlencoded".equals(contentType)) {
 					postParameters = parseParameters2(body);
 				}
+			} else {
+				// Parse the dechunked multipart body. Previously chunked multipart uploads were
+				// marked complete but never parsed, so getMultiParts() came back empty.
+				parseMultipartParts(ByteBuffer.wrap(chunkedBody.toByteArray()));
 			}
 			return true;
 		}
@@ -518,6 +585,19 @@ public class HttpRequest {
 		if (!multipart) {
 			postParameters = parseParameters2(body);
 		} else {
+			parseMultipartParts(rawBody);
+		}
+		return true;
+	}
+
+	/**
+	 * Parses multipart/form-data parts from the given body buffer (read mode, positioned at the
+	 * start of the body). Shared by the Content-Length path (rawBody) and the chunked path (the
+	 * dechunked bytes) so that chunked multipart uploads are parsed rather than silently dropped.
+	 * The parameter is named {@code rawBody} so the parsing body below is identical to the
+	 * original inline implementation.
+	 */
+	private void parseMultipartParts(ByteBuffer rawBody) throws IOException {
 			boolean parsingBoundary = false;
 			Part    currPart        = null;
 			boolean mpFinished      = false;
@@ -560,6 +640,7 @@ public class HttpRequest {
 						currPart.data    = new String(currPart.rawData, StandardCharsets.ISO_8859_1);
 						currPart.complete = true;
 						mpParts.put(currPart.mapName, currPart);
+						mpPartsAll.add(currPart);
 						
 						logger.debug(
 							"Completed part header #{} (id: {}) ~ " +
@@ -575,13 +656,17 @@ public class HttpRequest {
 					if (mpFinished) {
 						logger.debug("mp finished");
 						rawBody.position(rawBody.limit());
-						return true;
+						return;
 					}
 				}
 				
 				if (!parsingBoundary) throw new IllegalStateException("Not parsing boundary & adding part");
-				
-				// add new part				
+
+				if (mpPartsAll.size() >= MAX_MULTIPART_PARTS) {
+					throw new ProtocolException("Too many multipart parts (max " + MAX_MULTIPART_PARTS + ")");
+				}
+
+				// add new part
 				int oldlimit = rawBody.limit();
 				int headerStartPos = rawBody.position();
 				found = findInBB(rawBody, HTTP_HEAD_TERM_BYTES);
@@ -613,8 +698,8 @@ public class HttpRequest {
 						HeadKeyVals hkv = parseHeadKeyVals(currMpLine);
 						currPart.headKeyVals.put(hkv.key, hkv);
 					}
-					// check we got content-disposition..
-					HeadKeyVals hkv = currPart.headKeyVals.get("Content-Disposition");
+					// check we got content-disposition.. (case-insensitive per HTTP)
+					HeadKeyVals hkv = currPart.getHeadKeyVal("Content-Disposition");
 					if (hkv == null) {
 						throw new ProtocolException("Content-Disposition line doesn't exist in part header");
 					}
@@ -634,8 +719,6 @@ public class HttpRequest {
 					rawBody.position(datapos);
 				}
 			}
-		}
-		return true;
 	}
 	
 	protected void setIOLoop(IOLoop ioLoop) {
@@ -664,7 +747,9 @@ public class HttpRequest {
 	
 	public String getHeader(String name) {
 		if (headers == null) return null;
-		return headers.get(name.toLowerCase());
+		// Headers are stored lowercased with Locale.ROOT; look up with the same locale to
+		// avoid the Turkish-locale dotted/dotless-I mismatch (e.g. "Content-Length").
+		return headers.get(name.toLowerCase(Locale.ROOT));
 	}
 	
 	public HttpVerb getMethod() {
@@ -678,33 +763,60 @@ public class HttpRequest {
 	
 	HeadKeyVals parseHeadKeyVals(String line) throws IllegalArgumentException {
 		logger.debug("hv line: {}", line);
-		String[] lineSplit = line.split(": ", 2);
-		if (lineSplit.length != 2) {
+		// Split the header name from its value at the first ':' (OWS after the colon is
+		// optional per RFC, so don't require a space). Then parse the ';'-separated parameters
+		// in a quote-aware way so a parameter value containing "; " (e.g. a filename) isn't
+		// mis-split.
+		int colon = line.indexOf(':');
+		if (colon < 0) {
 			throw new IllegalArgumentException("Expecting id and val for header line");
 		}
 		HeadKeyVals hkv = new HeadKeyVals();
-		hkv.key = lineSplit[0];
-		String[] lineSplit2 = lineSplit[1].split("; ");
-		hkv.val = lineSplit2[0];
-		boolean key = true;
-		for (String val : lineSplit2) {
-			if (key) {
-				key = false;
+		hkv.key = line.substring(0, colon).trim();
+		String rest = line.substring(colon + 1).trim();
+		List<String> segments = splitParamsRespectingQuotes(rest);
+		hkv.val = segments.isEmpty() ? "" : segments.get(0).trim();
+		for (int i = 1; i < segments.size(); i++) {
+			String seg = segments.get(i).trim();
+			if (seg.isEmpty()) {
 				continue;
 			}
-			logger.debug("lnsp2 val: {}", val);
-			String[] spl = val.split("=", 2);
-			if (spl.length != 2) {
+			int eq = seg.indexOf('=');
+			if (eq < 0) {
 				throw new IllegalArgumentException("Expecting id and val in header line (for sub-val)");
 			}
-			String splval = spl[1];
-			if (splval.startsWith("\"") && splval.endsWith("\"")) {
-				splval = splval.substring(1, splval.length()-1);
+			String pName = seg.substring(0, eq).trim();
+			String pVal = seg.substring(eq + 1).trim();
+			// Strip surrounding DQUOTEs (guard the length so a lone '"' doesn't throw).
+			if (pVal.length() >= 2 && pVal.charAt(0) == '"' && pVal.charAt(pVal.length() - 1) == '"') {
+				pVal = pVal.substring(1, pVal.length() - 1);
 			}
-			hkv.vals.put(spl[0], splval);
+			hkv.vals.put(pName, pVal);
 		}
 		logger.debug("hkv: {}", hkv);
 		return hkv;
+	}
+
+	/** Splits a header value on ';' while ignoring ';' inside double-quoted strings, so quoted
+	 *  parameter values (e.g. {@code filename="a; b.txt"}) survive intact. */
+	private static List<String> splitParamsRespectingQuotes(String s) {
+		List<String> parts = new ArrayList<>();
+		StringBuilder cur = new StringBuilder();
+		boolean inQuotes = false;
+		for (int i = 0; i < s.length(); i++) {
+			char c = s.charAt(i);
+			if (c == '"') {
+				inQuotes = !inQuotes;
+				cur.append(c);
+			} else if (c == ';' && !inQuotes) {
+				parts.add(cur.toString());
+				cur.setLength(0);
+			} else {
+				cur.append(c);
+			}
+		}
+		parts.add(cur.toString());
+		return parts;
 	}
 	
 	public long getFlipRemain() {
@@ -831,7 +943,10 @@ public class HttpRequest {
 
 	
 	private Map<String, List<String>> parseParameters(String requestLine) {
-		String[] str = QUERY_STRING_PATTERN.split(requestLine);
+		// Split on the FIRST '?' only: everything after it is the query string, including any
+		// further '?' characters (which are legal inside the query and may appear in values,
+		// e.g. ?redirect=http://x?y=1). Splitting on every '?' would drop those.
+		String[] str = QUERY_STRING_PATTERN.split(requestLine, 2);
 		//Parameters exist
 		if (str.length > 1) {
 			return parseParameters2(str[1]);
@@ -842,7 +957,7 @@ public class HttpRequest {
 	private Map<String, List<String>> parseParameters2(String line) {
 		Map<String, List<String>> result = new LinkedHashMap<>();
 		//Parameters exist
-		String[] paramArray = PARAM_STRING_PATTERN.split(line); 
+		String[] paramArray = PARAM_STRING_PATTERN.split(line);
 		for (String keyValue : paramArray) {
 			String[] keyValueArray = KEY_VALUE_PATTERN.split(keyValue, 2);
 			//We need to check if the parameter has a value associated with it.
@@ -1022,6 +1137,17 @@ public class HttpRequest {
 		}
 	}
 
+	/** True if the comma-separated Connection header lists the given (case-insensitive) token. */
+	private static boolean connectionHasToken(String connectionHeader, String token) {
+		if (connectionHeader == null) return false;
+		for (String t : connectionHeader.split(",")) {
+			if (t.trim().equalsIgnoreCase(token)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	private static boolean isChunked(String transferEncoding) {
 		if (transferEncoding == null) return false;
 		for (String value : transferEncoding.split(",")) {
@@ -1061,7 +1187,9 @@ public class HttpRequest {
 			} catch (NumberFormatException e) {
 				throw new ProtocolException("Invalid chunk size");
 			}
-			if (chunkSize < 0 || chunkedBody.size() + chunkSize > MAX_BODY_SIZE) {
+			// Use long arithmetic: a near-Integer.MAX_VALUE chunk size would otherwise overflow
+			// the int addition to a negative value and slip past the size cap.
+			if (chunkSize < 0 || (long) chunkedBody.size() + chunkSize > MAX_BODY_SIZE) {
 				throw new ProtocolException("Chunked body too large");
 			}
 			if (chunkSize == 0) {
@@ -1102,6 +1230,11 @@ public class HttpRequest {
 	}
 
 	private boolean consumeChunkTerminator(ByteBuffer buffer) throws ProtocolException {
+		// Accumulate trailers into a local map and only commit once the full trailer block
+		// (ending in a blank line) has been read. If the block is split across socket reads
+		// the caller resets the buffer position and re-invokes us; committing incrementally
+		// would otherwise re-add (and duplicate) already-parsed trailer values on each retry.
+		Map<String, String> pending = new LinkedHashMap<>();
 		String trailerOrBlank;
 		do {
 			trailerOrBlank = readAsciiLine(buffer);
@@ -1123,15 +1256,21 @@ public class HttpRequest {
 				if (isProhibitedTrailer(key)) {
 					throw new ProtocolException("Prohibited header in chunk trailer: " + key);
 				}
-				addHeader(this.trailers, key, val);
+				addHeader(pending, key, val);
 			}
 		} while (!trailerOrBlank.isEmpty());
+		trailers.putAll(pending);
 		return true;
 	}
 
 	public static String normalizeAndDecodePath(String path) throws HttpException {
 		if (path == null || path.isEmpty()) {
 			return "/";
+		}
+		// The asterisk-form request-target (used by "OPTIONS * HTTP/1.1") is not a path and must
+		// be passed through verbatim rather than fed to the URI normalizer (which would reject it).
+		if (path.equals("*")) {
+			return "*";
 		}
 		if (path.startsWith("http://") || path.startsWith("https://") || path.startsWith("//")) {
 			try {
@@ -1145,9 +1284,12 @@ public class HttpRequest {
 			}
 		}
 		try {
-			// 1. Percent-decode the path using UTF-8
-			String decoded = URLDecoder.decode(path, StandardCharsets.UTF_8);
-			
+			// 1. Percent-decode the path using UTF-8. NOTE: we must NOT use URLDecoder here —
+			// it applies form (application/x-www-form-urlencoded) semantics and would turn a
+			// literal '+' into a space, which is wrong for a URL path (RFC 3986). Only %XX
+			// escapes are decoded; '+' is preserved verbatim.
+			String decoded = percentDecodePath(path);
+
 			// 2. Protect against null byte injection
 			if (decoded.indexOf('\0') != -1) {
 				throw new HttpException(400, "Bad Request", "Null bytes in path are forbidden");
@@ -1179,6 +1321,35 @@ public class HttpRequest {
 
 	private static String urlDecode(String value) {
 		return URLDecoder.decode(value, StandardCharsets.UTF_8);
+	}
+
+	/**
+	 * Percent-decodes a URL path. Unlike {@link URLDecoder}, a literal '+' is preserved (it
+	 * is an ordinary path character per RFC 3986, not an encoded space). The incoming string
+	 * carries raw request bytes as ISO-8859-1 chars (0-255); decoded bytes are reinterpreted
+	 * as UTF-8. Malformed/truncated escapes raise a 400.
+	 */
+	private static String percentDecodePath(String path) throws HttpException {
+		int len = path.length();
+		java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(len);
+		for (int i = 0; i < len; i++) {
+			char c = path.charAt(i);
+			if (c == '%') {
+				if (i + 2 >= len) {
+					throw new HttpException(400, "Bad Request", "Truncated percent-encoding in path");
+				}
+				int hi = Character.digit(path.charAt(i + 1), 16);
+				int lo = Character.digit(path.charAt(i + 2), 16);
+				if (hi < 0 || lo < 0) {
+					throw new HttpException(400, "Bad Request", "Invalid percent-encoding in path");
+				}
+				out.write((hi << 4) | lo);
+				i += 2;
+			} else {
+				out.write(c & 0xFF);
+			}
+		}
+		return new String(out.toByteArray(), StandardCharsets.UTF_8);
 	}
 	
 	public static final boolean findInBB(ByteBuffer buffer, byte[] bytes) {
@@ -1268,7 +1439,7 @@ public class HttpRequest {
 				}
 				if (accepted.endsWith("/*")) {
 					String prefix = accepted.substring(0, accepted.length() - 1);
-					if (supported.toLowerCase().startsWith(prefix.toLowerCase())) {
+					if (supported.toLowerCase(Locale.ROOT).startsWith(prefix.toLowerCase(Locale.ROOT))) {
 						return supported;
 					}
 				}
@@ -1293,7 +1464,7 @@ public class HttpRequest {
 	public String getScheme() {
 		String xfp = getHeader("X-Forwarded-Proto");
 		if (xfp != null && !xfp.isEmpty()) {
-			return xfp.trim().toLowerCase();
+			return xfp.trim().toLowerCase(Locale.ROOT);
 		}
 		return (serverPort == 8443 || serverPort == 443) ? "https" : "http";
 	}
@@ -1325,10 +1496,11 @@ public class HttpRequest {
 			}
 		}
 		if (mpParts != null) {
-			for (Map.Entry<String, Part> entry : mpParts.entrySet()) {
-				String key = entry.getKey();
-				Part part = entry.getValue();
-				HeadKeyVals cd = part.getHeadKeyVals().get("Content-Disposition");
+			// Iterate every part (not the name-keyed map) so multiple values for the same field
+			// name are all included in the tree.
+			for (Part part : mpPartsAll) {
+				String key = part.getMapName();
+				HeadKeyVals cd = part.getHeadKeyVal("Content-Disposition");
 				boolean isFile = cd != null && cd.getVals().containsKey("filename");
 				if (!isFile && part.getData() != null) {
 					combined.computeIfAbsent(key, k -> new ArrayList<>()).add(part.getData());
@@ -1351,6 +1523,12 @@ public class HttpRequest {
 		return root;
 	}
 
+	/** Cap on PHP-style bracket nesting depth. {@link #insertValue} recurses once per segment,
+	 *  so without a bound an attacker-supplied name like {@code a[x][x]...} (thousands of
+	 *  brackets) would overflow the stack — a StackOverflowError is an Error, not a
+	 *  RuntimeException, so it would bypass the dispatcher's catch and kill the I/O loop. */
+	private static final int MAX_PARAM_NESTING_DEPTH = 32;
+
 	private List<String> parseSegments(String rawName) {
 		List<String> segments = new ArrayList<>();
 		int firstBracket = rawName.indexOf('[');
@@ -1362,6 +1540,12 @@ public class HttpRequest {
 		int i = firstBracket;
 		while (i < rawName.length()) {
 			if (rawName.charAt(i) == '[') {
+				// Stop nesting at the depth cap: keep the remainder of the name as a single
+				// final segment so no data is lost and recursion stays bounded.
+				if (segments.size() >= MAX_PARAM_NESTING_DEPTH) {
+					segments.add(rawName.substring(i));
+					break;
+				}
 				int close = rawName.indexOf(']', i);
 				if (close != -1) {
 					String segment = rawName.substring(i + 1, close);

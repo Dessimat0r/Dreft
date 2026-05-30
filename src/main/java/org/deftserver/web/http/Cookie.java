@@ -30,8 +30,25 @@ public class Cookie {
 		if (name == null || name.trim().isEmpty()) {
 			throw new IllegalArgumentException("Cookie name cannot be null or empty");
 		}
+		rejectControlChars("Cookie name", name);
+		rejectControlChars("Cookie value", value);
 		this.name = name;
 		this.value = value;
+	}
+
+	/**
+	 * Rejects characters that would let an attacker break out of the Set-Cookie header and
+	 * inject additional headers/response data (CR, LF, NUL and other control characters).
+	 * This is the primary defence against HTTP response-splitting via cookie attributes.
+	 */
+	private static void rejectControlChars(String field, String s) {
+		if (s == null) return;
+		for (int i = 0; i < s.length(); i++) {
+			char c = s.charAt(i);
+			if (c < 0x20 || c == 0x7f) {
+				throw new IllegalArgumentException(field + " contains an illegal control character");
+			}
+		}
 	}
 
 	public String getName() {
@@ -47,6 +64,7 @@ public class Cookie {
 	}
 
 	public void setDomain(String domain) {
+		rejectControlChars("Cookie domain", domain);
 		this.domain = domain;
 	}
 
@@ -55,6 +73,7 @@ public class Cookie {
 	}
 
 	public void setPath(String path) {
+		rejectControlChars("Cookie path", path);
 		this.path = path;
 	}
 

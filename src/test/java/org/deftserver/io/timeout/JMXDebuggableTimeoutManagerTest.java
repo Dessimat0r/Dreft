@@ -89,6 +89,21 @@ public class JMXDebuggableTimeoutManagerTest {
 		assertEquals(0, tm.getNumberOfKeepAliveTimeouts());
 	}
 	
+	@Test
+	public void keepAliveChurnDoesNotGrowQueueUnbounded() {
+		// Repeatedly re-arming the keep-alive timeout for the SAME channel cancels the previous
+		// entry each time. Without compaction the dead entries would accumulate to ~2000; the
+		// purge keeps the queue bounded to roughly 2x the live count (here: 1).
+		final long now = System.currentTimeMillis();
+		MockChannel c = new MockChannel();
+		for (int i = 0; i < 2000; i++) {
+			addNopKeepAliveTimeout(c, now + 100000 + i);
+		}
+		assertEquals(1, tm.getNumberOfKeepAliveTimeouts());
+		assertTrue("queue should be compacted, was " + tm.getNumberOfTimeouts(),
+			tm.getNumberOfTimeouts() < 200);
+	}
+
 	private void addRecursiveTimeout(final long timeout) {
 		final Timeout t = new Timeout(timeout, new AsyncCallback() {
 			@Override public void onCallback() { addNopTimeout(System.currentTimeMillis() + 100); }

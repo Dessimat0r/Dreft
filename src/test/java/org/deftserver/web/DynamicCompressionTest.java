@@ -1,6 +1,7 @@
 package org.deftserver.web;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
@@ -190,6 +191,52 @@ public class DynamicCompressionTest {
 				baos.write(buffer, 0, len);
 			}
 			return baos.toString(java.nio.charset.StandardCharsets.UTF_8);
+		}
+	}
+
+	@Test
+	public void testConditionalGetOnGzippedResourceYieldsCleanNotModified() throws Exception {
+		// 1. Fetch the gzipped representation and capture its (quoted) ETag.
+		String first = rawRequest(
+			"GET /compress HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Accept-Encoding: gzip\r\n" +
+			"Connection: close\r\n\r\n");
+		assertTrue(first.startsWith("HTTP/1.1 200"));
+		int etagIdx = first.indexOf("Etag: ");
+		assertTrue("expected an Etag header:\n" + first.substring(0, Math.min(300, first.length())), etagIdx != -1);
+		String etag = first.substring(etagIdx + 6, first.indexOf("\r\n", etagIdx)).trim();
+
+		// 2. Conditional GET with that ETag must yield a CLEAN 304: no Transfer-Encoding,
+		//    no Content-Encoding, no chunked body — just headers (regression for the bug
+		//    where gzip framing leaked into the 304, producing a stray "0\r\n\r\n" body).
+		String second = rawRequest(
+			"GET /compress HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Accept-Encoding: gzip\r\n" +
+			"If-None-Match: " + etag + "\r\n" +
+			"Connection: close\r\n\r\n");
+		assertTrue("expected 304, got:\n" + second.substring(0, Math.min(80, second.length())),
+			second.startsWith("HTTP/1.1 304"));
+		assertFalse("304 must not carry Transfer-Encoding:\n" + second, second.contains("Transfer-Encoding:"));
+		assertFalse("304 must not carry Content-Encoding:\n" + second, second.contains("Content-Encoding:"));
+		int bodyStart = second.indexOf("\r\n\r\n") + 4;
+		assertEquals("304 must have an empty body", bodyStart, second.length());
+	}
+
+	private String rawRequest(String request) throws IOException {
+		try (java.net.Socket socket = new java.net.Socket("localhost", PORT)) {
+			socket.setSoTimeout(3000);
+			socket.getOutputStream().write(request.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+			socket.getOutputStream().flush();
+			java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+			byte[] buf = new byte[4096];
+			int n;
+			java.io.InputStream is = socket.getInputStream();
+			while ((n = is.read(buf)) != -1) {
+				out.write(buf, 0, n);
+			}
+			return out.toString(java.nio.charset.StandardCharsets.ISO_8859_1);
 		}
 	}
 }

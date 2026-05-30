@@ -324,6 +324,12 @@ public class DeftSystemTest {
 		reqHandlers.put("/authenticated", new AuthenticatedRequestHandler());
 		reqHandlers.put("/query_params", new QueryParamsRequestHandler());
 		reqHandlers.put("/chunked", new ChunkedRequestHandler());
+		reqHandlers.put("/writebb", new RequestHandler() {
+			@Override
+			public void get(org.deftserver.web.http.HttpRequest request, org.deftserver.web.http.HttpResponse response) {
+				response.write(java.nio.ByteBuffer.wrap("bytebufferbody".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+			}
+		});
 
 		final Application application = new Application(reqHandlers);
 		application.setStaticContentDir("src/test/resources");
@@ -655,7 +661,9 @@ public class DeftSystemTest {
 		assertEquals(500, response.getStatusLine().getStatusCode());
 		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
 		assertEquals("Internal Server Error", response.getStatusLine().getReasonPhrase());
-		assertEquals(6, response.getAllHeaders().length);
+		// text/plain body is gzipped, which now also emits Vary: Accept-Encoding (7 headers).
+		assertEquals(7, response.getAllHeaders().length);
+		assertTrue(response.getFirstHeader("Vary").getValue().toLowerCase().contains("accept-encoding"));
 		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
 		assertEquals("exception message", payLoad);
 	}
@@ -670,7 +678,9 @@ public class DeftSystemTest {
 		assertEquals(500, response.getStatusLine().getStatusCode());
 		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
 		assertEquals("Internal Server Error", response.getStatusLine().getReasonPhrase());
-		assertEquals(6, response.getAllHeaders().length);
+		// text/plain body is gzipped, which now also emits Vary: Accept-Encoding (7 headers).
+		assertEquals(7, response.getAllHeaders().length);
+		assertTrue(response.getFirstHeader("Vary").getValue().toLowerCase().contains("accept-encoding"));
 		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
 		assertEquals("exception message", payLoad);
 	}
@@ -1390,6 +1400,45 @@ public class DeftSystemTest {
 	}
 
 	@Test
+	public void conditionalPrecedenceTest() throws IOException {
+		// RFC 9110 §13.1.3: when If-None-Match is present (even non-matching), If-Modified-Since
+		// must be ignored. A far-future If-Modified-Since alone would yield 304, but a present,
+		// non-matching If-None-Match must force a 200.
+		String response = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"If-None-Match: \"does-not-match\"\r\n" +
+			"If-Modified-Since: Wed, 01 Jan 2098 00:00:00 GMT\r\n\r\n");
+		assertTrue("INM present (non-matching) must override IMS → 200, got: " +
+			response.substring(0, Math.min(30, response.length())),
+			response.startsWith("HTTP/1.1 200"));
+	}
+
+	@Test
+	public void ifRangeTest() throws IOException {
+		// Fetch the ETag first.
+		String full = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\nHost: localhost\r\n\r\n");
+		int idx = full.indexOf("ETag: ");
+		assertTrue(idx != -1);
+		String etag = full.substring(idx + 6, full.indexOf("\r\n", idx)).trim();
+
+		// If-Range matches → the Range is honoured (206).
+		String matched = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\nHost: localhost\r\n" +
+			"If-Range: " + etag + "\r\nRange: bytes=0-3\r\n\r\n");
+		assertTrue("matching If-Range should give 206, got: " + matched.substring(0, Math.min(30, matched.length())),
+			matched.startsWith("HTTP/1.1 206"));
+
+		// If-Range does NOT match → the Range is ignored, full file served (200).
+		String unmatched = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\nHost: localhost\r\n" +
+			"If-Range: \"stale-etag\"\r\nRange: bytes=0-3\r\n\r\n");
+		assertTrue("non-matching If-Range should give 200, got: " + unmatched.substring(0, Math.min(30, unmatched.length())),
+			unmatched.startsWith("HTTP/1.1 200"));
+	}
+
+	@Test
 	public void automaticHeadRequestTest() throws IOException {
 		String response = sendRawRequest(
 			"HEAD / HTTP/1.1\r\n" +
@@ -1493,6 +1542,155 @@ public class DeftSystemTest {
 		System.out.println("DEBUG VERSION RESP: [" + response + "]");
 		assertTrue(response.startsWith("HTTP/1.1 505"));
 		assertTrue(response.contains("HTTP Version Not Supported"));
+	}
+
+	@Test
+	public void largeHeaderBlockExceedingReadBufferTest() throws IOException {
+		// Header block far larger than READ_BUFFER_SIZE (2048): must grow the read buffer and
+		// succeed, not crash with IllegalStateException.
+		StringBuilder big = new StringBuilder("a".repeat(8000));
+		String response = sendRawRequest(
+			"GET / HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"X-Big: " + big + "\r\n" +
+			"Connection: close\r\n\r\n"
+		);
+		assertTrue("expected 200 for large-but-legal headers, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 200"));
+	}
+
+	@Test
+	public void oversizedHeaderBlockReturns431Test() throws IOException {
+		// Header block exceeding the 64 KiB cap must be rejected with 431, not a crash/hang.
+		String big = "a".repeat(70000);
+		String response = sendRawRequest(
+			"GET / HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"X-Big: " + big + "\r\n" +
+			"Connection: close\r\n\r\n"
+		);
+		assertTrue("expected 431, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 431"));
+	}
+
+	@Test
+	public void headStaticFileReportsContentLengthTest() throws IOException {
+		// HEAD on a static file must report the file size in Content-Length (not 0) and no body.
+		java.io.File f = new java.io.File("src/test/resources/test.txt");
+		long size = f.length();
+		String response = sendRawRequest(
+			"HEAD /src/test/resources/test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Connection: close\r\n\r\n"
+		);
+		assertTrue(response.startsWith("HTTP/1.1 200"));
+		assertTrue("expected Content-Length: " + size + " in:\n" + response,
+			response.contains("Content-Length: " + size + "\r\n"));
+		// No body after the header terminator.
+		int bodyStart = response.indexOf("\r\n\r\n") + 4;
+		assertEquals("HEAD response must have no body", bodyStart, response.length());
+	}
+
+	@Test
+	public void writeByteBufferBodyTest() throws IOException {
+		// Exercises HttpResponse.write(ByteBuffer): the body must round-trip with a correct
+		// Content-Length (the rewrite buffers through flush() so partial writes aren't lost).
+		String response = sendRawRequest(
+			"GET /writebb HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+		assertTrue(response.startsWith("HTTP/1.1 200"));
+		assertTrue(response.contains("Content-Length: 14\r\n"));
+		assertTrue(response.endsWith("bytebufferbody"));
+	}
+
+	@Test
+	public void pipelinedRequestsCloseConnectionTest() throws IOException {
+		// Two pipelined requests: the server answers the first and closes (RFC-compliant for a
+		// non-pipelining server) rather than discarding the second and leaving the client hung.
+		try (Socket socket = new Socket("localhost", PORT)) {
+			socket.setSoTimeout(3000);
+			String two = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n" +
+			             "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+			socket.getOutputStream().write(two.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+			socket.getOutputStream().flush();
+			java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+			byte[] buf = new byte[4096];
+			int n;
+			InputStream is = socket.getInputStream();
+			while ((n = is.read(buf)) != -1) {
+				out.write(buf, 0, n);
+			}
+			String resp = out.toString(java.nio.charset.StandardCharsets.ISO_8859_1);
+			assertTrue("first response should be 200, got: " + resp.substring(0, Math.min(40, resp.length())),
+				resp.startsWith("HTTP/1.1 200"));
+			assertTrue("response must declare Connection: Close:\n" + resp, resp.contains("Connection: Close"));
+			// Exactly one response — the second pipelined request must NOT be answered (server closed).
+			assertEquals("server must not pipeline a second response", -1, resp.indexOf("HTTP/1.1", 1));
+		}
+	}
+
+	@Test
+	public void serverWideOptionsAsteriskTest() throws IOException {
+		// "OPTIONS * HTTP/1.1" (asterisk-form) must be handled (204 + Allow), not 400/crash.
+		String response = sendRawRequest(
+			"OPTIONS * HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Connection: close\r\n\r\n"
+		);
+		assertTrue("expected 204 for OPTIONS *, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 204"));
+		assertTrue("expected Allow header:\n" + response, response.contains("Allow: "));
+	}
+
+	@Test
+	public void postToUnknownPathReturns404Test() throws IOException {
+		// A POST (or any method) to a non-existent resource must be 404, not 501.
+		String response = sendRawRequest(
+			"POST /no/such/path HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Content-Length: 3\r\n" +
+			"Connection: close\r\n\r\n" +
+			"abc"
+		);
+		assertTrue("expected 404 for POST to unknown path, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 404"));
+	}
+
+	@Test
+	public void obsoleteHeaderFoldingRejectionTest() throws IOException {
+		// A continuation line starting with SP (obs-fold) must be rejected (RFC 7230 §3.2.4).
+		String response = sendRawRequest(
+			"GET / HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"X-Foo: bar\r\n" +
+			" baz\r\n\r\n"
+		);
+		assertTrue("expected 400 for obs-fold, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 400"));
+	}
+
+	@Test
+	public void controlCharInHeaderValueRejectionTest() throws IOException {
+		// A bare CR embedded in a header value must be rejected (header-injection defence).
+		String response = sendRawRequest(
+			"GET / HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"X-Foo: a\rb\r\n\r\n"
+		);
+		assertTrue("expected 400 for control char in value, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 400"));
+	}
+
+	@Test
+	public void invalidContentLengthRejectionTest() throws IOException {
+		// Non-digit Content-Length (leading '+') must be rejected (request-smuggling defence).
+		String response = sendRawRequest(
+			"POST /post HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Content-Length: +5\r\n\r\n" +
+			"hello"
+		);
+		assertTrue("expected 400 for invalid Content-Length, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 400"));
 	}
 
 	@Test
@@ -1635,6 +1833,40 @@ public class DeftSystemTest {
 			org.junit.Assert.fail("Should have thrown 403 Forbidden");
 		} catch (HttpException he) {
 			assertEquals(403, he.getStatusCode());
+		}
+	}
+
+	@Test
+	public void symlinkEscapeIsForbiddenTest() throws Exception {
+		// A symlink inside the webroot pointing OUTSIDE it must not be servable (the boundary
+		// check resolves real paths, not lexical ones). Regression for the symlink-traversal hole.
+		java.nio.file.Path webroot = java.nio.file.Files.createTempDirectory("dreft-webroot");
+		java.nio.file.Path outside = java.nio.file.Files.createTempDirectory("dreft-outside");
+		java.nio.file.Path secret = outside.resolve("secret.txt");
+		java.nio.file.Files.writeString(secret, "TOPSECRET");
+		java.nio.file.Path link = webroot.resolve("link.txt");
+		try {
+			java.nio.file.Files.createSymbolicLink(link, secret);
+		} catch (UnsupportedOperationException | IOException e) {
+			org.junit.Assume.assumeNoException("symbolic links not supported on this platform", e);
+			return;
+		}
+
+		org.deftserver.web.handler.StaticContentHandler handler = org.deftserver.web.handler.StaticContentHandler.getInstance();
+		try {
+			handler.setStaticContentDir(webroot.toRealPath().toString());
+			String reqPath = webroot.toRealPath().resolve("link.txt").toString();
+			HttpRequest req = new HttpRequest("GET " + reqPath + " HTTP/1.1", java.util.Map.of("Host", "localhost"));
+			org.deftserver.web.http.HttpResponse resp = new org.deftserver.web.http.HttpResponse(null, null, false);
+			try {
+				handler.get(req, resp);
+				org.junit.Assert.fail("Symlink escaping the webroot must be 403 Forbidden");
+			} catch (HttpException he) {
+				assertEquals(403, he.getStatusCode());
+			}
+		} finally {
+			// Restore the shared singleton's static dir for the other (HTTP) static tests.
+			handler.setStaticContentDir("src/test/resources");
 		}
 	}
 

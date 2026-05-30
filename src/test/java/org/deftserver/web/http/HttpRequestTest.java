@@ -470,4 +470,178 @@ public class HttpRequestTest {
 		return ByteBuffer.wrap(data.getBytes(StandardCharsets.ISO_8859_1));
 	}
 
+	// --- URL path decoding (RFC 3986): '+' is a literal path char, not an encoded space ---
+
+	@Test
+	public void testPathDecodePreservesLiteralPlus() {
+		assertEquals("/a+b", HttpRequest.normalizeAndDecodePath("/a+b"));
+	}
+
+	@Test
+	public void testPathDecodePercentSpaceAndPlus() {
+		// %20 -> space, %2B -> '+', literal '+' stays '+'
+		assertEquals("/a b", HttpRequest.normalizeAndDecodePath("/a%20b"));
+		assertEquals("/a+b", HttpRequest.normalizeAndDecodePath("/a%2Bb"));
+	}
+
+	@Test
+	public void testPathDecodeUtf8() {
+		// /caf%C3%A9 -> /café
+		assertEquals("/café", HttpRequest.normalizeAndDecodePath("/caf%C3%A9"));
+	}
+
+	@Test(expected = HttpException.class)
+	public void testPathDecodeRejectsTruncatedEscape() {
+		HttpRequest.normalizeAndDecodePath("/a%2");
+	}
+
+	@Test(expected = HttpException.class)
+	public void testPathDecodeRejectsInvalidEscape() {
+		HttpRequest.normalizeAndDecodePath("/a%zzb");
+	}
+
+	@Test(expected = HttpException.class)
+	public void testPathTraversalStillBlockedAfterDecode() {
+		// %2e%2e/ decodes to ../ and must still be rejected
+		HttpRequest.normalizeAndDecodePath("/foo/%2e%2e/secret");
+	}
+
+	@Test
+	public void testMultipartFilenameWithSemicolonPreserved() {
+		// A filename containing "; " must not be split apart by the part-header parameter parser.
+		String boundary = "BOUNDARY";
+		String mpBody = "--" + boundary + "\r\n"
+			+ "Content-Disposition: form-data; name=\"file\"; filename=\"a; b.txt\"\r\n"
+			+ "Content-Type: text/plain\r\n\r\n"
+			+ "hello\r\n"
+			+ "--" + boundary + "--\r\n";
+		String req = "POST /upload HTTP/1.1\r\n"
+			+ "Host: localhost\r\n"
+			+ "Content-Type: multipart/form-data; boundary=" + boundary + "\r\n"
+			+ "Content-Length: " + mpBody.length() + "\r\n\r\n"
+			+ mpBody;
+		HttpRequest request = HttpRequest.of(raw(req));
+		assertTrue("request should be complete", request.isComplete());
+		HttpRequest.Part part = request.getMultiParts().get("file");
+		assertNotNull("file part must be parsed", part);
+		HttpRequest.HeadKeyVals cd = part.getHeadKeyVal("Content-Disposition");
+		assertNotNull(cd);
+		assertEquals("a; b.txt", cd.getVals().get("filename"));
+		assertEquals("hello", part.getData());
+	}
+
+	@Test
+	public void testConnectionHeaderMultiTokenClose() {
+		// "close" appearing as one of several Connection tokens must still close the connection.
+		HttpRequest closed = HttpRequest.of(
+			raw("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive, close\r\n\r\n"));
+		assertFalse(closed.isKeepAlive());
+		// Plain HTTP/1.1 with no Connection header defaults to keep-alive.
+		HttpRequest alive = HttpRequest.of(raw("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+		assertTrue(alive.isKeepAlive());
+		// HTTP/1.0 with multi-token keep-alive must stay alive.
+		HttpRequest alive10 = HttpRequest.of(
+			raw("GET / HTTP/1.0\r\nHost: localhost\r\nConnection: keep-alive, foo\r\n\r\n"));
+		assertTrue(alive10.isKeepAlive());
+	}
+
+	@Test
+	public void testQuotedAndReorderedMultipartBoundary() {
+		// Boundary may be quoted and need not be the first Content-Type parameter.
+		String boundary = "BOUNDARY";
+		String mpBody = "--" + boundary + "\r\n"
+			+ "Content-Disposition: form-data; name=\"f\"\r\n\r\n"
+			+ "v\r\n"
+			+ "--" + boundary + "--\r\n";
+		String req = "POST /u HTTP/1.1\r\n"
+			+ "Host: localhost\r\n"
+			+ "Content-Type: multipart/form-data; charset=utf-8; boundary=\"" + boundary + "\"\r\n"
+			+ "Content-Length: " + mpBody.length() + "\r\n\r\n"
+			+ mpBody;
+		HttpRequest request = HttpRequest.of(raw(req));
+		assertTrue(request.isComplete());
+		assertTrue(request.isMultipart());
+		assertNotNull(request.getMultiParts().get("f"));
+		assertEquals("v", request.getMultiParts().get("f").getData());
+	}
+
+	@Test
+	public void testMultipartDuplicateFieldNamesPreserved() {
+		String b = "BND";
+		String mpBody = "--" + b + "\r\n"
+			+ "Content-Disposition: form-data; name=\"f\"\r\n\r\nA\r\n"
+			+ "--" + b + "\r\n"
+			+ "Content-Disposition: form-data; name=\"f\"\r\n\r\nB\r\n"
+			+ "--" + b + "--\r\n";
+		String req = "POST /u HTTP/1.1\r\n"
+			+ "Host: localhost\r\n"
+			+ "Content-Type: multipart/form-data; boundary=" + b + "\r\n"
+			+ "Content-Length: " + mpBody.length() + "\r\n\r\n"
+			+ mpBody;
+		HttpRequest request = HttpRequest.of(raw(req));
+		assertTrue(request.isComplete());
+		java.util.List<HttpRequest.Part> parts = request.getParts("f");
+		assertEquals(2, parts.size());
+		assertEquals("A", parts.get(0).getData());
+		assertEquals("B", parts.get(1).getData());
+		// The name-keyed map remains last-wins for backwards compatibility.
+		assertEquals("B", request.getMultiParts().get("f").getData());
+		assertEquals(2, request.getAllParts().size());
+	}
+
+	@Test
+	public void testChunkedMultipartIsParsed() {
+		// A chunked multipart/form-data upload must be parsed (previously it was accepted but
+		// the parts were never decoded, so getMultiParts() came back empty).
+		String boundary = "BOUNDARY";
+		String mpBody = "--" + boundary + "\r\n"
+			+ "Content-Disposition: form-data; name=\"field1\"\r\n\r\n"
+			+ "value1\r\n"
+			+ "--" + boundary + "--\r\n";
+		String chunk = Integer.toHexString(mpBody.length()) + "\r\n" + mpBody + "\r\n0\r\n\r\n";
+		String req = "POST /upload HTTP/1.1\r\n"
+			+ "Host: localhost\r\n"
+			+ "Transfer-Encoding: chunked\r\n"
+			+ "Content-Type: multipart/form-data; boundary=" + boundary + "\r\n\r\n"
+			+ chunk;
+		HttpRequest request = HttpRequest.of(raw(req));
+		assertTrue("request should be complete", request.isComplete());
+		assertTrue("request should be multipart", request.isMultipart());
+		Map<String, HttpRequest.Part> parts = request.getMultiParts();
+		assertNotNull("field1 part must be parsed", parts.get("field1"));
+		assertEquals("value1", parts.get("field1").getData());
+	}
+
+	@Test
+	public void testDeepParamNestingIsCappedNoStackOverflow() {
+		// A maliciously deep bracket-nested name must not overflow the stack in
+		// getParametersTree() (a StackOverflowError would bypass the dispatcher and kill the
+		// I/O loop). The nesting depth must be capped.
+		StringBuilder name = new StringBuilder("a");
+		for (int i = 0; i < 100; i++) name.append("[x]"); // request 100 levels of nesting
+		HttpRequest request = HttpRequest.of(
+			raw("GET /?" + name + "=1 HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+		Map<String, Object> tree = request.getParametersTree();
+		assertNotNull(tree);
+		assertTrue("nesting depth must be capped, was " + mapDepth(tree), mapDepth(tree) <= 40);
+	}
+
+	private static int mapDepth(Object o) {
+		if (!(o instanceof Map)) return 0;
+		int max = 0;
+		for (Object v : ((Map<?, ?>) o).values()) {
+			max = Math.max(max, mapDepth(v));
+		}
+		return max + 1;
+	}
+
+	@Test
+	public void testQueryStringWithEmbeddedQuestionMarkPreserved() {
+		// A '?' inside a query value must not truncate later params (split on FIRST '?' only).
+		HttpRequest request = HttpRequest.of(
+			raw("GET /search?redirect=http://x?y=1&z=2 HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+		assertEquals("http://x?y=1", request.getParameter("redirect"));
+		assertEquals("2", request.getParameter("z"));
+	}
+
 }

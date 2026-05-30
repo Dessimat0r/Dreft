@@ -24,7 +24,7 @@ public abstract class WebSocketHandler extends RequestHandler {
 		String key = request.getHeader("Sec-WebSocket-Key");
 
 		if (upgrade != null && upgrade.equalsIgnoreCase("websocket") &&
-			connection != null && connection.toLowerCase().contains("upgrade") &&
+			connection != null && connection.toLowerCase(java.util.Locale.ROOT).contains("upgrade") &&
 			key != null) {
 
 			String acceptKey = calculateAcceptKey(key);

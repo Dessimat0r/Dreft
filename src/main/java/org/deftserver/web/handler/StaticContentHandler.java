@@ -133,23 +133,36 @@ public class StaticContentHandler extends RequestHandler {
 		
 		File file = requested.toFile();
 		if (staticContentDir != null && staticContentRoot != null) {
-			Path root = staticContentRoot;
-			Path fileCheck = null;
+			File candidate = null;
 			if (file.exists()) {
-				fileCheck = file.toPath().toAbsolutePath().normalize();
+				candidate = file;
 			} else {
 				Path absoluteRequested = Path.of(path).normalize();
 				if (absoluteRequested.isAbsolute() && !absoluteRequested.startsWith("..")) {
 					File absoluteFile = absoluteRequested.toFile();
 					if (absoluteFile.exists()) {
 						file = absoluteFile;
-						fileCheck = absoluteFile.toPath().toAbsolutePath().normalize();
+						candidate = absoluteFile;
 					}
 				}
 			}
-			
-			if (fileCheck != null && !fileCheck.startsWith(root)) {
-				throw new HttpException(403, "Forbidden", "Requested resource: <tt>" + path +  "</tt> is not allowed.");
+
+			if (candidate != null) {
+				// Resolve symlinks (toRealPath) on BOTH sides before the boundary check: a
+				// lexical normalize() would let a symlink inside the webroot that points outside
+				// it (e.g. link -> /etc) escape the root. Compare real paths instead.
+				Path fileReal;
+				Path rootReal;
+				try {
+					fileReal = candidate.toPath().toRealPath();
+					rootReal = staticContentRoot.toRealPath();
+				} catch (IOException e) {
+					// Can't safely resolve the path — deny rather than risk an escape.
+					throw new HttpException(403, "Forbidden", "Requested resource: <tt>" + path + "</tt> is not allowed.");
+				}
+				if (!fileReal.startsWith(rootReal)) {
+					throw new HttpException(403, "Forbidden", "Requested resource: <tt>" + path + "</tt> is not allowed.");
+				}
 			}
 		}
 
@@ -218,9 +231,10 @@ public class StaticContentHandler extends RequestHandler {
 			}
 		}
 
-		// Last-Modified Cache Validation
+		// Last-Modified Cache Validation. RFC 9110 §13.1.3: If-Modified-Since MUST be ignored when
+		// If-None-Match is present (the entity-tag is the stronger validator and takes precedence).
 		final String ifModifiedSince = request.getHeader("If-Modified-Since");
-		if (ifModifiedSince != null) {
+		if (ifModifiedSince != null && ifNoneMatch == null) {
 			long ims = org.deftserver.util.DateUtil.parseRFC1123ToMillis(ifModifiedSince);
 			if (ims == -1) {
 				try {
@@ -236,9 +250,23 @@ public class StaticContentHandler extends RequestHandler {
 			}
 		}
 
-		// Handle Range requests
+		// Handle Range requests. If-Range (RFC 9110 §13.1.5): only honour the Range when the
+		// client's validator still matches the current representation; otherwise serve the whole
+		// file (200) so the client re-syncs. ETag comparison for If-Range is strong-only, so a
+		// weak ("W/") tag never enables the range.
 		String rangeHeader = request.getHeader("Range");
-		if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
+		boolean rangeApplicable = true;
+		String ifRange = request.getHeader("If-Range");
+		if (ifRange != null && rangeHeader != null) {
+			ifRange = ifRange.trim();
+			if (ifRange.startsWith("\"") || ifRange.startsWith("W/")) {
+				rangeApplicable = ifRange.equals(etag); // etag is a strong, quoted tag
+			} else {
+				long irTime = org.deftserver.util.DateUtil.parseRFC1123ToMillis(ifRange);
+				rangeApplicable = irTime != -1 && lastModifiedSec <= irTime;
+			}
+		}
+		if (rangeApplicable && rangeHeader != null && rangeHeader.startsWith("bytes=")) {
 			String rangeVal = rangeHeader.substring(6).trim();
 			if (!rangeVal.contains(",")) { // single range only
 				long fileLength = file.length();
@@ -295,6 +323,9 @@ public class StaticContentHandler extends RequestHandler {
 
 		if (hasBody) {
 			response.write(file);
+		} else {
+			// HEAD: report the same Content-Length a GET would, without sending the body.
+			response.setHeader("Content-Length", String.valueOf(file.length()));
 		}
 	}
 }

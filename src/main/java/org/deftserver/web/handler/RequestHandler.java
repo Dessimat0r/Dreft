@@ -40,7 +40,7 @@ public abstract class RequestHandler {
 	private boolean isMethodAnnotated(HttpVerb verb, Class<? extends Annotation> annotation) {
 		try {
 			Class<?>[] parameterTypes = {HttpRequest.class, HttpResponse.class};
-			return getClass().getMethod(verb.toString().toLowerCase(), parameterTypes).getAnnotation(annotation) != null; 
+			return getClass().getMethod(verb.toString().toLowerCase(java.util.Locale.ROOT), parameterTypes).getAnnotation(annotation) != null;
 		} catch (NoSuchMethodException nsme) {
 			return false;
 		}

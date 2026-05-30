@@ -87,8 +87,13 @@ public class Application {
 			return BadRequestRequestHandler.getInstance(); 
 		}
 		
+		// Server-wide "OPTIONS *" applies to the whole server, not a resource.
+		if (request.getMethod() == HttpVerb.OPTIONS && "*".equals(request.getRequestedPath())) {
+			return org.deftserver.web.handler.ServerOptionsRequestHandler.getInstance();
+		}
+
 		RequestHandler rh = getHandler(request.getRequestedPath());
-		
+
 		// Intercept CORS preflight request
 		if (request.getMethod() == HttpVerb.OPTIONS && 
 			request.getHeader("Origin") != null && 

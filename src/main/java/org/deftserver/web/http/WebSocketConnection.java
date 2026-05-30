@@ -38,10 +38,9 @@ public class WebSocketConnection {
 		frame.flip();
 		
 		try {
-			// Write frame synchronously to keep it simple, or queue it
-			while (frame.hasRemaining()) {
-				protocol.write(channel, frame);
-			}
+			// Write frame fully; writeBlocking bounds the wait so a stalled peer cannot
+			// peg the I/O-loop thread in an infinite spin.
+			protocol.writeBlocking(channel, frame);
 		} catch (IOException e) {
 			protocol.closeChannel(channel);
 		}
@@ -54,9 +53,7 @@ public class WebSocketConnection {
 		frame.putShort((short) 1000); // Normal closure
 		frame.flip();
 		try {
-			while (frame.hasRemaining()) {
-				protocol.write(channel, frame);
-			}
+			protocol.writeBlocking(channel, frame);
 		} catch (IOException ignored) {
 		} finally {
 			protocol.closeChannel(channel);

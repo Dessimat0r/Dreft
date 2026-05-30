@@ -1,9 +1,5 @@
 package org.deftserver.io.callback;
 
-import java.util.AbstractCollection;
-import java.util.List;
-import java.util.concurrent.ConcurrentLinkedQueue;
-
 import org.deftserver.util.MXBeanUtil;
 import org.deftserver.web.AsyncCallback;
 import org.slf4j.Logger;
@@ -42,7 +38,13 @@ public class JMXDebuggableCallbackManager implements CallbackManager, CallbackMa
 			if (cb == null) {
 				break;
 			}
-			cb.onCallback();
+			try {
+				cb.onCallback();
+			} catch (RuntimeException e) {
+				// A bad callback must not abort the rest of this batch nor escape into the
+				// I/O loop's selector loop.
+				logger.error("RuntimeException in scheduled callback — skipping and continuing", e);
+			}
 			if (logger.isDebugEnabled()) {
 				logger.debug("Callback executed");
 			}

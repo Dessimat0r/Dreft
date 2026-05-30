@@ -130,6 +130,13 @@ public class IOLoop implements IOLoopMXBean {
 					} catch (CancelledKeyException e) {
 						logger.debug("CancelledKeyException in IOLoop", e);
 						Closeables.closeQuietly(this, key.channel());
+					} catch (RuntimeException e) {
+						// A handler bug must not abort processing of the remaining selected keys
+						// nor leave a faulting channel registered (which the selector would keep
+						// re-reporting as ready, spinning the loop). Drop just this channel.
+						logger.error("Unexpected RuntimeException handling channel {} — closing it", key.channel(), e);
+						removeHandler(key.channel());
+						Closeables.closeQuietly(this, key.channel());
 					}
 				}
 				long ms = tm.execute();

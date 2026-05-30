@@ -146,8 +146,27 @@ public class HttpUtil {
 		case 505:
 			return _505_VERSION_NOT_SUPPORTED;
 		default:
-			logger.error("Uknonwn Http status code: " + statusCode);
-			throw new IllegalArgumentException("Unknow Http status code: " + statusCode);
+			// Never throw while serializing a response — an unknown/extension status code
+			// must still yield a valid status line rather than aborting the write and
+			// leaking the connection. Emit a syntactically valid line with a best-effort
+			// reason phrase.
+			if (statusCode < 100 || statusCode > 599) {
+				logger.error("Out-of-range HTTP status code {}, coercing to 500", statusCode);
+				return _500_INTERNAL_SERVER_ERROR;
+			}
+			logger.warn("No canned reason phrase for HTTP status code {}; using generic line", statusCode);
+			return "HTTP/1.1 " + statusCode + " " + genericReasonPhrase(statusCode) + "\r\n";
+		}
+	}
+
+	private static String genericReasonPhrase(int statusCode) {
+		switch (statusCode / 100) {
+			case 1: return "Informational";
+			case 2: return "Success";
+			case 3: return "Redirection";
+			case 4: return "Client Error";
+			case 5: return "Server Error";
+			default: return "Unknown";
 		}
 	}
 

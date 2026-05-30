@@ -23,16 +23,42 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 		MXBeanUtil.registerMXBean(this, "TimeoutManager"); 
 	}
 
+	/** Number of cancelled-but-still-queued (dead) entries, used to bound queue memory. */
+	private int cancelledCount = 0;
+
 	@Override
 	public void addKeepAliveTimeout(SelectableChannel channel, Timeout timeout) {
 		logger.debug("added keep-alive timeout: {}", timeout);
 		DecoratedTimeout oldTimeout = index.get(channel);
 		if (oldTimeout != null) {
 			oldTimeout.timeout.cancel(); // O(1) cancel instead of O(N) timeouts.remove(oldTimeout)
+			cancelledCount++;
 		}
 		DecoratedTimeout decorated = new DecoratedTimeout(channel, timeout);
 		timeouts.add(decorated);
 		index.put(channel, decorated);
+		purgeCancelledIfNeeded();
+	}
+
+	/**
+	 * Compacts the queue when dead (cancelled) entries dominate it. Cancellation stays O(1) (we
+	 * just flag the Timeout and leave the node in the heap), but under sustained keep-alive churn
+	 * those dead nodes would otherwise accumulate until their original deadlines elapse. Rebuilding
+	 * the heap (O(n)) only when more than half the entries are dead keeps the work amortised O(1)
+	 * per add while bounding memory to ~2× the live timeout count.
+	 */
+	private void purgeCancelledIfNeeded() {
+		if (cancelledCount > 64 && cancelledCount * 2 > timeouts.size()) {
+			java.util.List<DecoratedTimeout> live = new java.util.ArrayList<>(timeouts.size());
+			for (DecoratedTimeout d : timeouts) {
+				if (!d.timeout.isCancelled()) {
+					live.add(d);
+				}
+			}
+			timeouts.clear();
+			timeouts.addAll(live);
+			cancelledCount = 0;
+		}
 	}
 
 	@Override
@@ -58,6 +84,9 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 				break; 
 			}
 			timeouts.poll();
+			if (candidate.timeout.isCancelled() && cancelledCount > 0) {
+				cancelledCount--;
+			}
 			try {
 				candidate.timeout.getCallback().onCallback();
 			} catch (RuntimeException e) {

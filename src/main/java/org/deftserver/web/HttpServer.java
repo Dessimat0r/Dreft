@@ -28,6 +28,7 @@ public class HttpServer {
 	private javax.net.ssl.SSLContext sslContext;
 	
 	private int maxConnections = -1;
+	private int maxConnectionsPerIp = -1;
 
 	public HttpServer(Application application) {
 		this.application = application;
@@ -35,6 +36,11 @@ public class HttpServer {
 
 	public void setMaxConnections(int max) {
 		this.maxConnections = max;
+	}
+
+	/** Caps simultaneous connections from a single remote IP (<= 0 disables). */
+	public void setMaxConnectionsPerIp(int max) {
+		this.maxConnectionsPerIp = max;
 	}
 
 	public int getPort() {
@@ -78,6 +84,9 @@ public class HttpServer {
 		if (maxConnections > 0) {
 			protocol.setMaxConnections(maxConnections);
 		}
+		if (maxConnectionsPerIp > 0) {
+			protocol.setMaxConnectionsPerIp(maxConnectionsPerIp);
+		}
 		if (isSSLEnabled()) {
 			protocol.enableSSL(sslContext);
 		}
@@ -111,6 +120,9 @@ public class HttpServer {
 			final HttpProtocol protocol = new HttpProtocol(ioLoop, application);
 			if (maxConnections > 0) {
 				protocol.setMaxConnections(maxConnections / numThreads > 0 ? maxConnections / numThreads : 1);
+			}
+			if (maxConnectionsPerIp > 0) {
+				protocol.setMaxConnectionsPerIp(maxConnectionsPerIp);
 			}
 			if (isSSLEnabled()) {
 				protocol.enableSSL(sslContext);
