@@ -37,6 +37,8 @@ public class AsynchronousSocket implements IOHandler {
 
 	private static DnsResolver dnsResolver = java.net.InetSocketAddress::new;
 
+	/** Overrides the DNS resolver used for connects (e.g. to inject a stub in tests); defaults to the
+	 *  blocking {@link java.net.InetSocketAddress} resolution run on a virtual thread. */
 	public static void setDnsResolver(DnsResolver resolver) {
 		dnsResolver = resolver;
 	}
@@ -94,13 +96,16 @@ public class AsynchronousSocket implements IOHandler {
 		this(IOLoop.INSTANCE, channel);
 	}
 	
+	/** Wraps a channel for non-blocking async I/O on the given loop, registering it (with OP_READ if
+	 *  already connected). */
 	public AsynchronousSocket(IOLoop ioLoop, SelectableChannel channel) throws IOException {
 		this.ioLoop = ioLoop;
 		this.channel = channel;
-		interestOps = SelectionKey.OP_CONNECT;	// TODO RS110628 should probably be moved to connect(..)
 		channel.configureBlocking(false);
 		if (channel instanceof SocketChannel && (((SocketChannel) channel).isConnected())) {
-			interestOps |= SelectionKey.OP_READ;
+			interestOps = SelectionKey.OP_READ;
+		} else {
+			interestOps = SelectionKey.OP_CONNECT;
 		}
 		ioLoop.addHandler(channel, this, interestOps, null);
 	}
@@ -112,8 +117,11 @@ public class AsynchronousSocket implements IOHandler {
 	 * (in which case the data will be written/read as soon as the connection is ready).
 	 */
 	public void connect(String host, int port, AsyncResult<Boolean> ccb) {
-		ioLoop.updateHandler(channel, interestOps |= SelectionKey.OP_CONNECT);
 		connectCallback = ccb;
+		ioLoop.addCallback(() -> {
+			interestOps |= SelectionKey.OP_CONNECT;
+			ioLoop.updateHandler(channel, interestOps);
+		});
 		if (channel instanceof SocketChannel) {
 			Thread.startVirtualThread(() -> {
 				try {
@@ -157,6 +165,15 @@ public class AsynchronousSocket implements IOHandler {
 	@Override
 	public void handleAccept(SelectionKey key) throws IOException {
 		logger.debug("handle accept...");
+	}
+
+	/**
+	 * Invoked by the IOLoop when it tears this socket down on an I/O error — make sure the close
+	 * callback fires (invokeCloseCallback is one-shot, so an explicit close() won't double-notify).
+	 */
+	@Override
+	public void onClose(java.nio.channels.SelectableChannel channel) {
+		invokeCloseCallback();
 	}
 
 	/**
@@ -272,6 +289,9 @@ public class AsynchronousSocket implements IOHandler {
 		}
 	}
 
+	// The invoke*Callback helpers below each fire (and then clear, where one-shot) the corresponding
+	// stored user callback. They are the single dispatch points so a callback can't be invoked twice.
+
 	private void invokeReadSuccessfulCallback(String result) {
 		AsyncResult<String> cb = readCallback;
 		readCallback = nopAsyncStringResult;
@@ -341,6 +361,7 @@ public class AsynchronousSocket implements IOHandler {
 				logger.error("IOException during write: {}", e.getMessage());
 				invokeCloseCallback();
 				Closeables.closeQuietly(ioLoop, channel);
+				return;
 			}
 		}
 		logger.debug("wrote: {} bytes", bytesWritten);

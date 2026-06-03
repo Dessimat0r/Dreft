@@ -22,4 +22,26 @@ public class HttpServerDescriptor {
 	 */
 	public static int WRITE_BUFFER_SIZE = 2048;	// 2048 bytes
 
+	/**
+	 * Absolute cap (ms) on how long a single blocking write may hold the I/O-loop thread (the TLS
+	 * application-write path writes synchronously). The existing zero-progress stall timer aborts a
+	 * fully-stalled peer, but a "drip" reader that reads a byte just often enough keeps resetting it,
+	 * holding the loop indefinitely — a slow-read DoS that blocks all other connections. This absolute
+	 * deadline bounds that (a §36 "response write timeout"): a peer that hasn't let the server finish
+	 * writing within this window is dropped. Generous by default so genuinely slow-but-legitimate
+	 * readers complete; lower it for stricter anti-DoS (at the cost of dropping very slow readers).
+	 * NOTE: the real elimination is non-blocking TLS writes (OP_WRITE deferral, as plaintext already
+	 * does) — see progress.md V3-24; this is the low-risk bound until then.
+	 */
+	public static long RESPONSE_WRITE_TIMEOUT_MS = 30_000; // 30s
+
+	/**
+	 * The requested listen() backlog for the accept queue — how many fully-established connections the
+	 * OS may queue awaiting accept() before it refuses (RST) new ones. The JDK default (50) is small:
+	 * under a connection burst (especially TLS, whose handshakes make the single accept loop slower to
+	 * drain the queue) it overflows and legitimate clients get "connection refused". A larger backlog
+	 * lets the server absorb bursts. The OS silently caps this at SOMAXCONN.
+	 */
+	public static int ACCEPT_BACKLOG = 1024;
+
 }

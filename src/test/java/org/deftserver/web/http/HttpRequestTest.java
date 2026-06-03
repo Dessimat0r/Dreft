@@ -112,6 +112,25 @@ public class HttpRequestTest {
 
 
 	@Test
+	public void valuelessFormFloodParsesWithoutAmplification() {
+		// A form body of many value-less params ("a&a&...") yields no parameters and must not be
+		// rejected — and (the point of this regression) must NOT materialise every segment up front
+		// (the old regex split did, an OOM amplification the 413 param cap never caught since no
+		// param has a value). 200k pairs ≈ 400 KiB.
+		StringBuilder body = new StringBuilder();
+		for (int i = 0; i < 200_000; i++) {
+			if (i > 0) body.append('&');
+			body.append('a');
+		}
+		HttpRequest request = HttpRequest.of(raw(
+			"POST /p HTTP/1.1\r\nHost: localhost\r\n" +
+			"Content-Type: application/x-www-form-urlencoded\r\n" +
+			"Content-Length: " + body.length() + "\r\n\r\n" + body));
+		assertTrue(request.isComplete());
+		assertEquals(0, request.getPostParameters().size());
+	}
+
+	@Test
 	public void testSingleParameterWithoutValue() {
 		HttpRequestHelper helper = new HttpRequestHelper();
 		helper.addGetParameter("firstname", null);
@@ -403,6 +422,40 @@ public class HttpRequestTest {
 	}
 
 	@Test
+	public void rejectsSignedChunkSize() {
+		// RFC 9112 §7.1: chunk-size is 1*HEXDIG. A leading '+' (which Integer.parseInt would
+		// otherwise accept) must be rejected — a stricter proxy reading "+4" differently than
+		// Dreft's 4 is a request-smuggling discrepancy.
+		HttpRequest request = HttpRequest.of(raw(
+			"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+			+ "+4\r\nWiki\r\n0\r\n\r\n"));
+		assertTrue(request instanceof MalFormedHttpRequest);
+	}
+
+	@Test
+	public void rejectsHexPrefixChunkSize() {
+		HttpRequest request = HttpRequest.of(raw(
+			"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+			+ "0x4\r\nWiki\r\n0\r\n\r\n"));
+		assertTrue(request instanceof MalFormedHttpRequest);
+	}
+
+	@Test
+	public void chunkLargerThanInitialBufferGrowsAndDecodes() {
+		// A single chunk larger than the initial raw-body buffer (64 KiB) must grow the buffer on
+		// demand and decode correctly — the raw buffer is no longer pre-sized to the 16 MiB cap.
+		int size = 100_000; // > 64 KiB
+		StringBuilder data = new StringBuilder(size);
+		for (int i = 0; i < size; i++) data.append((char) ('a' + (i % 26)));
+		String body = Integer.toHexString(size) + "\r\n" + data + "\r\n0\r\n\r\n";
+		HttpRequest request = HttpRequest.of(raw(
+			"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n" + body));
+		assertTrue("request should be complete", request.isComplete());
+		assertEquals(size, request.getBody().length());
+		assertEquals(data.toString(), request.getBody());
+	}
+
+	@Test
 	public void allowsBodiesForPutAndPatch() {
 		HttpRequest put = HttpRequest.of(raw("""
 				PUT /resource HTTP/1.1\r
@@ -531,6 +584,25 @@ public class HttpRequestTest {
 	}
 
 	@Test
+	public void testPreferredEncodingRespectsIdentityRejection() {
+		// "identity;q=0" → identity must NOT be returned as the default fallback.
+		HttpRequest r1 = HttpRequest.of(
+			raw("GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity;q=0\r\n\r\n"));
+		Assert.assertNull(r1.getPreferredEncoding(java.util.List.of("gzip", "identity")));
+		// "*;q=0" excludes identity too.
+		HttpRequest r2 = HttpRequest.of(
+			raw("GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: *;q=0\r\n\r\n"));
+		Assert.assertNull(r2.getPreferredEncoding(java.util.List.of("identity")));
+		// gzip requested and identity not forbidden → gzip wins.
+		HttpRequest r3 = HttpRequest.of(
+			raw("GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n"));
+		assertEquals("gzip", r3.getPreferredEncoding(java.util.List.of("gzip", "identity")));
+		// No Accept-Encoding → first supported.
+		HttpRequest r4 = HttpRequest.of(raw("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+		assertEquals("gzip", r4.getPreferredEncoding(java.util.List.of("gzip", "identity")));
+	}
+
+	@Test
 	public void testConnectionHeaderMultiTokenClose() {
 		// "close" appearing as one of several Connection tokens must still close the connection.
 		HttpRequest closed = HttpRequest.of(
@@ -587,6 +659,26 @@ public class HttpRequestTest {
 		// The name-keyed map remains last-wins for backwards compatibility.
 		assertEquals("B", request.getMultiParts().get("f").getData());
 		assertEquals(2, request.getAllParts().size());
+	}
+
+	@Test
+	public void testMultipartWithPreambleBeforeFirstBoundary() {
+		// RFC 2046 §5.1.1 permits an ignored preamble (and some clients prepend a leading CRLF)
+		// before the first boundary. Such bodies must parse rather than be rejected as malformed.
+		String b = "BND";
+		String mpBody = "This is an ignored preamble.\r\n"
+			+ "--" + b + "\r\n"
+			+ "Content-Disposition: form-data; name=\"f\"\r\n\r\nA\r\n"
+			+ "--" + b + "--\r\n";
+		String req = "POST /u HTTP/1.1\r\n"
+			+ "Host: localhost\r\n"
+			+ "Content-Type: multipart/form-data; boundary=" + b + "\r\n"
+			+ "Content-Length: " + mpBody.length() + "\r\n\r\n"
+			+ mpBody;
+		HttpRequest request = HttpRequest.of(raw(req));
+		assertTrue(request.isComplete());
+		assertTrue(request.isMultipart());
+		assertEquals("A", request.getMultiParts().get("f").getData());
 	}
 
 	@Test

@@ -20,7 +20,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-import org.deftserver.io.IOLoop;
 import org.deftserver.web.handler.RequestHandler;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -69,22 +68,15 @@ public class AdvancedHttpComplianceTest {
 		
 		server = new HttpServer(new Application(reqHandlers));
 
-		Thread.ofPlatform().start(() -> {
-			try {
-				server.listen(PORT);
-				IOLoop.INSTANCE.start();
-			} catch (Exception e) {
-				e.printStackTrace();
-			}
-		});
+		server.bind(PORT);
+		server.start(1); // dedicated IOLoop, isolated from the shared IOLoop.INSTANCE
 		
-		Thread.sleep(200);
+		TestServerSupport.awaitListening(PORT);
 	}
 
 	@AfterClass
 	public static void tearDown() throws Exception {
 		server.stop();
-		IOLoop.INSTANCE.stop();
 		Thread.sleep(100);
 	}
 
@@ -101,6 +93,49 @@ public class AdvancedHttpComplianceTest {
 			String statusLine = reader.readLine();
 			assertNotNull(statusLine);
 			assertTrue(statusLine.contains("400 Bad Request"));
+		}
+	}
+
+	@Test
+	public void testTransferEncodingAndContentLengthRejected() throws Exception {
+		// RFC 9112 §6.1: a message with BOTH Transfer-Encoding and Content-Length is a classic
+		// request-smuggling vector (front-end and back-end may frame the body differently) and MUST
+		// be rejected. Locks in the HttpRequest constructor's TE+CL guard with a running test.
+		try (Socket socket = new Socket("127.0.0.1", PORT)) {
+			OutputStream os = socket.getOutputStream();
+			os.write(("POST /compliance HTTP/1.1\r\n" +
+			          "Host: localhost\r\n" +
+			          "Transfer-Encoding: chunked\r\n" +
+			          "Content-Length: 5\r\n\r\n" +
+			          "0\r\n\r\n").getBytes());
+			os.flush();
+
+			BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+			String statusLine = reader.readLine();
+			assertNotNull(statusLine);
+			assertTrue("TE+CL together must be rejected, got: " + statusLine,
+				statusLine.contains("400 Bad Request"));
+		}
+	}
+
+	@Test
+	public void testConflictingContentLengthRejected() throws Exception {
+		// RFC 9110 §8.6: two Content-Length fields with DIFFERENT values is unresolvable framing (a
+		// smuggling vector) and MUST be rejected. Locks in addHeader's conflicting-CL guard.
+		try (Socket socket = new Socket("127.0.0.1", PORT)) {
+			OutputStream os = socket.getOutputStream();
+			os.write(("POST /compliance HTTP/1.1\r\n" +
+			          "Host: localhost\r\n" +
+			          "Content-Length: 5\r\n" +
+			          "Content-Length: 6\r\n\r\n" +
+			          "hello").getBytes());
+			os.flush();
+
+			BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+			String statusLine = reader.readLine();
+			assertNotNull(statusLine);
+			assertTrue("conflicting Content-Length must be rejected, got: " + statusLine,
+				statusLine.contains("400 Bad Request"));
 		}
 	}
 
@@ -146,6 +181,38 @@ public class AdvancedHttpComplianceTest {
 			String statusLine = reader.readLine();
 			assertNotNull(statusLine);
 			assertTrue(statusLine.contains("200 OK"));
+		}
+	}
+
+	@Test
+	public void testIpv6LiteralHostAccepted() throws Exception {
+		// §6: an IPv6 literal Host (with brackets, colons, and an optional port) must be accepted —
+		// the header-value parser allows the colons, and the request routes normally.
+		try (Socket socket = new Socket("127.0.0.1", PORT)) {
+			OutputStream os = socket.getOutputStream();
+			os.write(("GET /compliance HTTP/1.1\r\n" +
+			          "Host: [2001:db8::1]:8443\r\n\r\n").getBytes());
+			os.flush();
+			BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+			String statusLine = reader.readLine();
+			assertNotNull(statusLine);
+			assertTrue("IPv6 literal Host must be accepted, got: " + statusLine, statusLine.contains("200 OK"));
+		}
+	}
+
+	@Test
+	public void testAbsoluteUriIpv6HostMatch() throws Exception {
+		// §6: absolute-form target with an IPv6 authority must match the IPv6 Host (normalizeAuthority
+		// handles bracketed literals + default-port stripping).
+		try (Socket socket = new Socket("127.0.0.1", PORT)) {
+			OutputStream os = socket.getOutputStream();
+			os.write(("GET http://[2001:db8::1]/compliance HTTP/1.1\r\n" +
+			          "Host: [2001:db8::1]\r\n\r\n").getBytes());
+			os.flush();
+			BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+			String statusLine = reader.readLine();
+			assertNotNull(statusLine);
+			assertTrue("absolute IPv6 URI must match IPv6 Host, got: " + statusLine, statusLine.contains("200 OK"));
 		}
 	}
 

@@ -13,7 +13,6 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
-import org.deftserver.io.IOLoop;
 import org.deftserver.web.handler.RequestHandler;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -45,22 +44,15 @@ public class AntiDosTimeoutTest {
 		server = new HttpServer(new Application(reqHandlers));
 		server.setMaxConnections(2); // Set active connections limit to 2
 
-		Thread.ofPlatform().start(() -> {
-			try {
-				server.listen(PORT);
-				IOLoop.INSTANCE.start();
-			} catch (Exception e) {
-				e.printStackTrace();
-			}
-		});
+		server.bind(PORT);
+		server.start(1); // dedicated IOLoop, isolated from the shared IOLoop.INSTANCE
 		
-		Thread.sleep(200);
+		TestServerSupport.awaitListening(PORT);
 	}
 
 	@AfterClass
 	public static void tearDown() throws Exception {
 		server.stop();
-		IOLoop.INSTANCE.stop();
 		Thread.sleep(100);
 	}
 
@@ -75,10 +67,16 @@ public class AntiDosTimeoutTest {
 		
 		// Sleep for 6 seconds (timeout is 5 seconds)
 		Thread.sleep(6000);
-		
-		// Assert that the server has closed the connection due to timeout
-		int read = socket.getInputStream().read();
-		assertEquals(-1, read);
+
+		// The server now sends a best-effort 408 Request Timeout (RFC 9110 §15.5.9) before
+		// closing the connection, rather than dropping it silently.
+		java.io.InputStream is = socket.getInputStream();
+		byte[] buf = new byte[256];
+		int n = is.read(buf);
+		String response = n > 0 ? new String(buf, 0, n, java.nio.charset.StandardCharsets.ISO_8859_1) : "";
+		assertTrue("expected 408, got: " + response, response.startsWith("HTTP/1.1 408"));
+		// And the connection must then be closed (subsequent read hits EOF).
+		assertEquals(-1, is.read());
 		socket.close();
 	}
 

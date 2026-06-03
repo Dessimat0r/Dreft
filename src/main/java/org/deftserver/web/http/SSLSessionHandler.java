@@ -2,6 +2,7 @@ package org.deftserver.web.http;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
@@ -29,6 +30,9 @@ public class SSLSessionHandler {
 
 	private boolean handshakeComplete = false;
 
+	/** Creates a server-side TLS session for a channel: builds the {@link SSLEngine}, sizes the
+	 *  net/app wrap/unwrap buffers from the session, and begins the handshake (driven by
+	 *  {@link #handshake()} as bytes arrive). */
 	public SSLSessionHandler(SocketChannel socketChannel, SSLContext sslContext, IOLoop ioLoop) throws SSLException {
 		this.socketChannel = socketChannel;
 		this.ioLoop = ioLoop;
@@ -47,6 +51,7 @@ public class SSLSessionHandler {
 		this.engine.beginHandshake();
 	}
 
+	/** True once the TLS handshake has finished and application data can flow. */
 	public boolean isHandshakeComplete() {
 		return handshakeComplete;
 	}
@@ -56,13 +61,23 @@ public class SSLSessionHandler {
 		return engine.getSession().getPacketBufferSize();
 	}
 
+	/** Drives the non-blocking TLS handshake state machine (wrap/unwrap/run-delegated-tasks) until it
+	 *  completes or needs more inbound bytes; re-entered as data arrives and after async tasks finish.
+	 *  Guarded against a no-progress spin. */
 	public synchronized void handshake() throws IOException {
 		if (handshakeComplete) return;
 
 		SSLEngineResult.HandshakeStatus hs = engine.getHandshakeStatus();
 		logger.debug("TLS Handshake status: {}", hs);
 
+		// Defence against a pathological engine state that keeps requesting NEED_WRAP without making
+		// progress: that would spin this loop (on the I/O-loop thread) at 100% CPU forever. A real
+		// handshake takes only a handful of transitions, so a generous cap can't hurt legitimate use.
+		int guard = 0;
 		while (!handshakeComplete) {
+			if (++guard > 10_000) {
+				throw new IOException("TLS handshake made no progress after " + (guard - 1) + " steps; aborting");
+			}
 			switch (hs) {
 				case NEED_UNWRAP:
 					int read = readEncrypted();
@@ -72,6 +87,9 @@ public class SSLSessionHandler {
 					netReadBuf.flip();
 					SSLEngineResult res = engine.unwrap(netReadBuf, appReadBuf);
 					netReadBuf.compact();
+					if (appReadBuf.position() > 0) {
+						appReadBuf.clear(); // discard plaintext produced during handshake (e.g. TLS 1.3 EncryptedExtensions)
+					}
 					hs = res.getHandshakeStatus();
 					logger.debug("Handshake NEED_UNWRAP result: {}, next status: {}", res.getStatus(), hs);
 
@@ -89,26 +107,53 @@ public class SSLSessionHandler {
 					logger.debug("Handshake NEED_WRAP result: {}, next status: {}", res.getStatus(), hs);
 
 					netWriteBuf.flip();
-					writeEncrypted();
+					if (!tryWrite(netWriteBuf, () -> {
+						try {
+							netWriteBuf.compact();
+							handshake();
+						} catch (IOException e) {
+							logger.error("Handshake write resume failed", e);
+							closeQuietly();
+						}
+					})) {
+						ioLoop.updateHandler(socketChannel, SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+						return;
+					}
 					break;
 
-				case NEED_TASK:
-					Runnable task;
-					while ((task = engine.getDelegatedTask()) != null) {
-						final Runnable t = task;
-						Thread.startVirtualThread(() -> {
+			case NEED_TASK:
+				Runnable task = engine.getDelegatedTask();
+				if (task == null) {
+					hs = engine.getHandshakeStatus();
+					break;
+				}
+				while (task != null) {
+					final Runnable t = task;
+					Thread.startVirtualThread(() -> {
+						try {
 							t.run();
+						} catch (Throwable taskError) {
+							// A failed delegated task must not strand the connection (waiting forever
+							// for a handshake resume that never comes — only the header-read timeout
+							// would eventually reap it). Tear it down promptly, on the loop thread.
 							ioLoop.addCallback(() -> {
-								try {
-									handshake();
-								} catch (IOException e) {
-									logger.error("Error during async handshake task execution: {}", e.getMessage());
-									closeQuietly();
-								}
+								logger.error("TLS delegated handshake task threw — closing connection", taskError);
+								closeQuietly();
 							});
+							return;
+						}
+						ioLoop.addCallback(() -> {
+							try {
+								handshake();
+							} catch (IOException e) {
+								logger.error("Error during async handshake task execution", e);
+								closeQuietly();
+							}
 						});
-					}
-					return; // Wait for delegated task to run and call handshake
+					});
+					task = engine.getDelegatedTask();
+				}
+				return; // Wait for delegated task to run and call handshake
 
 				case FINISHED:
 				case NOT_HANDSHAKING:
@@ -122,42 +167,137 @@ public class SSLSessionHandler {
 		}
 	}
 
-	/**
-	 * Bound on how long we keep retrying a full-buffer non-blocking write before treating
-	 * the peer as dead. Forward progress resets the clock, so only a genuinely stalled
-	 * socket (which would otherwise spin the I/O-loop thread at 100% CPU forever) is dropped.
-	 */
-	private static final long WRITE_STALL_TIMEOUT_NS = 10L * 1_000_000_000L;
-
+	/** Reads available ciphertext from the socket into the net-read buffer; returns the byte count
+	 *  (or -1 at EOF). */
 	private int readEncrypted() throws IOException {
 		return socketChannel.read(netReadBuf);
 	}
 
-	/** Fully writes {@code buf} to the (non-blocking) channel, aborting if the socket makes
-	 *  zero progress for {@link #WRITE_STALL_TIMEOUT_NS}. */
-	private void writeFully(ByteBuffer buf) throws IOException {
-		long stallDeadline = 0;
-		while (buf.hasRemaining()) {
-			int n = socketChannel.write(buf);
-			if (n > 0) {
-				stallDeadline = 0;
-			} else {
-				long now = System.nanoTime();
-				if (stallDeadline == 0) {
-					stallDeadline = now + WRITE_STALL_TIMEOUT_NS;
-				} else if (now - stallDeadline > 0) {
-					throw new IOException("TLS socket write stalled (peer not reading); aborting");
+	// --- deferred (non-blocking) write support ---
+	// Instead of busy-spinning LockSupport.parkNanos on the I/O-loop thread, partial writes are
+	// deferred: the unwritten tail stays in pendingWriteBuffer and writeCompleteAction runs once
+	// {@link #onWritable()} drains it. The caller MUST register OP_WRITE on the channel.
+
+	private ByteBuffer pendingWriteBuffer;
+	private Runnable writeCompleteAction;
+
+	/** @return true if a previously deferred write is still waiting for socket space. */
+	public boolean hasPendingWrite() {
+		return pendingWriteBuffer != null && pendingWriteBuffer.hasRemaining();
+	}
+
+	/** Non-blocking best-effort write. When the socket buffer cannot accept every byte at once,
+	 *  stores {@code buf} as the pending buffer and {@code onComplete} for later resumption.
+	 *  @return true if all bytes were written immediately, false if a deferred write was set up. */
+	private boolean tryWrite(ByteBuffer buf, Runnable onComplete) throws IOException {
+		int n = socketChannel.write(buf);
+		if (n < 0) throw new IOException("Connection closed during TLS write");
+		if (buf.hasRemaining()) {
+			pendingWriteBuffer = buf;
+			writeCompleteAction = onComplete;
+			return false;
+		}
+		return true;
+	}
+
+	public boolean tryWrite(ByteBuffer buf) throws IOException {
+		return tryWrite(buf, null);
+	}
+
+
+	/**
+	 * Called by {@code HttpProtocol.handleWrite} when OP_WRITE fires after a deferred write.
+	 * Drains the pending buffer; when fully written, executes the continuation.
+	 * @return true if the deferred write completed, false if more socket space is needed.
+	 */
+	public boolean onWritable() throws IOException {
+		if (pendingWriteBuffer != null && pendingWriteBuffer.hasRemaining()) {
+			socketChannel.write(pendingWriteBuffer);
+		}
+		if (pendingWriteBuffer != null && !pendingWriteBuffer.hasRemaining()) {
+			Runnable action = writeCompleteAction;
+			pendingWriteBuffer = null;
+			writeCompleteAction = null;
+			if (action != null) {
+				action.run();
+			}
+			return true;
+		}
+		return pendingWriteBuffer == null;
+	}
+
+	private static final ByteBuffer EMPTY = ByteBuffer.allocate(0);
+
+	/**
+	 * Drives any handshaking the engine requests after the main handshake has completed — TLS 1.3
+	 * post-handshake messages such as NewSessionTicket (NEED_TASK to process) and KeyUpdate
+	 * (NEED_WRAP to answer). Without this the engine's response is never sent and a long-lived
+	 * connection that rekeys would eventually fail to decrypt. NEED_UNWRAP just means "more inbound
+	 * bytes needed" — handled by the surrounding unwrap loop — so we return on it.
+	 *
+	 * <p>Calls itself via {@link #onWritable()} continuations so partial writes do not block
+	 * the I/O-loop thread; delegated tasks are offloaded to virtual threads. Must only be
+	 * called from the I/O-loop thread (or a callback scheduled on it).</p>
+	 */
+	private void driveHandshake(SSLEngineResult.HandshakeStatus hs) throws IOException {
+		int guard = 0;
+		while ((hs == SSLEngineResult.HandshakeStatus.NEED_TASK
+				|| hs == SSLEngineResult.HandshakeStatus.NEED_WRAP) && guard++ < 100) {
+			if (hs == SSLEngineResult.HandshakeStatus.NEED_TASK) {
+				Runnable task = engine.getDelegatedTask();
+				if (task == null) {
+					hs = engine.getHandshakeStatus();
+					continue;
 				}
-				// Park briefly instead of busy-spinning while the send buffer is full.
-				java.util.concurrent.locks.LockSupport.parkNanos(200_000L);
+				while (task != null) {
+					final Runnable t = task;
+					Thread.startVirtualThread(() -> {
+						t.run();
+						ioLoop.addCallback(() -> {
+							try {
+								driveHandshake(engine.getHandshakeStatus());
+							} catch (IOException e) {
+								logger.error("Error during async post-handshake task", e);
+								closeQuietly();
+							}
+						});
+					});
+					task = engine.getDelegatedTask();
+				}
+				return; // Wait for delegated tasks to call driveHandshake via callback
+			} else { // NEED_WRAP — emit the engine's handshake record (e.g. a KeyUpdate response)
+				netWriteBuf.clear();
+				SSLEngineResult wr = engine.wrap(EMPTY, netWriteBuf);
+				netWriteBuf.flip();
+				if (netWriteBuf.hasRemaining()) {
+					if (!tryWrite(netWriteBuf, () -> {
+						try {
+							netWriteBuf.compact();
+							driveHandshake(engine.getHandshakeStatus());
+						} catch (IOException e) {
+							logger.error("Post-handshake write resume failed", e);
+							closeQuietly();
+						}
+					})) {
+						ioLoop.updateHandler(socketChannel, SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+						return;
+					}
+				}
+				if (wr.getStatus() == SSLEngineResult.Status.CLOSED) {
+					throw new SSLConnectionClosedException();
+				}
+				// Nothing produced and still NEED_WRAP → can't make progress; bail to avoid a spin.
+				if (wr.bytesProduced() == 0 && wr.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.NEED_WRAP) {
+					break;
+				}
+				hs = wr.getHandshakeStatus();
 			}
 		}
 	}
 
-	private void writeEncrypted() throws IOException {
-		writeFully(netWriteBuf);
-	}
-
+	/** Decrypts inbound ciphertext: buffers {@code src} alongside any residual bytes, unwraps every
+	 *  complete TLS record into a (growable) destination, drives any TLS 1.3 post-handshake messages,
+	 *  and returns the recovered application bytes (read-ready). */
 	public synchronized ByteBuffer unwrap(ByteBuffer src) throws IOException {
 		// Allocate destination large enough for multiple records being unwrapped in one call
 		ByteBuffer dst = ByteBuffer.allocate(engine.getSession().getApplicationBufferSize() * 4);
@@ -182,16 +322,33 @@ public class SSLSessionHandler {
 		netReadBuf.flip();
 
 		while (netReadBuf.hasRemaining()) {
+			int srcPos = netReadBuf.position();
 			SSLEngineResult res = engine.unwrap(netReadBuf, dst);
 			if (res.getStatus() == SSLEngineResult.Status.BUFFER_UNDERFLOW) {
+				// The engine may have requested a post-handshake write (e.g. KeyUpdate response)
+				// before needing more inbound bytes — drive it now so the response isn't dropped.
+				driveHandshake(res.getHandshakeStatus());
+				// If driveHandshake deferred a write, we cannot drain the netReadBuf further; stop.
+				if (hasPendingWrite()) {
+					break;
+				}
 				break;
 			} else if (res.getStatus() == SSLEngineResult.Status.BUFFER_OVERFLOW) {
+				// Restore src position: the engine may have advanced it before detecting overflow.
+				netReadBuf.position(srcPos);
 				ByteBuffer newDst = ByteBuffer.allocate(dst.capacity() * 2);
 				dst.flip();
 				newDst.put(dst);
 				dst = newDst;
 			} else if (res.getStatus() == SSLEngineResult.Status.CLOSED) {
 				throw new SSLConnectionClosedException();
+			} else {
+				// OK: a record may have triggered post-handshake handshaking (TLS 1.3
+				// NewSessionTicket / KeyUpdate) — drive it so the engine's response is sent.
+				driveHandshake(res.getHandshakeStatus());
+				if (hasPendingWrite()) {
+					break;
+				}
 			}
 		}
 		netReadBuf.compact();
@@ -199,35 +356,45 @@ public class SSLSessionHandler {
 		return dst;
 	}
 
+	/** Encrypts application bytes from {@code src} into one or more TLS records, growing the
+	 *  destination on overflow and stopping cleanly if the engine can make no progress (e.g. it must
+	 *  first read a peer handshake message). Returns the ciphertext ready to write. */
 	public synchronized ByteBuffer wrap(ByteBuffer src) throws IOException {
 		ByteBuffer dst = ByteBuffer.allocate(engine.getSession().getPacketBufferSize() * 2);
 		while (src.hasRemaining()) {
+			int srcPos = src.position();
 			SSLEngineResult res = engine.wrap(src, dst);
 			if (res.getStatus() == SSLEngineResult.Status.BUFFER_OVERFLOW) {
+				src.position(srcPos); // restore position — engine may have advanced it before overflow
 				ByteBuffer newDst = ByteBuffer.allocate(dst.capacity() * 2);
 				dst.flip();
 				newDst.put(dst);
 				dst = newDst;
 			} else if (res.getStatus() == SSLEngineResult.Status.CLOSED) {
 				throw new SSLConnectionClosedException();
+			} else if (res.bytesConsumed() == 0 && res.bytesProduced() == 0) {
+				// OK but no progress: the engine can't wrap more application data right now (e.g.
+				// it must unwrap a peer handshake message first). Stop rather than spin — the
+				// remaining src bytes will be wrapped on a subsequent call after we read inbound.
+				break;
 			}
 		}
 		dst.flip();
 		return dst;
 	}
 
-	public void closeQuietly() {
+	/** Best-effort graceful TLS shutdown: sends a {@code close_notify} alert (so the peer sees a clean
+	 *  close rather than a TCP reset) then closes the socket, swallowing any errors. Synchronized to
+	 *  avoid racing the SSLEngine (which is not thread-safe) with concurrent wrap/unwrap/handshake calls. */
+	public synchronized void closeQuietly() {
 		try {
 			engine.closeOutbound();
-			// Attempt to send the TLS close_notify alert so the peer gets a clean
-			// shutdown rather than a TCP RST. Best-effort: if the socket is already
-			// gone, the IOException is silently ignored below.
 			ByteBuffer src = ByteBuffer.allocate(0);
 			ByteBuffer dst = ByteBuffer.allocate(engine.getSession().getPacketBufferSize());
 			SSLEngineResult result = engine.wrap(src, dst);
 			if (result.bytesProduced() > 0) {
 				dst.flip();
-				writeFully(dst);
+				socketChannel.write(dst); // best-effort non-blocking write
 			}
 		} catch (Exception e) {
 			// Ignore — channel may already be closed or broken

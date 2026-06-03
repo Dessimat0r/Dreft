@@ -6,21 +6,31 @@ import org.deftserver.web.http.HttpRequest;
 import org.deftserver.web.http.HttpResponse;
 
 
+/** Terminal handler returning 404 Not Found (with an escaped, nosniff body) for every method, used
+ *  when routing finds no match. */
 public class NotFoundRequestHandler extends RequestHandler {
 
 	private final static NotFoundRequestHandler instance = new NotFoundRequestHandler();
-	
+
 	private NotFoundRequestHandler() { }
-	
+
+	/** The shared singleton instance. */
 	public static final NotFoundRequestHandler getInstance() {
 		return instance;
 	}
-	
+
+	/** Writes the 404 response (HTML-escaped reflected path, nosniff, Connection: close). */
 	@Override
 	public void get(HttpRequest request, HttpResponse response) throws IOException {
 		response.setStatusCode(404);
 		response.setHeader("Connection", "close");
-		response.write("<html><head><title>404: Not found</title></head><body>Requested resource: <tt>" + request.getRequestedPath() + "</tt> was not found.</body>");
+		// Set an explicit content type and nosniff so the body is never MIME-sniffed as HTML
+		// when no type would otherwise be sent, and HTML-escape the reflected path to prevent
+		// reflected XSS (the path is attacker-controlled).
+		response.setHeader("Content-Type", "text/html; charset=utf-8");
+		response.setHeader("X-Content-Type-Options", "nosniff");
+		response.write("<html><head><title>404: Not found</title></head><body>Requested resource: <tt>"
+			+ org.deftserver.util.HttpUtil.escapeHtml(request.getRequestedPath()) + "</tt> was not found.</body>");
 	}
 
 	// A non-existent resource is 404 for every method, not just GET — otherwise the base

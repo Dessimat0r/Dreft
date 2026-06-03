@@ -5,16 +5,19 @@ import java.io.IOException;
 import org.deftserver.web.http.HttpRequest;
 import org.deftserver.web.http.HttpResponse;
 
+/** Terminal handler returning 400 Bad Request for every method, used for malformed requests. */
 public class BadRequestRequestHandler extends RequestHandler {
 
 private final static BadRequestRequestHandler instance = new BadRequestRequestHandler();
-	
+
 	private BadRequestRequestHandler() { }
-	
+
+	/** The shared singleton instance. */
 	public static final BadRequestRequestHandler getInstance() {
 		return instance;
 	}
-	
+
+	/** Writes the 400 response (Connection: close). */
 	@Override
 	public void get(HttpRequest request, HttpResponse response) throws IOException {
 		response.setStatusCode(400);

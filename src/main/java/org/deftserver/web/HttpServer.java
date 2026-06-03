@@ -21,7 +21,8 @@ public class HttpServer {
 	private static final int MIN_PORT_NUMBER = 0;
 	private static final int MAX_PORT_NUMBER = 65535;
 	
-	private ServerSocketChannel serverChannel;
+	private final List<ServerSocketChannel> serverChannels = new LinkedList<>();
+	private final List<ServerSocketChannel> sslServerChannels = new LinkedList<>();
 	private final List<IOLoop> ioLoops = new LinkedList<>();
 	
 	private final Application application;
@@ -30,10 +31,12 @@ public class HttpServer {
 	private int maxConnections = -1;
 	private int maxConnectionsPerIp = -1;
 
+	/** Creates a server for the given application (handlers). Configure TLS/limits, then bind+start. */
 	public HttpServer(Application application) {
 		this.application = application;
 	}
 
+	/** Caps the total number of simultaneous connections across the server ({@code <= 0} disables). */
 	public void setMaxConnections(int max) {
 		this.maxConnections = max;
 	}
@@ -44,9 +47,11 @@ public class HttpServer {
 	}
 
 	public int getPort() {
-		return serverChannel == null ? -1 : serverChannel.socket().getLocalPort();
+		return serverChannels.isEmpty() ? -1 : serverChannels.get(0).socket().getLocalPort();
 	}
 
+	/** Enables HTTPS by loading a PKCS12 keystore from disk and building a TLS {@link SSLContext}
+	 *  from it (key-manager only; no client-certificate trust). Call before {@link #listen}/{@link #start}. */
 	public void enableSSL(String keystorePath, String keystorePassword, String keyPassword) throws Exception {
 		java.security.KeyStore ks = java.security.KeyStore.getInstance("PKCS12");
 		try (java.io.InputStream in = new java.io.FileInputStream(keystorePath)) {
@@ -58,14 +63,17 @@ public class HttpServer {
 		sslContext.init(kmf.getKeyManagers(), null, null);
 	}
 
+	/** Enables HTTPS using a caller-supplied {@link SSLContext} (e.g. for custom key/trust managers). */
 	public void enableSSL(javax.net.ssl.SSLContext sslContext) {
 		this.sslContext = sslContext;
 	}
 
+	/** True if HTTPS has been enabled (a TLS context is configured). */
 	public boolean isSSLEnabled() {
 		return sslContext != null;
 	}
 
+	/** The configured TLS context, or null if running plaintext HTTP. */
 	public javax.net.ssl.SSLContext getSSLContext() {
 		return sslContext;
 	}
@@ -93,36 +101,47 @@ public class HttpServer {
 		registerHandler(IOLoop.INSTANCE, protocol);
 	}
 	
+	/** Opens the shared non-blocking server socket and binds it to {@code port} (with
+	 *  {@code SO_REUSEADDR}). Use 0 for an ephemeral port. Closes the channel and rethrows on failure. */
 	public void bind(int port) throws IOException {
+		bind(port, isSSLEnabled());
+	}
+
+	public void bind(int port, boolean ssl) throws IOException {
 		if (port < MIN_PORT_NUMBER || port > MAX_PORT_NUMBER) {
 			throw new IllegalArgumentException("Invalid port number. Valid range: [" + 
 					MIN_PORT_NUMBER + ", " + MAX_PORT_NUMBER + ")");
 		}
-		serverChannel = ServerSocketChannel.open();
-		serverChannel.configureBlocking(false);
-		InetSocketAddress endpoint = new InetSocketAddress(port);	// use "any" address
+		ServerSocketChannel channel = ServerSocketChannel.open();
+		channel.configureBlocking(false);
+		InetSocketAddress endpoint = new InetSocketAddress(port);
 		try {
-			if (serverChannel != null) {
-				serverChannel.socket().setReuseAddress(true);
-			}
-			serverChannel.socket().bind(endpoint);
+			channel.socket().setReuseAddress(true);
+			channel.socket().bind(endpoint, org.deftserver.web.http.HttpServerDescriptor.ACCEPT_BACKLOG);
 		} catch (IOException e) {
 			logger.error("Could not bind socket: {}", e);
-			Closeables.closeQuietly(IOLoop.INSTANCE, serverChannel);
+			try { channel.close(); } catch (IOException ignore) {}
 			throw e;
+		}
+		serverChannels.add(channel);
+		if (ssl) {
+			sslServerChannels.add(channel);
 		}
 	}
 	
+	/** Runs the server across {@code numThreads} independent I/O loops, each on its own platform
+	 *  thread with its own {@link HttpProtocol}, all sharing the one server socket for OP_ACCEPT
+	 *  (a multi-reactor design). Call {@link #bind} first. */
 	public void start(int numThreads) throws IOException {
 		for (int i = 0; i < numThreads; i++) {
 			final IOLoop ioLoop = new IOLoop();
 			ioLoops.add(ioLoop);
 			final HttpProtocol protocol = new HttpProtocol(ioLoop, application);
 			if (maxConnections > 0) {
-				protocol.setMaxConnections(maxConnections / numThreads > 0 ? maxConnections / numThreads : 1);
+				protocol.setMaxConnections((maxConnections + numThreads - 1) / numThreads);
 			}
 			if (maxConnectionsPerIp > 0) {
-				protocol.setMaxConnectionsPerIp(maxConnectionsPerIp);
+				protocol.setMaxConnectionsPerIp((maxConnectionsPerIp + numThreads - 1) / numThreads);
 			}
 			if (isSSLEnabled()) {
 				protocol.enableSSL(sslContext);
@@ -147,21 +166,26 @@ public class HttpServer {
 		logger.debug("Stopping HTTP server");
 		for (IOLoop ioLoop : ioLoops) {
 			ioLoop.addCallback(() -> {
-				Closeables.closeQuietly(ioLoop, serverChannel);
 				if (ioLoop != IOLoop.INSTANCE) {
 					ioLoop.dispose();
 				}
 			});
 		}
+		for (ServerSocketChannel channel : serverChannels) {
+			Closeables.closeQuietly(channel);
+		}
 	}
-	
+
 	private void registerHandler(IOLoop ioLoop, HttpProtocol protocol) throws IOException {
-		ioLoop.addHandler(
-			serverChannel,
-			protocol, 
-			SelectionKey.OP_ACCEPT,
-			null /*attachment*/
-		);
+		for (ServerSocketChannel channel : serverChannels) {
+			boolean isSsl = sslServerChannels.contains(channel);
+			ioLoop.addHandler(
+				channel,
+				protocol,
+				SelectionKey.OP_ACCEPT,
+				isSsl
+			);
+		}
 	}
 
 }

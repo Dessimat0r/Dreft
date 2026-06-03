@@ -39,6 +39,8 @@ public class DateUtil {
 	private static volatile long lastSeconds = 0;
 	private static volatile String cachedDateString = "";
 
+	/** The current time as an IMF-fixdate string for the response {@code Date} header, cached to
+	 *  one-second granularity (double-checked) so the formatter runs at most once per second. */
 	public static String getCurrentAsString() {
 		long nowSeconds = System.currentTimeMillis() / 1000;
 		if (nowSeconds != lastSeconds) {
@@ -52,10 +54,13 @@ public class DateUtil {
 		return cachedDateString;
 	}
 
+	/** Formats an epoch-milliseconds instant as a strict IMF-fixdate (e.g. for {@code Last-Modified}). */
 	public static String formatToRFC1123(long epochMillis) {
 		return OUTPUT_FORMATTER.format(ZonedDateTime.ofInstant(Instant.ofEpochMilli(epochMillis), GMT_ZONE));
 	}
 
+	/** Parses an HTTP-date in any of the three RFC 9110 formats (IMF-fixdate, obsolete RFC 850,
+	 *  asctime) to epoch milliseconds, or returns -1 if it is null or unparseable. */
 	public static long parseRFC1123ToMillis(String httpDate) {
 		if (httpDate == null) return -1;
 		httpDate = httpDate.trim();

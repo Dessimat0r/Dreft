@@ -16,8 +16,10 @@ import java.util.HashMap;
 
 
 
+/** Example: a minimal Dreft server wiring a few {@code RequestHandler}s and starting the I/O loop
+ *  on port 8080. Demonstration code, not part of the framework. */
 public class DeftServerExample {
-	
+
 	private final static Logger logger = LoggerFactory.getLogger(DeftServerExample.class);
 	private final static int PORT = 8080;
 	
@@ -35,6 +37,7 @@ public class DeftServerExample {
 
 	}
 
+	/** Registers the example handlers and starts the server on port 8080. */
 	public static void main(String[] args) {
 		Map<String, RequestHandler> handlers = new HashMap<>();
 		handlers.put("/", new ExampleRequestHandler());

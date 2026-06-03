@@ -14,6 +14,8 @@ public class MXBeanUtil {
 	
 	private MXBeanUtil() {}
 
+	/** Registers {@code self} as a JMX MXBean named {@code org.deftserver:type=<type>,name=<class>}
+	 *  (idempotent; logs and swallows failures). */
 	public static void registerMXBean(Object self, String type) {
 		MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
 		try {
@@ -24,10 +26,11 @@ public class MXBeanUtil {
 			}
 		}
 		catch (Exception e) {
-			logger.error("Unable to register {} MXBean: {}", self.getClass().getCanonicalName(), e);
+			logger.error("Unable to register {} MXBean", self.getClass().getCanonicalName(), e);
 		}
 	}
 
+	/** Unregisters the JMX MXBean previously registered for {@code self}/{@code type} (idempotent). */
 	public static void unregisterMXBean(Object self, String type) {
 		MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
 		try {
@@ -38,7 +41,7 @@ public class MXBeanUtil {
 			}
 		}
 		catch (Exception e) {
-			logger.error("Unable to unregister {} MXBean: {}", self.getClass().getCanonicalName(), e);
+			logger.error("Unable to unregister {} MXBean", self.getClass().getCanonicalName(), e);
 		}
 	}
 

@@ -17,6 +17,7 @@ public class NopAsyncResult<T> {
 	
 	};
 	
+	/** Returns a holder whose {@link #nopAsyncResult} is a no-op {@code AsyncResult<T>}. */
 	public static <T> NopAsyncResult<T> of(Class<T> type) {
 		return new NopAsyncResult<T>();
 	}

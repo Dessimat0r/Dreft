@@ -2,6 +2,7 @@ package org.deftserver.web.http;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 public class CorsConfig {
@@ -13,7 +14,7 @@ public class CorsConfig {
 	private Long maxAge;
 
 	public List<String> getAllowedOrigins() {
-		return allowedOrigins;
+		return Collections.unmodifiableList(allowedOrigins);
 	}
 
 	public void setAllowedOrigins(String... origins) {
@@ -22,7 +23,7 @@ public class CorsConfig {
 	}
 
 	public List<String> getAllowedMethods() {
-		return allowedMethods;
+		return Collections.unmodifiableList(allowedMethods);
 	}
 
 	public void setAllowedMethods(String... methods) {
@@ -31,7 +32,7 @@ public class CorsConfig {
 	}
 
 	public List<String> getAllowedHeaders() {
-		return allowedHeaders;
+		return Collections.unmodifiableList(allowedHeaders);
 	}
 
 	public void setAllowedHeaders(String... headers) {
@@ -51,7 +52,11 @@ public class CorsConfig {
 		return maxAge;
 	}
 
+	/** Sets the {@code Access-Control-Max-Age} (preflight cache lifetime in seconds; must be >= 0). */
 	public void setMaxAge(Long maxAge) {
+		if (maxAge != null && maxAge < 0) {
+			throw new IllegalArgumentException("maxAge must be non-negative");
+		}
 		this.maxAge = maxAge;
 	}
 

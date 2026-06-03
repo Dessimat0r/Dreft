@@ -16,10 +16,12 @@ public class ServerOptionsRequestHandler extends RequestHandler {
 
 	private ServerOptionsRequestHandler() { }
 
+	/** The shared singleton instance. */
 	public static ServerOptionsRequestHandler getInstance() {
 		return instance;
 	}
 
+	/** Writes the 204 response advertising the server-wide {@code Allow} method set. */
 	@Override
 	public void options(HttpRequest request, HttpResponse response) throws IOException {
 		response.setStatusCode(204);

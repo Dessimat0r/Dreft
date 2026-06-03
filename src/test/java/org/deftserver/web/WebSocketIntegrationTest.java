@@ -17,7 +17,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
-import org.deftserver.io.IOLoop;
 import org.deftserver.web.handler.RequestHandler;
 import org.deftserver.web.handler.WebSocketHandler;
 import org.deftserver.web.http.WebSocketConnection;
@@ -43,6 +42,15 @@ public class WebSocketIntegrationTest {
 		}
 
 		@Override
+		public void onBinaryMessage(WebSocketConnection connection, byte[] data) {
+			// Echo binary frames back as binary (prefixed) to exercise WebSocketConnection.write(byte[]).
+			byte[] reply = new byte[data.length + 1];
+			reply[0] = (byte) 0xBB;
+			System.arraycopy(data, 0, reply, 1, data.length);
+			connection.write(reply);
+		}
+
+		@Override
 		public void onClose(WebSocketConnection connection) {
 			System.out.println("DEBUG WS: Server onClose triggered!");
 		}
@@ -61,23 +69,16 @@ public class WebSocketIntegrationTest {
 		
 		server = new HttpServer(new Application(reqHandlers));
 		
-		Thread.ofPlatform().start(() -> {
-			try {
-				server.listen(PORT);
-				IOLoop.INSTANCE.start();
-			} catch (Exception e) {
-				e.printStackTrace();
-			}
-		});
+		server.bind(PORT);
+		server.start(1); // dedicated IOLoop, isolated from the shared IOLoop.INSTANCE
 		
 		// Wait a brief moment for loop to boot
-		Thread.sleep(200);
+		TestServerSupport.awaitListening(PORT);
 	}
 
 	@AfterClass
 	public static void tearDown() throws Exception {
 		server.stop();
-		IOLoop.INSTANCE.stop();
 		// Wait brief moment for cleanup
 		Thread.sleep(100);
 	}
@@ -129,6 +130,99 @@ public class WebSocketIntegrationTest {
 		
 		// Assert that client-side close listener was notified
 		assertTrue(closeLatch.await(5, TimeUnit.SECONDS));
+	}
+
+	@Test
+	public void idleWebSocketIsClosedByWebSocketIdleTimeout() throws Exception {
+		long original = org.deftserver.web.http.HttpProtocol.WEBSOCKET_IDLE_TIMEOUT_MS;
+		org.deftserver.web.http.HttpProtocol.WEBSOCKET_IDLE_TIMEOUT_MS = 600;
+		try {
+			CountDownLatch closed = new CountDownLatch(1);
+			WebSocket.Listener listener = new WebSocket.Listener() {
+				@Override public void onOpen(WebSocket ws) { ws.request(1); }
+				@Override public CompletionStage<?> onClose(WebSocket ws, int code, String reason) {
+					closed.countDown();
+					return null;
+				}
+				@Override public void onError(WebSocket ws, Throwable error) {
+					closed.countDown(); // an abrupt server close may surface as an error
+				}
+			};
+			HttpClient client = HttpClient.newHttpClient();
+			WebSocket ws = client.newWebSocketBuilder()
+					.buildAsync(URI.create("ws://localhost:" + PORT + "/ws"), listener)
+					.get(5, TimeUnit.SECONDS);
+			assertNotNull(ws);
+			// Send nothing: the idle WebSocket must be reaped by the (lowered) idle timeout, not held
+			// open indefinitely.
+			assertTrue("idle WebSocket should have been closed by the idle timeout",
+				closed.await(4, TimeUnit.SECONDS));
+		} finally {
+			org.deftserver.web.http.HttpProtocol.WEBSOCKET_IDLE_TIMEOUT_MS = original;
+		}
+	}
+
+	@Test
+	public void testBinaryMessageRoundTrip() throws Exception {
+		// A client binary message must be delivered to onBinaryMessage and echoed back as a binary
+		// frame via WebSocketConnection.write(byte[]).
+		CompletableFuture<byte[]> binaryFuture = new CompletableFuture<>();
+		java.io.ByteArrayOutputStream acc = new java.io.ByteArrayOutputStream();
+
+		WebSocket.Listener listener = new WebSocket.Listener() {
+			@Override
+			public void onOpen(WebSocket webSocket) { webSocket.request(1); }
+
+			@Override
+			public CompletionStage<?> onBinary(WebSocket webSocket, java.nio.ByteBuffer data, boolean last) {
+				while (data.hasRemaining()) acc.write(data.get());
+				if (last) binaryFuture.complete(acc.toByteArray());
+				webSocket.request(1);
+				return null;
+			}
+		};
+
+		HttpClient client = HttpClient.newHttpClient();
+		WebSocket webSocket = client.newWebSocketBuilder()
+				.buildAsync(URI.create("ws://localhost:" + PORT + "/ws"), listener)
+				.get(5, TimeUnit.SECONDS);
+
+		byte[] payload = new byte[] {1, 2, 3, 4, 5};
+		webSocket.sendBinary(java.nio.ByteBuffer.wrap(payload), true).get(5, TimeUnit.SECONDS);
+
+		byte[] echoed = binaryFuture.get(5, TimeUnit.SECONDS);
+		// Server prefixes 0xBB then echoes the payload.
+		assertEquals(payload.length + 1, echoed.length);
+		assertEquals((byte) 0xBB, echoed[0]);
+		for (int i = 0; i < payload.length; i++) {
+			assertEquals(payload[i], echoed[i + 1]);
+		}
+		webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "Bye!").get(5, TimeUnit.SECONDS);
+	}
+
+	@Test
+	public void testUnsupportedWebSocketVersionGets426() throws Exception {
+		// A WebSocket upgrade requesting a version other than 13 must get 426 Upgrade Required.
+		try (java.net.Socket s = new java.net.Socket("localhost", PORT)) {
+			s.setSoTimeout(3000);
+			String req = "GET /ws HTTP/1.1\r\n" +
+				"Host: localhost\r\n" +
+				"Upgrade: websocket\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+				"Sec-WebSocket-Version: 8\r\n\r\n";
+			s.getOutputStream().write(req.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+			s.getOutputStream().flush();
+			java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+			byte[] buf = new byte[2048];
+			int n;
+			while ((n = s.getInputStream().read(buf)) != -1) out.write(buf, 0, n);
+			String resp = out.toString(java.nio.charset.StandardCharsets.ISO_8859_1);
+			assertTrue("expected 426, got: " + resp.substring(0, Math.min(40, resp.length())),
+				resp.startsWith("HTTP/1.1 426"));
+			assertTrue("must advertise supported version 13:\n" + resp,
+				resp.contains("Sec-WebSocket-Version: 13"));
+		}
 	}
 
 	@Test

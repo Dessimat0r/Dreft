@@ -13,7 +13,8 @@ public class DynamicByteBuffer {
 
 	private ByteBuffer backend;
 
-	private DynamicByteBuffer(ByteBuffer bb) { 	
+	/** Wraps an existing backing {@link ByteBuffer}; use {@link #allocate(int)} to create one. */
+	private DynamicByteBuffer(ByteBuffer bb) {
 		this.backend = bb;
 	}
 	
@@ -43,9 +44,15 @@ public class DynamicByteBuffer {
 	
 	/**
 	 * Prepend the data. Will reallocate if needed.
+	 * <p>
+	 * Encodes with ISO-8859-1: this is only ever used to prepend the HTTP status line + header block,
+	 * and HTTP header field values are Latin-1/obs-text (RFC 9110 §5.5), one octet per character.
+	 * Using UTF-8 here would mis-encode a non-ASCII header octet (e.g. a Content-Disposition filename
+	 * byte) into a multi-byte sequence, corrupting the header on the wire. (The message body, which
+	 * may legitimately be UTF-8, is added separately via {@code write(String)}.)
 	 */
 	public long prepend(String data) {
-		byte[] bytes = data.getBytes(StandardCharsets.UTF_8);
+		byte[] bytes = data.getBytes(StandardCharsets.ISO_8859_1);
 		int headerLen = bytes.length;
 		int bodyLen = backend.position();
 		ensureCapacity(headerLen, true);
@@ -79,6 +86,7 @@ public class DynamicByteBuffer {
 		backend.position(headerLen + bodyLen);
 	}
 	
+	/** Ensures room to append {@code size} bytes, growing with the default 1.5× padding. */
 	private void ensureCapacity(int size) {
 		ensureCapacity(size, false);
 	}
@@ -88,13 +96,28 @@ public class DynamicByteBuffer {
 	 * @param size The size of the data that is about to be appended.
 	 * @param exact If true, reallocates to exactly the required size. If false, reallocates with 1.5x padding.
 	 */
+	/** Largest array the JVM can allocate (a few bytes of header reserved, per common practice). */
+	private static final int MAX_ARRAY_SIZE = Integer.MAX_VALUE - 8;
+
 	private void ensureCapacity(int size, boolean exact) {
 		int remaining = backend.remaining();
 		if (size > remaining) {
 			logger.debug("allocating new DynamicByteBuffer, old capacity {}: ", backend.capacity());
-			int missing = size - remaining;
-			int newSize = exact ? (backend.capacity() + missing) : (int) ((backend.capacity() + missing) * 1.5);
-			reallocate(newSize);
+			int missing = size - remaining;                       // size >= remaining ⇒ missing >= 0
+			// Compute in long: capacity()+missing can approach Integer.MAX_VALUE, and the ×1.5
+			// growth factor would otherwise overflow a 32-bit int to a negative value, producing a
+			// NegativeArraySizeException (a crash/DoS on a very large response). Clamp to the JVM's
+			// max array size; only fail if the *minimum* required size genuinely can't be allocated.
+			long required = (long) backend.capacity() + missing;
+			long newSize = exact ? required : (long) (required * 1.5);
+			if (newSize > MAX_ARRAY_SIZE) {
+				newSize = required;                               // ×1.5 overflowed the cap; try exact
+				if (newSize > MAX_ARRAY_SIZE) {
+					throw new OutOfMemoryError(
+						"DynamicByteBuffer cannot grow to " + required + " bytes (exceeds max array size)");
+				}
+			}
+			reallocate((int) newSize);
 		}
 	}
 	

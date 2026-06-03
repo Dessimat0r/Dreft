@@ -72,6 +72,39 @@ public class DynamicByteBufferTest {
 	}
 
 	@Test
+	public void testPrependEncodesHeaderAsLatin1NotUtf8() {
+		// prepend(String) carries the HTTP status line + headers, which are ISO-8859-1 (one octet per
+		// char). A non-ASCII header octet (here U+00E9 'é') must serialize to the single byte 0xE9,
+		// not the two-byte UTF-8 sequence 0xC3 0xA9 — otherwise the header is corrupted on the wire.
+		String header = "X-File: é\r\n"; // 'é' as a Latin-1 header octet
+		dbb.prepend(header);
+		byte[] backing = dbb.array();
+		int eIndex = "X-File: ".length();
+		assertEquals("non-ASCII header octet must be a single Latin-1 byte 0xE9",
+			(byte) 0xE9, backing[eIndex]);
+		// And the total prepended length must be the octet count (10), not the UTF-8 byte count (11).
+		assertEquals(header.length(), dbb.position());
+	}
+
+	@Test
+	public void testDataIntegrityAcrossManyReallocations() {
+		// Append a known pattern in many small chunks, forcing repeated growth, and verify every
+		// byte survives the reallocate() array copies intact (guards against off-by-one / lost data).
+		java.io.ByteArrayOutputStream expected = new java.io.ByteArrayOutputStream();
+		for (int i = 0; i < 500; i++) {
+			byte[] chunk = ("chunk-" + i + ";").getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+			dbb.put(chunk);
+			expected.write(chunk, 0, chunk.length);
+		}
+		byte[] exp = expected.toByteArray();
+		assertEquals(exp.length, dbb.position());
+		dbb.flip();
+		byte[] actual = new byte[dbb.limit()];
+		dbb.getByteBuffer().get(actual);
+		org.junit.Assert.assertArrayEquals(exp, actual);
+	}
+
+	@Test
 	public void testReallocationLimit() {
 		byte[] data = "0123456".getBytes();
 		dbb.put(data);

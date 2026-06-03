@@ -31,12 +31,14 @@ public class KeyValueStore extends Thread {
 
 	private ServerSocket serverSocket;
 
+	/** Creates the store, binding its server socket, and marks the thread as a daemon. */
 	public KeyValueStore() {
 		logger.debug("Initializing KeyValueStore");
 		initialize();
 		setDaemon(true);
 	}
-	
+
+	/** Accepts client connections and serves simple line-based get/put commands. */
 	public void run() {
 		try (ServerSocket server = serverSocket) {
 			boolean served = false;
@@ -74,6 +76,7 @@ public class KeyValueStore extends Thread {
 		logger.debug("Closing KeyValueStore");
 	}
 
+	/** Closes the client streams and socket, ignoring errors. */
 	private void closeQuietly(BufferedReader is, BufferedWriter os, Socket clientSocket) {
 		try {
 			if (is != null)
@@ -86,6 +89,7 @@ public class KeyValueStore extends Thread {
 		catch (IOException ignore) {}
 	}
 
+	/** Binds the server socket on an ephemeral port. */
 	private void initialize() {
 		try {
 			serverSocket = new ServerSocket();
@@ -96,6 +100,7 @@ public class KeyValueStore extends Thread {
 		}
 	}
 
+	/** The bound listening port. */
 	public int getPort() {
 		return serverSocket.getLocalPort();
 	}

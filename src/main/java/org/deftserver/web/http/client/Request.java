@@ -7,8 +7,10 @@ import org.deftserver.web.HttpVerb;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/** An outbound HTTP request for the async {@link AsynchronousHttpClient}: target URL, method and
+ *  redirect-following policy. */
 public class Request {
-	
+
 	private static final Logger logger = LoggerFactory.getLogger(Request.class);
 
 	private final URL url;
@@ -29,13 +31,15 @@ public class Request {
 		}
 	}
 	
+	/** An HTTP request with explicit redirect-following policy and redirect cap. */
 	public Request(String url, HttpVerb verb, boolean followRedirects, int maxRedirects) {
 		this(url, verb);
 		this.followRedirects = followRedirects;
 		this.maxRedirects = maxRedirects;
-		
+
 	}
 
+	/** The target URL. */
 	public URL getURL() {
 		return url;
 	}
@@ -56,6 +60,7 @@ public class Request {
 		return maxRedirects;
 	}
 	
+	/** Whether this request follows redirects. */
 	public boolean isFollowingRedirects() {
 		return followRedirects;
 	}

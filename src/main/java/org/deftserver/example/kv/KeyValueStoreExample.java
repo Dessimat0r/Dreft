@@ -15,6 +15,8 @@ import org.deftserver.web.http.HttpResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/** Example tying the {@link KeyValueStore} together with a Dreft server. Demonstration code, not part
+ *  of the framework. */
 public class KeyValueStoreExample {
 
 	private final static Logger logger = LoggerFactory.getLogger(KeyValueStoreExample.class);
@@ -24,12 +26,14 @@ public class KeyValueStoreExample {
 
 		private final int port;
 		
+		/** Starts an embedded {@link KeyValueStore} and records its port. */
 		public KeyValueStoreExampleRequestHandler() {
 			KeyValueStore store = new KeyValueStore();
 			store.start();
 			port = store.getPort();
 		}
-		
+
+		/** Asynchronously fetches a value from the store and writes it as the response. */
 		@Override
 		@Asynchronous
 		public void get(HttpRequest request, final HttpResponse response) throws IOException {
@@ -44,6 +48,7 @@ public class KeyValueStoreExample {
 		}
 	}
 	
+	/** Starts a server exposing {@code /kv} backed by an embedded key-value store. */
 	public static void main(String[] args) {
 		Map<String, RequestHandler> handlers = new HashMap<String, RequestHandler>();
 		handlers.put("/kv", new KeyValueStoreExampleRequestHandler());

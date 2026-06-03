@@ -12,6 +12,7 @@ public class Cookie {
 			this.value = value;
 		}
 
+		/** The wire form of this SameSite value (e.g. "Lax"). */
 		public String getValue() {
 			return value;
 		}
@@ -26,6 +27,9 @@ public class Cookie {
 	private boolean httpOnly = false;
 	private SameSite sameSite;
 
+	/** Creates a cookie with the given name and value, rejecting a null/empty name and any control
+	 *  characters in name or value (the response-splitting defence). Attributes default to a root
+	 *  Path and no Domain/Max-Age/Secure/HttpOnly/SameSite. */
 	public Cookie(String name, String value) {
 		if (name == null || name.trim().isEmpty()) {
 			throw new IllegalArgumentException("Cookie name cannot be null or empty");
@@ -38,77 +42,93 @@ public class Cookie {
 
 	/**
 	 * Rejects characters that would let an attacker break out of the Set-Cookie header and
-	 * inject additional headers/response data (CR, LF, NUL and other control characters).
-	 * This is the primary defence against HTTP response-splitting via cookie attributes.
+	 * inject additional attributes/headers/response data. Blocks control characters (CR/LF/NUL),
+	 * semicolons (attribute separator), commas, and other HTTP-illegal characters.
 	 */
 	private static void rejectControlChars(String field, String s) {
 		if (s == null) return;
 		for (int i = 0; i < s.length(); i++) {
 			char c = s.charAt(i);
-			if (c < 0x20 || c == 0x7f) {
-				throw new IllegalArgumentException(field + " contains an illegal control character");
+			if (c < 0x20 || c == 0x7f || c == ';' || c == ',') {
+				throw new IllegalArgumentException(field + " contains an illegal character");
 			}
 		}
 	}
 
+	/** The cookie name (the part before {@code =}). */
 	public String getName() {
 		return name;
 	}
 
+	/** The cookie value (the part after {@code =}). */
 	public String getValue() {
 		return value;
 	}
 
+	/** The {@code Domain} attribute, or null if unset. */
 	public String getDomain() {
 		return domain;
 	}
 
+	/** Sets the {@code Domain} attribute (rejecting control characters that could break the header). */
 	public void setDomain(String domain) {
 		rejectControlChars("Cookie domain", domain);
 		this.domain = domain;
 	}
 
+	/** The {@code Path} attribute (defaults to {@code /}). */
 	public String getPath() {
 		return path;
 	}
 
+	/** Sets the {@code Path} attribute (rejecting control characters that could break the header). */
 	public void setPath(String path) {
 		rejectControlChars("Cookie path", path);
 		this.path = path;
 	}
 
+	/** The {@code Max-Age} attribute in seconds, or null if unset. */
 	public Long getMaxAge() {
 		return maxAge;
 	}
 
+	/** Sets the {@code Max-Age} attribute (seconds; a non-positive value asks the client to delete it). */
 	public void setMaxAge(Long maxAge) {
 		this.maxAge = maxAge;
 	}
 
+	/** Whether the {@code Secure} attribute is set (cookie only sent over HTTPS). */
 	public boolean isSecure() {
 		return secure;
 	}
 
+	/** Sets the {@code Secure} attribute. */
 	public void setSecure(boolean secure) {
 		this.secure = secure;
 	}
 
+	/** Whether the {@code HttpOnly} attribute is set (cookie hidden from client-side scripts). */
 	public boolean isHttpOnly() {
 		return httpOnly;
 	}
 
+	/** Sets the {@code HttpOnly} attribute. */
 	public void setHttpOnly(boolean httpOnly) {
 		this.httpOnly = httpOnly;
 	}
 
+	/** The {@code SameSite} attribute, or null if unset. */
 	public SameSite getSameSite() {
 		return sameSite;
 	}
 
+	/** Sets the {@code SameSite} attribute (Lax / Strict / None). */
 	public void setSameSite(SameSite sameSite) {
 		this.sameSite = sameSite;
 	}
 
+	/** Serializes the cookie to its {@code Set-Cookie} header value form ({@code name=value} plus
+	 *  any configured attributes). */
 	@Override
 	public String toString() {
 		StringBuilder sb = new StringBuilder();

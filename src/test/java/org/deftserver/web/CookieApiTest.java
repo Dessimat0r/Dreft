@@ -15,7 +15,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-import org.deftserver.io.IOLoop;
 import org.deftserver.web.handler.RequestHandler;
 import org.deftserver.web.http.Cookie;
 import org.junit.AfterClass;
@@ -63,22 +62,15 @@ public class CookieApiTest {
 		
 		server = new HttpServer(new Application(reqHandlers));
 
-		Thread.ofPlatform().start(() -> {
-			try {
-				server.listen(PORT);
-				IOLoop.INSTANCE.start();
-			} catch (Exception e) {
-				e.printStackTrace();
-			}
-		});
+		server.bind(PORT);
+		server.start(1); // dedicated IOLoop, isolated from the shared IOLoop.INSTANCE
 		
-		Thread.sleep(200);
+		TestServerSupport.awaitListening(PORT);
 	}
 
 	@AfterClass
 	public static void tearDown() throws Exception {
 		server.stop();
-		IOLoop.INSTANCE.stop();
 		Thread.sleep(100);
 	}
 

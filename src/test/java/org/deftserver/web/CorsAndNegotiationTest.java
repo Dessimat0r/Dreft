@@ -16,7 +16,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-import org.deftserver.io.IOLoop;
 import org.deftserver.web.handler.RequestHandler;
 import org.deftserver.web.http.CorsConfig;
 import org.junit.AfterClass;
@@ -57,26 +56,50 @@ public class CorsAndNegotiationTest {
 
 		Map<String, RequestHandler> reqHandlers = new HashMap<>();
 		reqHandlers.put("/cors", new CorsTestHandler());
-		
+		// A CORS handler that ALSO sets its own Vary — the framework must keep the Origin token.
+		RequestHandler corsVary = new RequestHandler() {
+			{
+				CorsConfig c = new CorsConfig();
+				c.setAllowedOrigins("http://example.com");
+				setCorsConfig(c);
+			}
+			@Override
+			public void get(org.deftserver.web.http.HttpRequest req, org.deftserver.web.http.HttpResponse resp) {
+				resp.setHeader("Vary", "Accept-Language"); // handler overrides Vary
+				resp.setHeader("Content-Type", "text/plain; charset=utf-8");
+				resp.write("ok");
+			}
+		};
+		reqHandlers.put("/corsvary", corsVary);
+
 		server = new HttpServer(new Application(reqHandlers));
 
-		Thread.ofPlatform().start(() -> {
-			try {
-				server.listen(PORT);
-				IOLoop.INSTANCE.start();
-			} catch (Exception e) {
-				e.printStackTrace();
-			}
-		});
+		server.bind(PORT);
+		server.start(1); // dedicated IOLoop, isolated from the shared IOLoop.INSTANCE
 		
-		Thread.sleep(200);
+		TestServerSupport.awaitListening(PORT);
 	}
 
 	@AfterClass
 	public static void tearDown() throws Exception {
 		server.stop();
-		IOLoop.INSTANCE.stop();
 		Thread.sleep(100);
+	}
+
+	@Test
+	public void corsVaryOriginSurvivesHandlerSettingVary() throws Exception {
+		HttpClient client = HttpClient.newHttpClient();
+		HttpRequest request = HttpRequest.newBuilder()
+				.uri(URI.create("http://localhost:" + PORT + "/corsvary"))
+				.header("Origin", "http://example.com")
+				.GET().build();
+		HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+		assertEquals(200, response.statusCode());
+		String vary = response.headers().firstValue("Vary").orElse("");
+		String varyLower = vary.toLowerCase(java.util.Locale.ROOT);
+		// Both the handler's token and the CORS Origin token must be present.
+		assertTrue("Vary must keep the handler's Accept-Language: " + vary, varyLower.contains("accept-language"));
+		assertTrue("Vary must keep the CORS Origin token: " + vary, varyLower.contains("origin"));
 	}
 
 	@Test

@@ -9,7 +9,6 @@ import java.nio.channels.ServerSocketChannel;
 import java.util.HashMap;
 import java.util.Map;
 
-import org.deftserver.io.IOLoop;
 import org.deftserver.web.handler.RequestHandler;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -38,21 +37,14 @@ public class PerIpConnectionLimitTest {
 		server = new HttpServer(new Application(reqHandlers));
 		server.setMaxConnectionsPerIp(2); // at most 2 simultaneous connections per IP
 
-		Thread.ofPlatform().start(() -> {
-			try {
-				server.listen(PORT);
-				IOLoop.INSTANCE.start();
-			} catch (Exception e) {
-				e.printStackTrace();
-			}
-		});
-		Thread.sleep(200);
+		server.bind(PORT);
+		server.start(1); // dedicated IOLoop, isolated from the shared IOLoop.INSTANCE
+		TestServerSupport.awaitListening(PORT);
 	}
 
 	@AfterClass
 	public static void tearDown() throws Exception {
 		server.stop();
-		IOLoop.INSTANCE.stop();
 		Thread.sleep(100);
 	}
 

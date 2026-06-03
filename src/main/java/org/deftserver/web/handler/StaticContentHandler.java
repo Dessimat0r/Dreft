@@ -29,6 +29,8 @@ public class StaticContentHandler extends RequestHandler {
 	private String staticContentDir;
 	private java.nio.file.Path staticContentRoot;
 
+	/** Sets the root directory served by this handler, caching its canonical path for the
+	 *  symlink-boundary check performed on every request. */
 	public void setStaticContentDir(String staticContentDir) {
 		this.staticContentDir = staticContentDir;
 		if (staticContentDir != null) {
@@ -102,17 +104,18 @@ public class StaticContentHandler extends RequestHandler {
 
 	private final FileTypeMap mimeTypeMap =  MimetypesFileTypeMap.getDefaultFileTypeMap();
 
+	/** The shared singleton instance (one per JVM; configured via {@link #setStaticContentDir}). */
 	public static StaticContentHandler getInstance() {
 		return instance;
 	}
 
-	/** {inheritDoc} */
+	/** Serves the requested file (with body) — see {@link #perform}. */
 	@Override
 	public void get(HttpRequest request, HttpResponse response) throws IOException {
 		this.perform(request, response, true);
 	}
-	
-	/** {inheritDoc} */
+
+	/** Serves the requested file without a body (HEAD) — headers/Content-Length only. */
 	@Override
 	public void head(final HttpRequest request, final HttpResponse response) throws IOException {
 		this.perform(request, response, false);
@@ -126,9 +129,12 @@ public class StaticContentHandler extends RequestHandler {
 	private void perform(final HttpRequest request, final HttpResponse response, boolean hasBody) throws IOException {
 		logger.debug("req: {}, resp: {}, body: {}", request, response, hasBody);
 		final String path = request.getRequestedPath();
+		// HTML-escaped form of the (attacker-controlled) path for safe reflection in error
+		// messages — defence in depth even though these go out as text/plain.
+		final String safePath = org.deftserver.util.HttpUtil.escapeHtml(path);
 		Path requested = Path.of(path.substring(1)).normalize();	// remove the leading '/'
 		if (requested.startsWith("..") || path.contains("\0")) {
-			throw new HttpException(403, "Forbidden", "Requested resource: <tt>" + path +  "</tt> is not allowed.");
+			throw new HttpException(403, "Forbidden", "Requested resource: <tt>" + safePath +  "</tt> is not allowed.");
 		}
 		
 		File file = requested.toFile();
@@ -158,19 +164,19 @@ public class StaticContentHandler extends RequestHandler {
 					rootReal = staticContentRoot.toRealPath();
 				} catch (IOException e) {
 					// Can't safely resolve the path — deny rather than risk an escape.
-					throw new HttpException(403, "Forbidden", "Requested resource: <tt>" + path + "</tt> is not allowed.");
+					throw new HttpException(403, "Forbidden", "Requested resource: <tt>" + safePath + "</tt> is not allowed.");
 				}
 				if (!fileReal.startsWith(rootReal)) {
-					throw new HttpException(403, "Forbidden", "Requested resource: <tt>" + path + "</tt> is not allowed.");
+					throw new HttpException(403, "Forbidden", "Requested resource: <tt>" + safePath + "</tt> is not allowed.");
 				}
 			}
 		}
 
 		logger.debug("file: {}", file);
 		if (!file.exists()) {
-			throw new HttpException(404, "Not found", "Requested resource: <tt>" + path +  "</tt> was not found.");
+			throw new HttpException(404, "Not found", "Requested resource: <tt>" + safePath +  "</tt> was not found.");
 		} else if (!file.isFile()) {
-			throw new HttpException(403, "Not a file", "Requested resource: <tt>" + path +  "</tt> is not a file.");
+			throw new HttpException(403, "Not a file", "Requested resource: <tt>" + safePath +  "</tt> is not a file.");
 		}
 
 		final long lastModified = file.lastModified();
@@ -184,34 +190,39 @@ public class StaticContentHandler extends RequestHandler {
 			response.setHeader("ETag", etag);
 		}
 
-		String mimeType = null;
-		try {
-			mimeType = java.nio.file.Files.probeContentType(file.toPath());
-		} catch (IOException e) {
-			// ignore and let fallback resolve
-		}
-		
-		// Fallback to extension maps if probe returned null or a generic octet-stream
-		if (mimeType == null || "application/octet-stream".equals(mimeType)) {
-			String ext = "";
-			String filenameLower = file.getName().toLowerCase(java.util.Locale.ROOT);
-			if (filenameLower.endsWith(".tar.gz")) {
-				ext = "tar.gz";
-			} else if (filenameLower.endsWith(".tar.bz2")) {
-				ext = "tar.bz2";
-			} else if (filenameLower.endsWith(".tar.xz")) {
-				ext = "tar.xz";
-			} else {
-				int dot = filenameLower.lastIndexOf('.');
-				if (dot != -1) {
-					ext = filenameLower.substring(dot + 1);
-				}
+		// Resolve the Content-Type from the file extension FIRST: it is fast (in-memory, no syscall),
+		// is the conventional behaviour for a static file server, and is safer than content sniffing —
+		// a magic-number probe could mis-classify e.g. a user-uploaded "notes.txt" that begins with
+		// "<html>" as text/html and serve it as active markup (a stored-XSS vector). Only fall back to
+		// a filesystem content probe (a per-request syscall) when the extension is unknown.
+		String ext = "";
+		String filenameLower = file.getName().toLowerCase(java.util.Locale.ROOT);
+		if (filenameLower.endsWith(".tar.gz")) {
+			ext = "tar.gz";
+		} else if (filenameLower.endsWith(".tar.bz2")) {
+			ext = "tar.bz2";
+		} else if (filenameLower.endsWith(".tar.xz")) {
+			ext = "tar.xz";
+		} else {
+			int dot = filenameLower.lastIndexOf('.');
+			if (dot != -1) {
+				ext = filenameLower.substring(dot + 1);
 			}
-			mimeType = EXT_TO_MIME.get(ext);
 		}
-		
+		String mimeType = EXT_TO_MIME.get(ext);
+
+		if (mimeType == null) {
+			try {
+				mimeType = java.nio.file.Files.probeContentType(file.toPath());
+			} catch (IOException e) {
+				// ignore and let the final fallback resolve
+			}
+		}
 		if (mimeType == null) {
 			mimeType = mimeTypeMap.getContentType(file);
+		}
+		if (mimeType == null) {
+			mimeType = "application/octet-stream";
 		}
 		if (mimeType.startsWith("text/")) {
 			if (!mimeType.contains("charset")) {
@@ -220,29 +231,50 @@ public class StaticContentHandler extends RequestHandler {
 		}
 		response.setHeader("Content-Type", mimeType);
 
-		// ETag Cache Validation
+		// Conditional requests, evaluated in the RFC 9110 §13.2.2 precedence order:
+		//   1. If-Match  2. If-Unmodified-Since (only if If-Match absent)
+		//   3. If-None-Match  4. If-Modified-Since (only if If-None-Match absent)
+		final String ifMatch = request.getHeader("If-Match");
 		final String ifNoneMatch = request.getHeader("If-None-Match");
+		final String ifUnmodifiedSince = request.getHeader("If-Unmodified-Since");
+		final String ifModifiedSince = request.getHeader("If-Modified-Since");
+
+		// 1. If-Match (RFC 9110 §13.1.1): "*" matches any existing representation; otherwise the
+		// current strong ETag must appear in the list. Failure → 412 Precondition Failed.
+		if (ifMatch != null && !etag.isEmpty()) {
+			String im = ifMatch.trim();
+			if (!im.equals("*") && !etagListContains(im, etag, true /* strong comparison */)) {
+				response.setStatusCode(412);	// Precondition Failed
+				logger.debug("if-match precondition failed");
+				return;
+			}
+		}
+
+		// 2. If-Unmodified-Since (RFC 9110 §13.1.4) — ignored when If-Match is present. If the
+		// representation was modified after the given date → 412.
+		if (ifUnmodifiedSince != null && ifMatch == null) {
+			long ius = parseHttpDateOrEpoch(ifUnmodifiedSince);
+			if (ius != -1 && lastModifiedSec > ius) {
+				response.setStatusCode(412);	// Precondition Failed
+				logger.debug("if-unmodified-since precondition failed");
+				return;
+			}
+		}
+
+		// 3. If-None-Match (ETag) cache validation → 304 Not Modified on match.
 		if (ifNoneMatch != null && !etag.isEmpty()) {
 			String clientEtag = ifNoneMatch.trim();
-			if (clientEtag.equals(etag) || clientEtag.equals("W/" + etag)) {
+			if (clientEtag.equals("*") || etagListContains(clientEtag, etag, false /* weak comparison */)) {
 				response.setStatusCode(304);	//Not Modified
 				logger.debug("not modified (etag matched)");
 				return;
 			}
 		}
 
-		// Last-Modified Cache Validation. RFC 9110 §13.1.3: If-Modified-Since MUST be ignored when
+		// 4. Last-Modified Cache Validation. RFC 9110 §13.1.3: If-Modified-Since MUST be ignored when
 		// If-None-Match is present (the entity-tag is the stronger validator and takes precedence).
-		final String ifModifiedSince = request.getHeader("If-Modified-Since");
 		if (ifModifiedSince != null && ifNoneMatch == null) {
-			long ims = org.deftserver.util.DateUtil.parseRFC1123ToMillis(ifModifiedSince);
-			if (ims == -1) {
-				try {
-					ims = Long.parseLong(ifModifiedSince);
-				} catch (NumberFormatException nfe) {
-					// ignore
-				}
-			}
+			long ims = parseHttpDateOrEpoch(ifModifiedSince);
 			if (ims != -1 && lastModifiedSec <= ims) {
 				response.setStatusCode(304);	//Not Modified
 				logger.debug("not modified");
@@ -327,5 +359,43 @@ public class StaticContentHandler extends RequestHandler {
 			// HEAD: report the same Content-Length a GET would, without sending the body.
 			response.setHeader("Content-Length", String.valueOf(file.length()));
 		}
+	}
+
+	/**
+	 * Whether the comma-separated list of entity-tags in {@code headerValue} contains the current
+	 * (strong, quoted) {@code currentStrongEtag}. With {@code strongComparison} (If-Match) a weak
+	 * ({@code W/}) client tag never matches; without it (If-None-Match) the weak indicator is ignored
+	 * (RFC 9110 §13.1.1/§13.1.2 / §8.8.3.2).
+	 */
+	private static boolean etagListContains(String headerValue, String currentStrongEtag, boolean strongComparison) {
+		for (String raw : headerValue.split(",")) {
+			String tag = raw.trim();
+			if (tag.isEmpty()) {
+				continue;
+			}
+			boolean weak = tag.startsWith("W/");
+			if (weak && strongComparison) {
+				continue; // strong comparison: a weak tag can never match
+			}
+			String bare = weak ? tag.substring(2) : tag;
+			if (bare.equals(currentStrongEtag)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Parses an HTTP date (RFC 1123), falling back to a bare epoch-millis value some clients send;
+	 *  returns -1 if neither parses (so the caller treats the precondition as not evaluable). */
+	private static long parseHttpDateOrEpoch(String value) {
+		long t = org.deftserver.util.DateUtil.parseRFC1123ToMillis(value);
+		if (t == -1) {
+			try {
+				t = Long.parseLong(value.trim());
+			} catch (NumberFormatException nfe) {
+				return -1;
+			}
+		}
+		return t;
 	}
 }

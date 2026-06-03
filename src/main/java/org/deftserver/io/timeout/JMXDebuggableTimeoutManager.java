@@ -61,22 +61,32 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 		}
 	}
 
+	/** Schedules a generic (non-channel-keyed) timeout, e.g. a header- or body-read deadline. */
 	@Override
 	public void addTimeout(Timeout timeout) {
 		logger.debug("added generic timeout: {}", timeout);
-		timeouts.add(new DecoratedTimeout(timeout));		
+		timeouts.add(new DecoratedTimeout(timeout));
 	}
 
+	/** True if a keep-alive timeout is currently registered for the given channel. */
 	@Override
 	public boolean hasKeepAliveTimeout(SelectableChannel channel) {
 		return index.containsKey(channel);
 	}
 
+	/** Fires all timeouts due as of now; see {@link #execute(long)}. */
 	@Override
 	public long execute() {
 		return execute(System.currentTimeMillis());
 	}
 
+	/**
+	 * Runs the callback of every timeout whose deadline is {@code <= now}, popping them from the
+	 * priority queue in deadline order. A cancelled timeout fires a harmless no-op callback. Each
+	 * callback is crash-isolated (a bad one can't abort the queue or kill the I/O loop).
+	 *
+	 * @return milliseconds until the next timeout is due (>= 1), or {@code Long.MAX_VALUE} if none.
+	 */
 	public long execute(long now) {
 		while (!timeouts.isEmpty()) {
 			DecoratedTimeout candidate = timeouts.peek();
@@ -89,9 +99,12 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 			}
 			try {
 				candidate.timeout.getCallback().onCallback();
-			} catch (RuntimeException e) {
-				// A bad callback must not abort the rest of the timeout queue.
-				logger.error("RuntimeException in timeout callback — skipping and continuing", e);
+			} catch (RuntimeException | StackOverflowError | LinkageError e) {
+				// A bad callback must not abort the rest of the timeout queue nor escape into the
+				// I/O loop (where an Error would be re-thrown and kill the loop thread). Per-task
+				// recoverable Errors are contained here; hard JVM errors still propagate. (Cf. P29.)
+				logger.error("{} in timeout callback — skipping and continuing",
+					e.getClass().getSimpleName(), e);
 			}
 			if (candidate.channel != null) {
 				DecoratedTimeout current = index.get(candidate.channel);
@@ -105,31 +118,39 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 	}
 
 	// implements TimeoutMXBean
+
+	/** JMX: number of live keep-alive (channel-keyed) timeouts. */
 	@Override
 	public int getNumberOfKeepAliveTimeouts() {
 		return index.size();
 	}
 
+	/** JMX: total entries in the timeout queue (including not-yet-purged cancelled ones). */
 	@Override
 	public int getNumberOfTimeouts() {
 		return timeouts.size();
 	}
 
+	/** A heap entry wrapping a {@link Timeout} with its optional owning channel and a monotonic
+	 *  sequence number that breaks ties so the ordering is stable (FIFO among equal deadlines). */
 	private class DecoratedTimeout implements Comparable<DecoratedTimeout> {
 
 		public final SelectableChannel channel;
 		public final Timeout timeout;
 		private final long sequenceNumber = seqGenerator.getAndIncrement();
 
+		/** Wraps a channel-keyed (keep-alive) timeout. */
 		public DecoratedTimeout(SelectableChannel channel, Timeout timeout) {
 			this.channel = channel;
 			this.timeout = timeout;
 		}
 
+		/** Wraps a generic (non-channel-keyed) timeout. */
 		public DecoratedTimeout(Timeout timeout) {
 			this(null, timeout);
 		}
 
+		/** Orders by deadline ascending, breaking ties by insertion sequence (stable FIFO). */
 		@Override
 		public int compareTo(DecoratedTimeout that) {
 			if (this == that) {

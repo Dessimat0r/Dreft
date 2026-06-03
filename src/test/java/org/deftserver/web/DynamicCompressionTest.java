@@ -19,7 +19,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.GZIPInputStream;
 
-import org.deftserver.io.IOLoop;
 import org.deftserver.web.handler.RequestHandler;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -71,23 +70,16 @@ public class DynamicCompressionTest {
 		
 		server = new HttpServer(new Application(reqHandlers));
 		
-		Thread.ofPlatform().start(() -> {
-			try {
-				server.listen(PORT);
-				IOLoop.INSTANCE.start();
-			} catch (Exception e) {
-				e.printStackTrace();
-			}
-		});
+		server.bind(PORT);
+		server.start(1); // dedicated IOLoop, isolated from the shared IOLoop.INSTANCE
 		
 		// Wait a brief moment for the loop to boot
-		Thread.sleep(200);
+		TestServerSupport.awaitListening(PORT);
 	}
 
 	@AfterClass
 	public static void tearDown() throws Exception {
 		server.stop();
-		IOLoop.INSTANCE.stop();
 		// Wait brief moment for cleanup
 		Thread.sleep(100);
 	}
@@ -203,7 +195,7 @@ public class DynamicCompressionTest {
 			"Accept-Encoding: gzip\r\n" +
 			"Connection: close\r\n\r\n");
 		assertTrue(first.startsWith("HTTP/1.1 200"));
-		int etagIdx = first.indexOf("Etag: ");
+		int etagIdx = first.indexOf("ETag: ");
 		assertTrue("expected an Etag header:\n" + first.substring(0, Math.min(300, first.length())), etagIdx != -1);
 		String etag = first.substring(etagIdx + 6, first.indexOf("\r\n", etagIdx)).trim();
 
@@ -222,6 +214,19 @@ public class DynamicCompressionTest {
 		assertFalse("304 must not carry Content-Encoding:\n" + second, second.contains("Content-Encoding:"));
 		int bodyStart = second.indexOf("\r\n\r\n") + 4;
 		assertEquals("304 must have an empty body", bodyStart, second.length());
+	}
+
+	@Test
+	public void testHttp10ClientDoesNotGetChunkedGzip() throws Exception {
+		// HTTP/1.0 has no chunked transfer-encoding, so a 1.0 client must receive an identity,
+		// Content-Length response even when it sends Accept-Encoding: gzip.
+		String resp = rawRequest(
+			"GET /compress HTTP/1.0\r\nHost: localhost\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n");
+		assertTrue("expected 200, got: " + resp.substring(0, Math.min(40, resp.length())),
+			resp.startsWith("HTTP/1.1 200"));
+		assertFalse("HTTP/1.0 response must not be chunked", resp.contains("Transfer-Encoding: chunked"));
+		assertFalse("HTTP/1.0 response must not be gzipped", resp.contains("Content-Encoding: gzip"));
+		assertTrue("HTTP/1.0 response must have a Content-Length", resp.contains("Content-Length: "));
 	}
 
 	private String rawRequest(String request) throws IOException {

@@ -13,4 +13,12 @@ public interface IOHandler {
 	void handleConnect(SelectionKey key) throws IOException;
 	void handleRead(SelectionKey key)    throws IOException;
 	void handleWrite(SelectionKey key)   throws IOException;
+
+	/**
+	 * Invoked by the {@code IOLoop} when it closes a channel owned by this handler outside the
+	 * handler's own code paths (e.g. on an I/O exception or a cancelled key). Lets the handler
+	 * release any per-channel state it keeps so nothing leaks when the loop tears a channel down.
+	 * Default: no-op.
+	 */
+	default void onClose(java.nio.channels.SelectableChannel channel) { }
 }

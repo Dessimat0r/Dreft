@@ -1,6 +1,7 @@
 package org.deftserver.web;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
@@ -56,6 +57,11 @@ import java.net.http.HttpResponse.BodyHandlers;
 public class DeftSystemTest {
 
 	private static int PORT;
+	// Held so @AfterClass can close the listening socket. Without this, the ServerSocketChannel
+	// stays bound and registered on the shared IOLoop.INSTANCE selector after this class finishes,
+	// leaking into subsequent test classes that reuse the singleton (a source of full-suite
+	// cross-class flakiness).
+	private static HttpServer httpServer;
 
 	public static final String expectedPayload = "hello test";
 
@@ -164,6 +170,15 @@ public class DeftSystemTest {
 		@Override
 		public void get(org.deftserver.web.http.HttpRequest request, org.deftserver.web.http.HttpResponse response) {
 			throw new HttpException(500, "exception message");
+		}
+	}
+
+	/** An async handler that never finishes its response — must be bounded by the processing timeout. */
+	private static class HangingAsyncRequestHandler extends RequestHandler {
+		@Asynchronous
+		@Override
+		public void get(org.deftserver.web.http.HttpRequest request, org.deftserver.web.http.HttpResponse response) {
+			// Intentionally never calls response.finish().
 		}
 	}
 
@@ -315,6 +330,7 @@ public class DeftSystemTest {
 		reqHandlers.put("/capturing/([0-9]+)", new CapturingRequestRequestHandler());
 		reqHandlers.put("/throw", new ThrowingHttpExceptionRequestHandler());
 		reqHandlers.put("/async_throw", new AsyncThrowingHttpExceptionRequestHandler());
+		reqHandlers.put("/async_hang", new HangingAsyncRequestHandler());
 		reqHandlers.put("/no_body", new NoBodyRequestHandler());
 		reqHandlers.put("/moved_perm", new MovedPermanentlyRequestHandler());
 		reqHandlers.put("/static_file_handler", new UserDefinedStaticContentHandler());
@@ -331,14 +347,63 @@ public class DeftSystemTest {
 			}
 		});
 
+		reqHandlers.put("/lastmod", new RequestHandler() {
+			@Override
+			public void get(org.deftserver.web.http.HttpRequest request, org.deftserver.web.http.HttpResponse response) {
+				// Fixed Last-Modified so conditional-precedence tests are deterministic (correct
+				// day-of-week: 2021-01-01 was a Friday — java.time RFC_1123 validates the name).
+				response.setHeader("Last-Modified", "Fri, 01 Jan 2021 00:00:00 GMT");
+				response.setHeader("Content-Type", "text/plain; charset=utf-8");
+				response.write("ok");
+			}
+		});
+
+		reqHandlers.put("/largeclose", new RequestHandler() {
+			@Override
+			public void get(org.deftserver.web.http.HttpRequest request, org.deftserver.web.http.HttpResponse response) {
+				// Large body + Connection: close. The body is big enough to (usually) defer the
+				// write to OP_WRITE; the connection must still close once the deferred write
+				// completes rather than being re-registered for read (P41).
+				response.setHeader("Connection", "close");
+				response.setHeader("Content-Type", "text/plain; charset=utf-8");
+				StringBuilder sb = new StringBuilder(1_000_000);
+				for (int i = 0; i < 1_000_000; i++) sb.append('x');
+				response.write(sb.toString());
+			}
+		});
+
+		reqHandlers.put("/preencoded", new RequestHandler() {
+			@Override
+			public void get(org.deftserver.web.http.HttpRequest request, org.deftserver.web.http.HttpResponse response) {
+				// Handler pre-compressed the body and declared it. The framework must NOT gzip again
+				// (double-encoding would corrupt it), even though the type is gzippable text.
+				response.setHeader("Content-Type", "text/plain; charset=utf-8");
+				response.setHeader("Content-Encoding", "gzip");
+				response.write("already-encoded-bytes");
+			}
+		});
+
+		reqHandlers.put("/partial206", new RequestHandler() {
+			@Override
+			public void get(org.deftserver.web.http.HttpRequest request, org.deftserver.web.http.HttpResponse response) {
+				// A handler that emits 206 Partial Content with a text body; must NOT be gzipped
+				// (re-encoding would invalidate the byte range / Content-Range).
+				response.setStatusCode(206);
+				response.setHeader("Content-Type", "text/plain; charset=utf-8");
+				response.setHeader("Content-Range", "bytes 0-4/10");
+				response.write("Hello");
+			}
+		});
+
 		final Application application = new Application(reqHandlers);
 		application.setStaticContentDir("src/test/resources");
 
 		// start deft instance from a new thread because the start invocation is blocking 
 		// (invoking thread will be I/O loop thread)
+		httpServer = new HttpServer(application);
 		Thread.ofPlatform().name("I/O-LOOP").start(() -> {
 			try {
-				new HttpServer(application).listen(PORT);
+				httpServer.listen(PORT);
 			} catch (IOException e) {
 				throw new RuntimeException(e);
 			}
@@ -372,7 +437,16 @@ public class DeftSystemTest {
 	
 	@AfterClass
 	public static void tearDown() throws InterruptedException {
-		IOLoop.INSTANCE.addCallback(new AsyncCallback() { @Override public void onCallback() { IOLoop.INSTANCE.stop(); }});
+		// Close the listening socket so the ServerSocketChannel is unbound and its key cancelled —
+		// otherwise it leaks into the shared IOLoop.INSTANCE and the next test class inherits a
+		// stale, still-bound server channel. This matches the canonical teardown used by every
+		// other server-starting test class (server.stop() only). We deliberately do NOT call
+		// IOLoop.INSTANCE.stop(): the singleton loop is shared across all test classes in the same
+		// JVM (forkCount=1, reuseForks=true), and stopping it mid-suite disrupts classes that run
+		// afterwards (their already-issued start() is a no-op on an already-running loop).
+		if (httpServer != null) {
+			httpServer.stop();
+		}
 		Thread.sleep(20);
 		org.deftserver.io.AsynchronousSocket.setDnsResolver(java.net.InetSocketAddress::new);
 	}
@@ -661,8 +735,9 @@ public class DeftSystemTest {
 		assertEquals(500, response.getStatusLine().getStatusCode());
 		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
 		assertEquals("Internal Server Error", response.getStatusLine().getReasonPhrase());
-		// text/plain body is gzipped, which now also emits Vary: Accept-Encoding (7 headers).
-		assertEquals(7, response.getAllHeaders().length);
+		// text/plain body is gzipped (Vary: Accept-Encoding) and the error path emits X-Content-Type-Options: nosniff (8 headers).
+		assertEquals(8, response.getAllHeaders().length);
+		assertEquals("nosniff", response.getFirstHeader("X-Content-Type-Options").getValue());
 		assertTrue(response.getFirstHeader("Vary").getValue().toLowerCase().contains("accept-encoding"));
 		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
 		assertEquals("exception message", payLoad);
@@ -678,8 +753,9 @@ public class DeftSystemTest {
 		assertEquals(500, response.getStatusLine().getStatusCode());
 		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
 		assertEquals("Internal Server Error", response.getStatusLine().getReasonPhrase());
-		// text/plain body is gzipped, which now also emits Vary: Accept-Encoding (7 headers).
-		assertEquals(7, response.getAllHeaders().length);
+		// text/plain body is gzipped (Vary: Accept-Encoding) and the error path emits X-Content-Type-Options: nosniff (8 headers).
+		assertEquals(8, response.getAllHeaders().length);
+		assertEquals("nosniff", response.getFirstHeader("X-Content-Type-Options").getValue());
 		assertTrue(response.getFirstHeader("Vary").getValue().toLowerCase().contains("accept-encoding"));
 		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
 		assertEquals("exception message", payLoad);
@@ -696,6 +772,8 @@ public class DeftSystemTest {
 		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
 		assertEquals("OK", response.getStatusLine().getReasonPhrase());
 		assertEquals(9, response.getAllHeaders().length);
+		// Content-Type is resolved extension-first (.txt → text/plain) with a UTF-8 charset appended.
+		assertEquals("text/plain; charset=utf-8", response.getFirstHeader("Content-Type").getValue());
 		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
 		assertEquals("test.txt", payLoad);
 	}
@@ -1155,6 +1233,47 @@ public class DeftSystemTest {
 	}
 	
 	@Test
+	public void asyncClientMalformedContentLengthInvokesOnFailureTest() throws Exception {
+		// A server that returns a non-numeric Content-Length must surface as onFailure on the async
+		// client, not a silent hang (the parse used to throw an uncaught NumberFormatException that
+		// dropped the channel without notifying the caller).
+		final java.net.ServerSocket raw = new java.net.ServerSocket(0);
+		final int rawPort = raw.getLocalPort();
+		Thread server = new Thread(() -> {
+			try (Socket s = raw.accept()) {
+				InputStream in = s.getInputStream();
+				byte[] buf = new byte[4096];
+				in.read(buf); // consume the request (best-effort)
+				s.getOutputStream().write(
+					("HTTP/1.1 200 OK\r\nContent-Length: notanumber\r\n\r\n")
+						.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+				s.getOutputStream().flush();
+				Thread.sleep(200); // give the client time to read before we close
+			} catch (Exception ignore) {
+				// test thread teardown
+			}
+		});
+		server.setDaemon(true);
+		server.start();
+
+		final CountDownLatch latch = new CountDownLatch(1);
+		final AsynchronousHttpClient http = new AsynchronousHttpClient();
+		final AsyncResult<org.deftserver.web.http.client.Response> cb =
+			new AsyncResult<org.deftserver.web.http.client.Response>() {
+				public void onSuccess(org.deftserver.web.http.client.Response r) { http.close(); }
+				public void onFailure(Throwable e) { latch.countDown(); http.close(); }
+			};
+		final String url = "http://localhost:" + rawPort + "/";
+		IOLoop.INSTANCE.addCallback(new AsyncCallback() { public void onCallback() { http.fetch(url, cb); }});
+		try {
+			assertTrue("async client must invoke onFailure on malformed Content-Length",
+				latch.await(5, TimeUnit.SECONDS));
+		} finally {
+			raw.close();
+		}
+	}
+
+	@Test
 	public void AsynchronousHttpClientConnectionFailedTest() throws InterruptedException, IOException {
 		final CountDownLatch latch = new CountDownLatch(1);
 		final String url = "http://localhost:" + freePort() + "/";
@@ -1352,6 +1471,91 @@ public class DeftSystemTest {
 			String finalResponse = new String(buffer, 0, read, java.nio.charset.StandardCharsets.ISO_8859_1);
 			assertTrue(finalResponse.contains("HTTP/1.1 200"));
 		}
+	}
+
+	@Test
+	public void unrecognizedExpectationReturns417Test() throws IOException {
+		// RFC 9110 §10.1.1: an Expect value the server can't meet (anything other than
+		// 100-continue) must not be silently ignored — that would leave a client withholding its
+		// body waiting forever. The server replies 417 Expectation Failed.
+		String response = sendRawRequest(
+			"POST /post HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Expect: 102-processing\r\n" +
+			"Content-Length: 4\r\n\r\n"
+		);
+		assertTrue("unrecognized Expect must yield 417, got: " + response,
+			response.startsWith("HTTP/1.1 417"));
+	}
+
+	@Test
+	public void http10ExpectHeaderIsIgnoredNot417Test() throws IOException {
+		// An HTTP/1.0 client doesn't understand interim responses; its Expect must be ignored
+		// entirely (no 100, and crucially no 417 either — that would break the request).
+		String response = sendRawRequest(
+			"POST /post HTTP/1.0\r\n" +
+			"Host: localhost\r\n" +
+			"Expect: 100-continue\r\n" +
+			"Content-Length: 4\r\n\r\n" +
+			"body"
+		);
+		assertTrue("HTTP/1.0 Expect must be ignored (no 417), got: " + response,
+			response.startsWith("HTTP/1.1 200") || response.startsWith("HTTP/1.0 200"));
+	}
+
+	@Test
+	public void staticFileIfMatchAndIfUnmodifiedSinceTest() throws IOException {
+		// Fetch the static file's current strong ETag.
+		String first = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+		assertTrue(first.startsWith("HTTP/1.1 200"));
+		int etIdx = first.toLowerCase(java.util.Locale.ROOT).indexOf("etag: ");
+		assertTrue("static response must carry an ETag", etIdx != -1);
+		String etag = first.substring(etIdx + 6, first.indexOf("\r\n", etIdx)).trim();
+
+		// If-Match with a non-matching tag → 412 Precondition Failed (RFC 9110 §13.1.1).
+		String ifMatchFail = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\nHost: localhost\r\n" +
+			"If-Match: \"nopenope\"\r\nConnection: close\r\n\r\n");
+		assertTrue("failing If-Match must be 412, got: " + ifMatchFail.substring(0, Math.min(40, ifMatchFail.length())),
+			ifMatchFail.startsWith("HTTP/1.1 412"));
+
+		// If-Match with the current tag → 200 OK (precondition passes).
+		String ifMatchOk = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\nHost: localhost\r\n" +
+			"If-Match: " + etag + "\r\nConnection: close\r\n\r\n");
+		assertTrue("matching If-Match must be 200, got: " + ifMatchOk.substring(0, Math.min(40, ifMatchOk.length())),
+			ifMatchOk.startsWith("HTTP/1.1 200"));
+
+		// If-Unmodified-Since in the distant past → the file was modified after it → 412.
+		String ius = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\nHost: localhost\r\n" +
+			"If-Unmodified-Since: Mon, 01 Jan 1990 00:00:00 GMT\r\nConnection: close\r\n\r\n");
+		assertTrue("If-Unmodified-Since in the past must be 412, got: " + ius.substring(0, Math.min(40, ius.length())),
+			ius.startsWith("HTTP/1.1 412"));
+	}
+
+	@Test
+	public void conditionalPrecedenceIfMatchBeatsIfNoneMatchTest() throws IOException {
+		// RFC 9110 §13.2.2 mandates If-Match be evaluated BEFORE If-None-Match. First fetch the
+		// resource's current ETag, then send If-Match with a WRONG tag + If-None-Match with the
+		// CURRENT tag. If-Match fails (current != wrong) so the correct result is 412 — NOT the 304
+		// that an If-None-Match-first evaluation would (incorrectly) produce.
+		String first = sendRawRequest("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+		assertTrue(first.startsWith("HTTP/1.1 200"));
+		int etIdx = first.indexOf("ETag: ");
+		assertTrue("response must carry an ETag", etIdx != -1);
+		String etag = first.substring(etIdx + 6, first.indexOf("\r\n", etIdx)).trim();
+
+		String resp = sendRawRequest(
+			"GET / HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"If-Match: \"deadbeefwrongtag\"\r\n" +
+			"If-None-Match: " + etag + "\r\n" +
+			"Connection: close\r\n\r\n");
+		assertTrue("If-Match (failing) must take precedence over If-None-Match -> 412, got: "
+			+ (resp.length() > 40 ? resp.substring(0, 40) : resp),
+			resp.startsWith("HTTP/1.1 412"));
 	}
 
 	@Test
@@ -1560,6 +1764,40 @@ public class DeftSystemTest {
 	}
 
 	@Test
+	public void oversizedContentLengthReturns413Test() throws IOException {
+		// A Content-Length above the 16 MiB body cap must be 413 Payload Too Large, not 400.
+		long tooBig = (16L * 1024 * 1024) + 1;
+		String response = sendRawRequest(
+			"POST /post HTTP/1.1\r\nHost: localhost\r\n" +
+			"Content-Length: " + tooBig + "\r\nConnection: close\r\n\r\n");
+		assertTrue("expected 413, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 413"));
+	}
+
+	@Test
+	public void uriTooLongReturns414Test() throws IOException {
+		// A request-target longer than the request-line limit must be 414 (URI Too Long), not 400.
+		String longPath = "/" + "a".repeat(9000); // > MAX_REQUEST_LINE_SIZE (8192)
+		String response = sendRawRequest(
+			"GET " + longPath + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+		assertTrue("expected 414, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 414"));
+	}
+
+	@Test
+	public void tooManyHeadersReturns431Test() throws IOException {
+		// Exceeding the header-count limit is 431 (Request Header Fields Too Large), not 400.
+		StringBuilder sb = new StringBuilder("GET / HTTP/1.1\r\nHost: localhost\r\n");
+		for (int i = 0; i < 150; i++) {
+			sb.append("X-H").append(i).append(": v\r\n");
+		}
+		sb.append("Connection: close\r\n\r\n");
+		String response = sendRawRequest(sb.toString());
+		assertTrue("expected 431, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 431"));
+	}
+
+	@Test
 	public void oversizedHeaderBlockReturns431Test() throws IOException {
 		// Header block exceeding the 64 KiB cap must be rejected with 431, not a crash/hang.
 		String big = "a".repeat(70000);
@@ -1604,12 +1842,10 @@ public class DeftSystemTest {
 
 	@Test
 	public void pipelinedRequestsCloseConnectionTest() throws IOException {
-		// Two pipelined requests: the server answers the first and closes (RFC-compliant for a
-		// non-pipelining server) rather than discarding the second and leaving the client hung.
 		try (Socket socket = new Socket("localhost", PORT)) {
 			socket.setSoTimeout(3000);
 			String two = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n" +
-			             "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+			             "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 			socket.getOutputStream().write(two.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
 			socket.getOutputStream().flush();
 			java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
@@ -1620,11 +1856,132 @@ public class DeftSystemTest {
 				out.write(buf, 0, n);
 			}
 			String resp = out.toString(java.nio.charset.StandardCharsets.ISO_8859_1);
-			assertTrue("first response should be 200, got: " + resp.substring(0, Math.min(40, resp.length())),
-				resp.startsWith("HTTP/1.1 200"));
-			assertTrue("response must declare Connection: Close:\n" + resp, resp.contains("Connection: Close"));
-			// Exactly one response — the second pipelined request must NOT be answered (server closed).
-			assertEquals("server must not pipeline a second response", -1, resp.indexOf("HTTP/1.1", 1));
+			assertTrue(resp.startsWith("HTTP/1.1 200"));
+			assertTrue(resp.contains("Connection: close") || resp.contains("Connection: Close"));
+			int firstHttp = resp.indexOf("HTTP/1.1");
+			int secondHttp = resp.indexOf("HTTP/1.1", firstHttp + 8);
+			assertTrue(secondHttp > 0);
+			int thirdHttp = resp.indexOf("HTTP/1.1", secondHttp + 8);
+			assertEquals(-1, thirdHttp);
+		}
+	}
+
+	/**
+	 * Reads exactly one HTTP response (status line + headers + Content-Length body) from a
+	 * persistent connection's input stream, leaving the stream positioned at the start of the
+	 * next response. Used by {@link #serialKeepAliveReuseTest} to verify per-request framing on
+	 * a reused keep-alive connection.
+	 */
+	private static String readOneResponse(InputStream is) throws IOException {
+		java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+		// Read until end of header block (CRLFCRLF).
+		int headerEnd = -1;
+		while (headerEnd == -1) {
+			int b = is.read();
+			if (b == -1) throw new java.io.EOFException("stream closed before header end");
+			out.write(b);
+			byte[] cur = out.toByteArray();
+			if (cur.length >= 4 && cur[cur.length - 4] == '\r' && cur[cur.length - 3] == '\n'
+					&& cur[cur.length - 2] == '\r' && cur[cur.length - 1] == '\n') {
+				headerEnd = cur.length;
+			}
+		}
+		String head = out.toString(java.nio.charset.StandardCharsets.ISO_8859_1);
+		int cl = 0;
+		int idx = head.toLowerCase(java.util.Locale.ROOT).indexOf("content-length:");
+		if (idx != -1) {
+			int eol = head.indexOf("\r\n", idx);
+			cl = Integer.parseInt(head.substring(idx + 15, eol).trim());
+		}
+		// Read exactly Content-Length body bytes.
+		for (int i = 0; i < cl; i++) {
+			int b = is.read();
+			if (b == -1) throw new java.io.EOFException("stream closed mid-body");
+			out.write(b);
+		}
+		return out.toString(java.nio.charset.StandardCharsets.ISO_8859_1);
+	}
+
+	@Test
+	public void serialKeepAliveReuseTest() throws IOException {
+		// Hammer a single keep-alive connection with many serial requests of varying shape and
+		// body size, reading each response fully before sending the next. This exercises the
+		// per-request buffer reset (getHttpRequest compact + fresh of()) and proves the body
+		// offset is recomputed correctly every time — a reused connection must never bleed one
+		// request's bytes into another's body, nor mis-frame a response.
+		try (Socket socket = new Socket("localhost", PORT)) {
+			socket.setSoTimeout(5000);
+			java.io.OutputStream os = socket.getOutputStream();
+			InputStream is = socket.getInputStream();
+			for (int i = 0; i < 50; i++) {
+				if (i % 2 == 0) {
+					// Variable-size POST /echo — body grows so a stale offset/length would misframe.
+					StringBuilder body = new StringBuilder();
+					// ASCII body so the request-decode (ISO-8859-1) / response-encode (UTF-8) round
+					// trip is byte-identical; this test targets framing/buffer-reset, not charset.
+					for (int j = 0; j <= i; j++) body.append("ab").append(j);
+					byte[] bodyBytes = body.toString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+					String req = "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: "
+						+ bodyBytes.length + "\r\n\r\n";
+					os.write(req.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+					os.write(bodyBytes);
+					os.flush();
+					String resp = readOneResponse(is);
+					assertTrue("iter " + i + " expected 200, got:\n" + resp, resp.startsWith("HTTP/1.1 200"));
+					int bs = resp.indexOf("\r\n\r\n") + 4;
+					String echoed = resp.substring(bs);
+					assertEquals("iter " + i + " echoed body must equal request body",
+						body.toString(), echoed);
+				} else {
+					// Simple GET / between POSTs to vary request shape on the reused connection.
+					String req = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+					os.write(req.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+					os.flush();
+					String resp = readOneResponse(is);
+					assertTrue("iter " + i + " GET expected 200, got:\n"
+						+ resp.substring(0, Math.min(40, resp.length())), resp.startsWith("HTTP/1.1 200"));
+				}
+			}
+		}
+	}
+
+	@Test
+	public void largeFileChunkedStreamingTest() throws Exception {
+		// Force the multi-window chunked path with a tiny window and verify the served bytes match
+		// the file exactly (this exercises the >2 GiB-class code path with a small fixture).
+		int original = org.deftserver.web.http.HttpProtocol.FILE_WINDOW_SIZE;
+		org.deftserver.web.http.HttpProtocol.FILE_WINDOW_SIZE = 4096;
+		try {
+			java.io.File f = new java.io.File("src/test/resources/n792205362_2067.jpg");
+			byte[] expected = java.nio.file.Files.readAllBytes(f.toPath());
+			org.junit.Assert.assertTrue("fixture must exceed the window", expected.length > 4096);
+			try (Socket socket = new Socket("localhost", PORT)) {
+				socket.setSoTimeout(5000);
+				socket.getOutputStream().write(
+					"GET /src/test/resources/n792205362_2067.jpg HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+						.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+				socket.getOutputStream().flush();
+				java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+				byte[] buf = new byte[8192];
+				int n;
+				while ((n = socket.getInputStream().read(buf)) != -1) {
+					out.write(buf, 0, n);
+				}
+				byte[] resp = out.toByteArray();
+				byte[] sep = "\r\n\r\n".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+				int bodyStart = -1;
+				for (int i = 0; i + 4 <= resp.length; i++) {
+					if (resp[i] == sep[0] && resp[i + 1] == sep[1] && resp[i + 2] == sep[2] && resp[i + 3] == sep[3]) {
+						bodyStart = i + 4;
+						break;
+					}
+				}
+				org.junit.Assert.assertTrue("response header terminator found", bodyStart != -1);
+				byte[] body = java.util.Arrays.copyOfRange(resp, bodyStart, resp.length);
+				org.junit.Assert.assertArrayEquals("chunked-streamed body must equal the file", expected, body);
+			}
+		} finally {
+			org.deftserver.web.http.HttpProtocol.FILE_WINDOW_SIZE = original;
 		}
 	}
 
@@ -1639,6 +1996,20 @@ public class DeftSystemTest {
 		assertTrue("expected 204 for OPTIONS *, got: " + response.substring(0, Math.min(40, response.length())),
 			response.startsWith("HTTP/1.1 204"));
 		assertTrue("expected Allow header:\n" + response, response.contains("Allow: "));
+	}
+
+	@Test
+	public void notFoundEscapesReflectedPathTest() throws IOException {
+		// Reflected-XSS defence: an attacker-controlled path reflected into the 404 body must be
+		// HTML-escaped, and the response must declare a content type + nosniff so it can't be
+		// MIME-sniffed and executed as HTML.
+		String response = sendRawRequest(
+			"GET /%3Cscript%3Ealert(1)%3C/script%3E HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+		assertTrue("expected 404, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 404"));
+		assertFalse("404 body must not reflect a raw <script> tag:\n" + response, response.contains("<script>"));
+		assertTrue("path should be HTML-escaped:\n" + response, response.contains("&lt;script&gt;"));
+		assertTrue("nosniff header expected:\n" + response, response.contains("X-Content-Type-Options: nosniff"));
 	}
 
 	@Test
@@ -1678,6 +2049,352 @@ public class DeftSystemTest {
 		);
 		assertTrue("expected 400 for control char in value, got: " + response.substring(0, Math.min(40, response.length())),
 			response.startsWith("HTTP/1.1 400"));
+	}
+
+	@Test
+	public void transferEncodingChunkedNotFinalRejectedTest() throws IOException {
+		// RFC 9112 §6.3: chunked must be the FINAL coding; otherwise the length is ambiguous
+		// (request-smuggling hazard) and the request must be rejected.
+		String notFinal = sendRawRequest(
+			"POST /post HTTP/1.1\r\nHost: localhost\r\n" +
+			"Transfer-Encoding: chunked, gzip\r\nConnection: close\r\n\r\n");
+		assertTrue("chunked-not-final must be 400, got: " + notFinal.substring(0, Math.min(40, notFinal.length())),
+			notFinal.startsWith("HTTP/1.1 400"));
+
+		// Transfer-Encoding present but no chunked at all → length undeterminable → 400.
+		String noChunked = sendRawRequest(
+			"POST /post HTTP/1.1\r\nHost: localhost\r\n" +
+			"Transfer-Encoding: gzip\r\nConnection: close\r\n\r\n");
+		assertTrue("non-chunked TE must be 400, got: " + noChunked.substring(0, Math.min(40, noChunked.length())),
+			noChunked.startsWith("HTTP/1.1 400"));
+	}
+
+	@Test
+	public void knownMethodUnimplementedReturns405WithAllowTest() throws IOException {
+		// "/" (ExampleRequestHandler) implements only GET. A POST is a *known* method the resource
+		// doesn't support → 405 Method Not Allowed with an Allow header (RFC 9110 §15.5.6), not 501.
+		String response = sendRawRequest(
+			"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+		assertTrue("expected 405, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 405"));
+		assertTrue("405 must carry Allow listing GET:\n" + response,
+			response.contains("Allow: ") && response.contains("GET"));
+	}
+
+	@Test
+	public void optionsOnResourceSynthesizes204WithAllowTest() throws IOException {
+		// An OPTIONS to a resource that doesn't override options() is answered with 204 + Allow
+		// describing the supported methods (RFC 9110 §9.3.7), rather than 501.
+		String response = sendRawRequest(
+			"OPTIONS / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+		assertTrue("expected 204, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 204"));
+		assertTrue("OPTIONS must carry Allow listing GET, HEAD, OPTIONS:\n" + response,
+			response.contains("Allow: ") && response.contains("GET") && response.contains("HEAD")
+			&& response.contains("OPTIONS"));
+	}
+
+	@Test
+	public void unknownMethodStillReturns501Test() throws IOException {
+		// A genuinely unrecognised method (not in HttpVerb) remains 501 Not Implemented — 405 is
+		// only for *known* methods unsupported by the resource.
+		String response = sendRawRequest(
+			"FROBNICATE / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+		assertTrue("expected 501, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 501"));
+	}
+
+	@Test
+	public void ifUnmodifiedSinceIgnoredWhenIfMatchPresentTest() throws IOException {
+		// RFC 9110 §13.2.2: If-Unmodified-Since MUST be ignored when If-Match is present. The
+		// resource's Last-Modified (2025) is after the stale If-Unmodified-Since (2020), so a naive
+		// evaluation would 412 — but If-Match: * satisfies the precondition, so we must get 200.
+		String withIfMatch = sendRawRequest(
+			"GET /lastmod HTTP/1.1\r\nHost: localhost\r\n" +
+			"If-Match: *\r\n" +
+			"If-Unmodified-Since: Wed, 21 Oct 2020 07:28:00 GMT\r\nConnection: close\r\n\r\n");
+		assertTrue("If-Match present must ignore stale If-Unmodified-Since (expect 200), got: "
+			+ withIfMatch.substring(0, Math.min(40, withIfMatch.length())),
+			withIfMatch.startsWith("HTTP/1.1 200"));
+
+		// Sanity: without If-Match, the stale If-Unmodified-Since IS evaluated → 412.
+		String withoutIfMatch = sendRawRequest(
+			"GET /lastmod HTTP/1.1\r\nHost: localhost\r\n" +
+			"If-Unmodified-Since: Wed, 21 Oct 2020 07:28:00 GMT\r\nConnection: close\r\n\r\n");
+		assertTrue("stale If-Unmodified-Since alone must be 412, got: "
+			+ withoutIfMatch.substring(0, Math.min(40, withoutIfMatch.length())),
+			withoutIfMatch.startsWith("HTTP/1.1 412"));
+	}
+
+	private static String writeAndReadOneKeepAliveResponse(java.io.OutputStream os, InputStream is, String request) throws IOException {
+		os.write(request.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+		os.flush();
+		StringBuilder sb = new StringBuilder();
+		int headerEnd = -1;
+		// read until end of headers
+		while (headerEnd == -1) {
+			int b = is.read();
+			if (b == -1) break;
+			sb.append((char) b);
+			if (sb.length() >= 4 && sb.substring(sb.length() - 4).equals("\r\n\r\n")) {
+				headerEnd = sb.length();
+			}
+		}
+		// parse Content-Length and consume the body so the stream is positioned at the next response
+		String headers = sb.toString();
+		int clIdx = headers.toLowerCase(java.util.Locale.ROOT).indexOf("content-length:");
+		if (clIdx != -1) {
+			int eol = headers.indexOf("\r\n", clIdx);
+			int cl = Integer.parseInt(headers.substring(clIdx + 15, eol).trim());
+			for (int i = 0; i < cl; i++) {
+				int b = is.read();
+				if (b == -1) break;
+				sb.append((char) b);
+			}
+		}
+		return sb.toString();
+	}
+
+	@Test
+	public void maxKeepAliveRequestsForcesCloseTest() throws IOException {
+		// A keep-alive connection must be gracefully closed once it has served MAX_KEEP_ALIVE_REQUESTS
+		// requests (bounds per-connection resource use / monopolisation).
+		int original = org.deftserver.web.http.HttpProtocol.MAX_KEEP_ALIVE_REQUESTS;
+		org.deftserver.web.http.HttpProtocol.MAX_KEEP_ALIVE_REQUESTS = 2;
+		try (Socket socket = new Socket("localhost", PORT)) {
+			socket.setSoTimeout(5000);
+			java.io.OutputStream os = socket.getOutputStream();
+			InputStream is = socket.getInputStream();
+			String r1 = writeAndReadOneKeepAliveResponse(os, is,
+				"GET /lastmod HTTP/1.1\r\nHost: localhost\r\n\r\n");
+			assertTrue("request 1 should keep the connection alive:\n" + r1,
+				r1.toLowerCase(java.util.Locale.ROOT).contains("connection: keep-alive"));
+			String r2 = writeAndReadOneKeepAliveResponse(os, is,
+				"GET /lastmod HTTP/1.1\r\nHost: localhost\r\n\r\n");
+			assertTrue("request 2 (at the cap) must signal close:\n" + r2,
+				r2.toLowerCase(java.util.Locale.ROOT).contains("connection: close"));
+		} finally {
+			org.deftserver.web.http.HttpProtocol.MAX_KEEP_ALIVE_REQUESTS = original;
+		}
+	}
+
+	@Test
+	public void deferredConnectionCloseResponseClosesConnectionTest() throws IOException {
+		// A keep-alive HTTP/1.1 *request* arms the keep-alive timeout, but the *response* declares
+		// Connection: close with a body large enough to defer the write to OP_WRITE. Once that
+		// deferred write completes the server must CLOSE the connection (honouring its own header),
+		// not re-register for read (which — with the keep-alive timeout present — would leave the
+		// client hanging). We detect the close as EOF after the full body (P41).
+		try (Socket socket = new Socket("localhost", PORT)) {
+			socket.setSoTimeout(8000);
+			socket.getOutputStream().write(
+				"GET /largeclose HTTP/1.1\r\nHost: localhost\r\n\r\n".getBytes(
+					java.nio.charset.StandardCharsets.ISO_8859_1));
+			socket.getOutputStream().flush();
+			InputStream is = socket.getInputStream();
+			byte[] buf = new byte[65536];
+			long total = 0;
+			int n;
+			boolean eof = false;
+			// Read to EOF. If the server wrongly kept the connection open, this would block past the
+			// body and the 8s SO-timeout would fire (failing the test) instead of returning -1.
+			while ((n = is.read(buf)) != -1) {
+				total += n;
+			}
+			eof = true;
+			assertTrue("connection must reach EOF (server closed it)", eof);
+			// headers + ~1,000,000-byte body
+			assertTrue("expected the full large body, got only " + total + " bytes", total > 1_000_000);
+		}
+	}
+
+	@Test
+	public void hungAsyncHandlerIsBoundedByProcessingTimeoutTest() throws IOException {
+		long original = org.deftserver.web.http.HttpProtocol.REQUEST_PROCESSING_TIMEOUT_MS;
+		org.deftserver.web.http.HttpProtocol.REQUEST_PROCESSING_TIMEOUT_MS = 400;
+		try {
+			// Connection: close — no keep-alive timeout, so the standalone processing timeout must
+			// bound the hung async handler (and send a best-effort 408) rather than leaking forever.
+			try (Socket socket = new Socket("localhost", PORT)) {
+				socket.setSoTimeout(5000);
+				socket.getOutputStream().write(
+					"GET /async_hang HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".getBytes(
+						java.nio.charset.StandardCharsets.ISO_8859_1));
+				socket.getOutputStream().flush();
+				InputStream is = socket.getInputStream();
+				byte[] buf = new byte[256];
+				int n = is.read(buf); // blocks until the processing timeout fires (~400ms), not forever
+				String resp = n > 0 ? new String(buf, 0, n, java.nio.charset.StandardCharsets.ISO_8859_1) : "";
+				assertTrue("hung async (close) must be timed out with 408, got: " + resp,
+					resp.startsWith("HTTP/1.1 408"));
+			}
+			// Keep-alive — the (extended) keep-alive timer bounds it; the connection must reach EOF
+			// rather than hang.
+			try (Socket socket = new Socket("localhost", PORT)) {
+				socket.setSoTimeout(5000);
+				socket.getOutputStream().write(
+					"GET /async_hang HTTP/1.1\r\nHost: localhost\r\n\r\n".getBytes(
+						java.nio.charset.StandardCharsets.ISO_8859_1));
+				socket.getOutputStream().flush();
+				InputStream is = socket.getInputStream();
+				// Drain to EOF — the server must close the hung connection, not block past SO timeout.
+				byte[] buf = new byte[256];
+				while (is.read(buf) != -1) { /* until close */ }
+			}
+		} finally {
+			org.deftserver.web.http.HttpProtocol.REQUEST_PROCESSING_TIMEOUT_MS = original;
+		}
+	}
+
+	@Test
+	public void preEncodedResponseNotDoubleGzippedTest() throws IOException {
+		// A handler that already set Content-Encoding must not be re-gzipped by the framework.
+		String response = sendRawRequest(
+			"GET /preencoded HTTP/1.1\r\nHost: localhost\r\n" +
+			"Accept-Encoding: gzip\r\nConnection: close\r\n\r\n");
+		assertTrue("expected 200, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 200"));
+		// Exactly one Content-Encoding: gzip (the handler's), and the body sent identity (not chunked
+		// by the framework's gzip path).
+		int firstCE = response.indexOf("Content-Encoding: gzip");
+		assertTrue("handler's Content-Encoding must be present", firstCE != -1);
+		assertEquals("must not have a second Content-Encoding (no double-encode)",
+			-1, response.indexOf("Content-Encoding: gzip", firstCE + 1));
+		assertFalse("framework must not chunk-frame a pre-encoded body:\n" + response,
+			response.contains("Transfer-Encoding: chunked"));
+		assertTrue("identity body must carry the handler's payload",
+			response.contains("already-encoded-bytes"));
+	}
+
+	@Test
+	public void partialContentNotGzippedTest() throws IOException {
+		// Even when the client offers gzip and the body is text, a 206 Partial Content response must
+		// be sent identity — gzipping it would invalidate the byte range / Content-Range header.
+		String response = sendRawRequest(
+			"GET /partial206 HTTP/1.1\r\nHost: localhost\r\n" +
+			"Accept-Encoding: gzip\r\nConnection: close\r\n\r\n");
+		assertTrue("expected 206, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 206"));
+		assertFalse("206 must not be gzipped:\n" + response,
+			response.contains("Content-Encoding: gzip"));
+		assertFalse("206 must not be chunked:\n" + response,
+			response.contains("Transfer-Encoding: chunked"));
+	}
+
+	@Test
+	public void tooManyHeadersInMultipartPartReturns431Test() throws IOException {
+		// A single multipart part with an excessive header section must be rejected (431) rather
+		// than amplified into a vast per-part header map (OOM/DoS).
+		String boundary = "BND";
+		StringBuilder part = new StringBuilder("--" + boundary + "\r\n");
+		for (int i = 0; i < 150; i++) {
+			part.append("X-H-").append(i).append(": a\r\n");
+		}
+		part.append("Content-Disposition: form-data; name=\"f\"\r\n\r\ndata\r\n");
+		part.append("--").append(boundary).append("--\r\n");
+		String body = part.toString();
+		String response = sendRawRequest(
+			"POST /post HTTP/1.1\r\nHost: localhost\r\n" +
+			"Content-Type: multipart/form-data; boundary=" + boundary + "\r\n" +
+			"Content-Length: " + body.length() + "\r\nConnection: close\r\n\r\n" + body);
+		assertTrue("expected 431, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 431"));
+	}
+
+	@Test
+	public void tooManyChunkTrailersReturns431Test() throws IOException {
+		// A chunked body with an excessive number of trailer fields must be rejected (431) rather
+		// than amplified into a huge trailer map (OOM/DoS), mirroring the header-count limit.
+		StringBuilder trailers = new StringBuilder();
+		for (int i = 0; i < 150; i++) {
+			trailers.append("X-T-").append(i).append(": a\r\n");
+		}
+		String response = sendRawRequest(
+			"POST /post HTTP/1.1\r\nHost: localhost\r\n" +
+			"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n" +
+			"0\r\n" + trailers + "\r\n");
+		assertTrue("expected 431, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 431"));
+	}
+
+	@Test
+	public void tooManyFormParametersReturns413Test() throws IOException {
+		// A form body with an excessive number of parameters must be rejected (413) rather than
+		// amplified into millions of map entries (OOM/DoS). The parse runs eagerly for every form POST.
+		StringBuilder body = new StringBuilder();
+		for (int i = 0; i < 10050; i++) {
+			if (i > 0) body.append('&');
+			body.append("a=1");
+		}
+		String response = sendRawRequest(
+			"POST /post HTTP/1.1\r\nHost: localhost\r\n" +
+			"Content-Type: application/x-www-form-urlencoded\r\n" +
+			"Content-Length: " + body.length() + "\r\nConnection: close\r\n\r\n" + body);
+		assertTrue("expected 413, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 413"));
+	}
+
+	@Test
+	public void leadingEmptyLineBeforeRequestLineIsIgnoredTest() throws IOException {
+		// RFC 9112 §2.2: a server SHOULD ignore an empty line received before the request-line.
+		String response = sendRawRequest(
+			"\r\nGET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+		assertTrue("leading CRLF must be ignored (expect 200), got: "
+			+ response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 200"));
+	}
+
+	@Test
+	public void http11WithoutHostReturns400Test() throws IOException {
+		// RFC 9112 §3.2: a server MUST reject (400) any HTTP/1.1 request that lacks a Host header.
+		String response = sendRawRequest(
+			"GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
+		assertTrue("expected 400, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 400"));
+	}
+
+	@Test
+	public void http10WithoutHostIsAllowedTest() throws IOException {
+		// HTTP/1.0 has no Host requirement, so a 1.0 request without Host must still be served.
+		String response = sendRawRequest(
+			"GET / HTTP/1.0\r\nConnection: close\r\n\r\n");
+		assertTrue("expected 200, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.0 200") || response.startsWith("HTTP/1.1 200"));
+	}
+
+	@Test
+	public void slowHeaderClientReceives408Test() throws IOException {
+		// A client that opens a connection and dribbles an incomplete header section must be timed
+		// out with a best-effort 408 Request Timeout (RFC 9110 §15.5.9), not silently dropped.
+		long original = org.deftserver.web.http.HttpProtocol.HEADER_READ_TIMEOUT_MS;
+		org.deftserver.web.http.HttpProtocol.HEADER_READ_TIMEOUT_MS = 300;
+		try (Socket socket = new Socket("localhost", PORT)) {
+			socket.setSoTimeout(4000);
+			// Send a partial request header that never terminates (no final CRLF CRLF).
+			socket.getOutputStream().write("GET / HTTP/1.1\r\nHost: localhost\r\n".getBytes(
+				java.nio.charset.StandardCharsets.ISO_8859_1));
+			socket.getOutputStream().flush();
+			InputStream is = socket.getInputStream();
+			byte[] buf = new byte[256];
+			int n = is.read(buf); // blocks until the server writes the 408 then closes
+			String response = n > 0 ? new String(buf, 0, n, java.nio.charset.StandardCharsets.ISO_8859_1) : "";
+			assertTrue("expected 408, got: " + response, response.startsWith("HTTP/1.1 408"));
+			assertTrue("408 must close the connection", response.contains("Connection: close"));
+		} finally {
+			org.deftserver.web.http.HttpProtocol.HEADER_READ_TIMEOUT_MS = original;
+		}
+	}
+
+	@Test
+	public void unsupportedTransferCodingReturns501Test() throws IOException {
+		// "gzip, chunked": chunked IS final so framing is unambiguous, but we cannot decode the
+		// gzip transfer-coding layer. RFC 9112 §6.1 → 501 Not Implemented (rather than silently
+		// handing the handler still-gzip-encoded bytes).
+		String response = sendRawRequest(
+			"POST /post HTTP/1.1\r\nHost: localhost\r\n" +
+			"Transfer-Encoding: gzip, chunked\r\nConnection: close\r\n\r\n");
+		assertTrue("expected 501, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 501"));
 	}
 
 	@Test

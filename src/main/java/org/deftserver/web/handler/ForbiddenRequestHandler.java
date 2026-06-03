@@ -5,16 +5,20 @@ import java.io.IOException;
 import org.deftserver.web.http.HttpRequest;
 import org.deftserver.web.http.HttpResponse;
 
+/** Terminal handler returning 403 Forbidden for every method, used when an {@code @Authenticated}
+ *  resource has no authenticated user. */
 public class ForbiddenRequestHandler extends RequestHandler {
 
 private final static ForbiddenRequestHandler instance = new ForbiddenRequestHandler();
-	
+
 	private ForbiddenRequestHandler() { }
-	
+
+	/** The shared singleton instance. */
 	public static final ForbiddenRequestHandler getInstance() {
 		return instance;
 	}
-	
+
+	/** Writes the 403 response (Connection: close). */
 	@Override
 	public void get(HttpRequest request, HttpResponse response) throws IOException {
 		response.setStatusCode(403);

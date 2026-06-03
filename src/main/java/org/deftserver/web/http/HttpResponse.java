@@ -34,27 +34,36 @@ public class HttpResponse {
 	private final Map<String, String> headers = new HashMap<String, String>();
 	private boolean headersCreated = false;
 	private final DynamicByteBuffer responseData = DynamicByteBuffer.allocate(WRITE_BUFFER_SIZE);
-	private boolean hasContent = false;
 	private final boolean suppressBody;
 	
 	private HttpRequest request;
 	private boolean useChunked = false;
-	private boolean useGzip = false;
+	private String compressionEncoding = null;
 	private boolean finished = false;
 	private final java.util.List<Cookie> cookies = new java.util.ArrayList<>();
 
+	/** Queues a cookie to be emitted as its own {@code Set-Cookie} response header line. */
 	public void setCookie(Cookie cookie) {
 		cookies.add(cookie);
 	}
-	
+
+	/** Associates the originating request, used for conditional-request, keep-alive and
+	 *  protocol-version decisions taken while framing the response. */
 	public void setRequest(HttpRequest request) {
 		this.request = request;
 	}
-	
+
+	/** Convenience constructor: builds a response that sends its body (not a HEAD). */
 	public HttpResponse(HttpProtocol protocol, SelectionKey key, boolean keepAlive) {
 		this(protocol, key, keepAlive, false);
 	}
 
+	/**
+	 * Builds the response for a single request. Seeds the mandatory {@code Server}/{@code Date}
+	 * headers and the {@code Connection} disposition (Keep-Alive vs Close, per {@code keepAlive}).
+	 * {@code suppressBody} is true for HEAD requests — headers/Content-Length are still computed
+	 * but the body bytes are never written.
+	 */
 	public HttpResponse(HttpProtocol protocol, SelectionKey key, boolean keepAlive, boolean suppressBody) {
 		this.protocol = protocol;
 		this.key = key;
@@ -63,20 +72,96 @@ public class HttpResponse {
 		headers.put("Date", DateUtil.getCurrentAsString());
 		headers.put("Connection", keepAlive ? "Keep-Alive" : "Close");
 	}
-	
+
+	/** The client socket channel this response is being written to. */
 	public SocketChannel getChannel() {
 		return (SocketChannel) key.channel();
 	}
-	
+
+	/** The owning protocol (used for SSL-aware writes, channel teardown and I/O-loop hand-off). */
 	public HttpProtocol getProtocol() {
 		return protocol;
 	}
+
+	/** True once the status line + headers have been emitted to the socket — i.e. the handler has
+	 *  already performed network I/O (via {@code flush()}/{@code write(File)}/{@code write(ByteBuffer)}).
+	 *  The dispatcher uses this to refuse to adaptively offload such a handler onto a virtual thread,
+	 *  since its NIO (selector registration / buffered writes) must stay on the I/O-loop thread. */
+	public boolean hasFlushedHeaders() {
+		return headersCreated;
+	}
+
+	/** True once {@link #finish()} has run. Used to tell a still-pending async response (which needs a
+	 *  processing timeout) from one that already completed synchronously during dispatch (e.g. a
+	 *  WebSocket upgrade, which is marked async but sends its 101 inline and manages its own timeouts). */
+	public boolean hasFinished() {
+		return finished;
+	}
+
+	/** Sets the HTTP status code for this response (default 200). */
 	public void setStatusCode(int sc) {
 		statusCode = sc;
 	}
-	
+
+	/** Sets a response header, first validating that neither name nor value can break out of the
+	 *  header stream (HTTP response-splitting defence — see {@link #validateHeaderField}). */
 	public void setHeader(String header, String value) {
+		validateHeaderField(header, value);
 		headers.put(header, value);
+	}
+
+	/**
+	 * Adds a field name to the {@code Vary} header without clobbering any value already present
+	 * (case-insensitive de-dup). {@code Vary} is a SET of header names, so it must be merged rather
+	 * than replaced — this lets the CORS layer ({@code Origin}), the gzip path ({@code Accept-Encoding})
+	 * and a handler's own {@code Vary} coexist regardless of the order in which they run, so a cache
+	 * never serves the wrong compressed/CORS/negotiated representation to another client.
+	 */
+	public void addVary(String fieldName) {
+		String existing = headers.get("Vary");
+		if (existing == null || existing.isEmpty()) {
+			setHeader("Vary", fieldName);
+			return;
+		}
+		if ("*".equals(existing.trim())) {
+			return; // already varies on everything
+		}
+		for (String token : existing.split(",")) {
+			if (token.trim().equalsIgnoreCase(fieldName)) {
+				return; // already listed
+			}
+		}
+		setHeader("Vary", existing + ", " + fieldName);
+	}
+
+	/**
+	 * Rejects header names/values that could break out of the header into the status/header
+	 * stream (CR, LF, NUL and other control characters) — the central defence against HTTP
+	 * response-splitting/header-injection for any value a handler reflects from user input
+	 * (e.g. a redirect Location or a reflected CORS Origin). HT is the only control char
+	 * permitted in a field value (RFC 9110 §5.5); names must be a non-empty token.
+	 */
+	private static void validateHeaderField(String name, String value) {
+		if (name == null || name.isEmpty()) {
+			throw new IllegalArgumentException("Header name must not be null or empty");
+		}
+		for (int i = 0; i < name.length(); i++) {
+			char c = name.charAt(i);
+			if (c <= 0x20 || c == 0x7f || c == ':') {
+				throw new IllegalArgumentException("Illegal character in header name: " + name);
+			}
+		}
+		// Reject a null value fail-fast (with a clear message) rather than letting it surface as a
+		// confusing NullPointerException later during header serialization.
+		if (value == null) {
+			throw new IllegalArgumentException("Header value must not be null for header: " + name);
+		}
+		for (int i = 0; i < value.length(); i++) {
+			char c = value.charAt(i);
+			if ((c < 0x20 && c != '\t') || c == 0x7f) {
+				throw new IllegalArgumentException("Illegal control character in value for header: " + name);
+			}
+		}
 	}
 
 	/**
@@ -99,12 +184,6 @@ public class HttpResponse {
 		long bytesWritten = 0;
 		try {
 			if (!headersCreated) {
-				// Streaming case: a handler that flushes before finish() with neither a
-				// Content-Length nor chunked framing produces a response whose body can only be
-				// delimited by closing the connection. Force Connection: close so a keep-alive
-				// client isn't left mis-framed (finish() then tears the connection down). The
-				// normal write()+finish() path sets Content-Length before flushing, so it is
-				// unaffected and stays keep-alive.
 				if (!useChunked && !headers.containsKey("Content-Length") && !suppressBody) {
 					setHeader("Connection", "Close");
 				}
@@ -115,15 +194,14 @@ public class HttpResponse {
 					responseData.prepend(prefix);
 					responseData.put("\r\n".getBytes(StandardCharsets.ISO_8859_1));
 				}
-
 				String initial = createInitalLineAndHeaders();
 				if (suppressBody) {
-					responseData.clear(); // discard any body bytes
+					responseData.clear();
 				}
 				bytesWritten += responseData.prepend(initial);
 				headersCreated = true;
 			}
-			responseData.flip(); // prepare for write
+			responseData.flip();
 	
 			SocketChannel channel = (SocketChannel) key.channel();
 			if (responseData.hasRemaining()) {
@@ -136,7 +214,9 @@ public class HttpResponse {
 			if (protocol.getIOLoop().hasKeepAliveTimeout(channel)) {
 				protocol.prolongKeepAliveTimeout(channel);
 			}
-			if (responseData.hasRemaining()) { 
+			SSLSessionHandler sslHandler = protocol.getSslSessionHandler(channel);
+			boolean sslPending = (sslHandler != null && sslHandler.hasPendingWrite());
+			if (responseData.hasRemaining() || sslPending) {
 				responseData.compact();	// make room for more data be 'read' in
 				key.channel().register(key.selector(), SelectionKey.OP_WRITE, responseData);
 			}
@@ -154,6 +234,14 @@ public class HttpResponse {
 		return bytesWritten;
 	}
 	
+	/**
+	 * Completes the response: emits any remaining body (including the chunked terminator / mapped-file
+	 * window), decides the conditional-request outcome and final framing, then either closes the
+	 * connection (Connection: close) or re-arms it for the next keep-alive request. Idempotent — a
+	 * second call (e.g. the dispatcher finishing an already-finished async response) is a no-op.
+	 *
+	 * @return the number of bytes written by this call.
+	 */
 	public long finish() {
 		if (finished) {
 			return 0;
@@ -172,8 +260,20 @@ public class HttpResponse {
 						bytesWritten += written;
 					} while (written > 0 && mbb.hasRemaining() && clientChannel.isOpen());
 				}
-				if (!mbb.hasRemaining()) {
-					protocol.registerForRead(key);
+				boolean closeConnection = "close".equalsIgnoreCase(headers.get("Connection"));
+				SSLSessionHandler sslHandler = protocol.getSslSessionHandler(clientChannel);
+				if (sslHandler != null && sslHandler.hasPendingWrite()) {
+					if (closeConnection) {
+						protocol.markCloseAfterWrite(clientChannel);
+					}
+				} else {
+					if (!mbb.hasRemaining()) {
+						finishConnection(closeConnection);
+					} else {
+						if (closeConnection) {
+							protocol.markCloseAfterWrite(clientChannel);
+						}
+					}
 				}
 			} else {
 				if (clientChannel.isOpen()) {
@@ -202,28 +302,33 @@ public class HttpResponse {
 						bytesWritten = flush();
 					}
 				}
-				// close (or register for read) if all data has been written.
-				// If OP_WRITE is interested, a write is pending, so we must wait until the buffer is fully sent.
-				// If the response declared Connection: close (e.g. a 404/400/403 or error page on an
-				// otherwise keep-alive connection), close once the body is fully written instead of
-				// keeping the socket open — otherwise the server contradicts its own header and holds
-				// the connection until the keep-alive timeout.
 				boolean closeConnection = "close".equalsIgnoreCase(headers.get("Connection"));
-				boolean isWriting = key.isValid() && (key.interestOps() & SelectionKey.OP_WRITE) != 0;
-				if (isWriting) {
-					if (key.attachment() instanceof DynamicByteBuffer) {
-						DynamicByteBuffer dbb = (DynamicByteBuffer) key.attachment();
-						if (!dbb.hasRemaining()) {
-							finishConnection(closeConnection);
-						}
-					} else if (key.attachment() instanceof ByteBuffer) {
-						ByteBuffer bb = (ByteBuffer) key.attachment();
-						if (!bb.hasRemaining()) {
-							finishConnection(closeConnection);
-						}
+				SSLSessionHandler sslHandler = protocol.getSslSessionHandler(clientChannel);
+				if (sslHandler != null && sslHandler.hasPendingWrite()) {
+					if (closeConnection) {
+						protocol.markCloseAfterWrite(clientChannel);
 					}
 				} else {
-					finishConnection(closeConnection);
+					boolean isWriting = key.isValid() && (key.interestOps() & SelectionKey.OP_WRITE) != 0;
+					if (isWriting) {
+						if (key.attachment() instanceof DynamicByteBuffer) {
+							DynamicByteBuffer dbb = (DynamicByteBuffer) key.attachment();
+							if (!dbb.hasRemaining()) {
+								finishConnection(closeConnection);
+							} else if (closeConnection) {
+								protocol.markCloseAfterWrite(clientChannel);
+							}
+						} else if (key.attachment() instanceof ByteBuffer) {
+							ByteBuffer bb = (ByteBuffer) key.attachment();
+							if (!bb.hasRemaining()) {
+								finishConnection(closeConnection);
+							} else if (closeConnection) {
+								protocol.markCloseAfterWrite(clientChannel);
+							}
+						}
+					} else {
+						finishConnection(closeConnection);
+					}
 				}
 			}
 			return bytesWritten;
@@ -234,30 +339,47 @@ public class HttpResponse {
 		}
 	}	
 
+	/** Finalises body framing before sending: applies gzip where appropriate, computes the ETag,
+	 *  evaluates conditional-request preconditions (304/412), and sets Content-Length or chunked
+	 *  Transfer-Encoding (clearing the body for bodiless statuses). */
 	private void setEtagAndContentLength() {
-		if (request != null && !isBodySuppressed() && responseData.position() > 0) {
+		// gzip here is framed with Transfer-Encoding: chunked, which HTTP/1.0 clients cannot parse
+		// — only enable it for HTTP/1.1 requests so a 1.0 client gets an identity, Content-Length
+		// response instead of an unreadable chunked one. Also never gzip a 206 Partial Content
+		// response: re-encoding the body would invalidate the byte range / Content-Range. And never
+		// gzip when the handler already set a Content-Encoding (e.g. it pre-compressed the body) —
+		// that would double-encode it into garbage.
+		if (request != null && !isBodySuppressed() && responseData.position() > 0
+				&& statusCode != 206
+				&& !headers.containsKey("Content-Encoding")
+				&& "HTTP/1.1".equals(request.getVersion())) {
 			String acceptEncoding = request.getHeader("Accept-Encoding");
-			if (org.deftserver.util.HttpUtil.isGzipAcceptable(acceptEncoding)) {
+			String preferred = org.deftserver.util.HttpUtil.getPreferredCompression(acceptEncoding);
+			if (preferred != null) {
 				String contentType = headers.get("Content-Type");
 				if (contentType != null && (
 					contentType.contains("text") || 
 					contentType.contains("json") || 
 					contentType.contains("xml") || 
 					contentType.contains("javascript"))) {
-					useGzip = true;
+					compressionEncoding = preferred;
 					useChunked = true;
-					setHeader("Content-Encoding", "gzip");
+					setHeader("Content-Encoding", preferred);
 					setHeader("Transfer-Encoding", "chunked");
 					// The representation now depends on Accept-Encoding; tell caches so they
-					// don't serve gzipped bytes to a client that didn't ask for them.
-					String existingVary = headers.get("Vary");
-					if (existingVary == null || existingVary.isEmpty()) {
-						setHeader("Vary", "Accept-Encoding");
-					} else if (!existingVary.toLowerCase(java.util.Locale.ROOT).contains("accept-encoding")) {
-						setHeader("Vary", existingVary + ", Accept-Encoding");
-					}
+					// don't serve gzipped bytes to a client that didn't ask for them. Merge (don't
+					// clobber any Origin/handler Vary already set).
+					addVary("Accept-Encoding");
 				}
 			}
+		}
+
+		// A CORS response varies by Origin. Re-ensure it here, at finish time (after the handler has
+		// run), so a handler that set its own Vary can't drop the Origin token the CORS layer added
+		// before dispatch — which would let a cache serve one origin's response to another.
+		if (headers.containsKey("Access-Control-Allow-Origin")
+				&& !"*".equals(headers.get("Access-Control-Allow-Origin"))) {
+			addVary("Origin");
 		}
 
 		if (statusCode / 100 == 1 || statusCode == 204 || statusCode == 304) {
@@ -265,16 +387,17 @@ public class HttpResponse {
 			return;
 		}
 
-		if (useGzip && responseData.position() > 0) {
-			java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
-			try (java.util.zip.GZIPOutputStream gzos = new java.util.zip.GZIPOutputStream(baos)) {
-				gzos.write(responseData.array(), 0, responseData.position());
+		if (compressionEncoding != null && responseData.position() > 0) {
+			try {
+				byte[] compressed = org.deftserver.util.HttpUtil.compress(
+					java.util.Arrays.copyOfRange(responseData.array(), 0, responseData.position()),
+					compressionEncoding
+				);
+				responseData.clear();
+				responseData.put(compressed);
 			} catch (IOException e) {
 				logger.error("Error compressing response: {}", e.getMessage());
 			}
-			byte[] compressed = baos.toByteArray();
-			responseData.clear();
-			responseData.put(compressed);
 		}
 
 		String etag = null;
@@ -282,40 +405,52 @@ public class HttpResponse {
 			// RFC 9110 §8.8.3: an ETag is a quoted-string. Quoting is also required for
 			// If-None-Match / If-Match to match, since clients echo the quoted value back.
 			etag = "\"" + HttpUtil.getEtag(responseData.array(), 0, responseData.position()) + "\"";
-			setHeader("Etag", etag);
+			// Use the RFC 9110 §8.8.3 canonical spelling "ETag" (matches the static handler and what
+			// case-sensitive clients/caches expect), even though header names are case-insensitive.
+			setHeader("ETag", etag);
 		}
 
 		if (request != null) {
-			String inm = request.getHeader("If-None-Match");
-			if (inm != null && etag != null && ifMatchHeaderMatches(inm, etag)) {
-				setStatusCode(304);
-				markBodiless();
-				return;
-			}
+			// RFC 9110 §13.2.2 fixes the precedence order so combinations are deterministic:
+			//   1. If-Match            2. If-Unmodified-Since (only if If-Match absent)
+			//   3. If-None-Match       4. If-Modified-Since   (only if If-None-Match absent)
+			// Evaluating these out of order (e.g. If-None-Match before If-Match) produces the wrong
+			// status for contradictory combinations — e.g. If-Match:"v2" + If-None-Match:"v1" against
+			// current "v1" must be 412 (If-Match fails first), not 304.
 			String im = request.getHeader("If-Match");
+			String inm = request.getHeader("If-None-Match");
+			String ius = request.getHeader("If-Unmodified-Since");
+			String ims = request.getHeader("If-Modified-Since");
+			String lm = headers.get("Last-Modified");
+
+			// 1. If-Match: precondition fails (→412) if the current ETag matches none of the listed tags.
 			if (im != null && etag != null && !ifMatchHeaderMatches(im, etag)) {
 				setStatusCode(412);
 				markBodiless();
 				return;
 			}
-			String ims = request.getHeader("If-Modified-Since");
-			String lm = headers.get("Last-Modified");
-			// RFC 9110 §13.1.3: ignore If-Modified-Since when If-None-Match is present.
-			if (ims != null && lm != null && inm == null) {
-				long imsTime = DateUtil.parseRFC1123ToMillis(ims);
-				long lmTime = DateUtil.parseRFC1123ToMillis(lm);
-				if (imsTime != -1 && lmTime != -1 && lmTime <= imsTime) {
-					setStatusCode(304);
-					markBodiless();
-					return;
-				}
-			}
-			String ius = request.getHeader("If-Unmodified-Since");
-			if (ius != null && lm != null) {
+			// 2. If-Unmodified-Since: only when If-Match is absent (§13.1.4). 412 if modified since.
+			if (im == null && ius != null && lm != null) {
 				long iusTime = DateUtil.parseRFC1123ToMillis(ius);
 				long lmTime = DateUtil.parseRFC1123ToMillis(lm);
 				if (iusTime != -1 && lmTime != -1 && lmTime > iusTime) {
 					setStatusCode(412);
+					markBodiless();
+					return;
+				}
+			}
+			// 3. If-None-Match: 304 (for the GET/HEAD path here) if the current ETag matches.
+			if (inm != null && etag != null && ifMatchHeaderMatches(inm, etag)) {
+				setStatusCode(304);
+				markBodiless();
+				return;
+			}
+			// 4. If-Modified-Since: only when If-None-Match is absent (§13.1.3). 304 if not modified.
+			if (inm == null && ims != null && lm != null) {
+				long imsTime = DateUtil.parseRFC1123ToMillis(ims);
+				long lmTime = DateUtil.parseRFC1123ToMillis(lm);
+				if (imsTime != -1 && lmTime != -1 && lmTime <= imsTime) {
+					setStatusCode(304);
 					markBodiless();
 					return;
 				}
@@ -345,19 +480,28 @@ public class HttpResponse {
 		if (closeConnection) {
 			protocol.closeChannel((SocketChannel) key.channel());
 		} else {
-			protocol.registerForRead(key);
+			protocol.handleConnectionIdle(key, (SocketChannel) key.channel());
 		}
 	}
 
+	/** Strips any body and body-encoding framing for a bodiless response (1xx/204/304), leaving
+	 *  Content-Length: 0. */
 	private void markBodiless() {
 		responseData.clear();
 		useChunked = false;
-		useGzip = false;
+		compressionEncoding = null;
 		headers.remove("Transfer-Encoding");
 		headers.remove("Content-Encoding");
+		// Content-Length: 0 is the unambiguous framing for a bodiless response. Note: although a 1xx
+		// (e.g. 101 Switching Protocols) strictly carries no Content-Length, the JDK java.net.http
+		// WebSocket client rejects a 101 handshake that lacks it — so we keep it for interop
+		// (robustness/interop over a pedantic reading; a 1xx body is forbidden regardless, RFC 9110
+		// §6.2, so the header is harmless).
 		setHeader("Content-Length", "0");
 	}
 
+	/** Serializes the status line, all headers, and one {@code Set-Cookie} line per queued cookie,
+	 *  terminated by the blank line that separates headers from the body. */
 	private String createInitalLineAndHeaders() {
 		StringBuilder sb = new StringBuilder(HttpUtil.createInitialLine(statusCode));
 		for (Map.Entry<String, String> header : headers.entrySet()) {
@@ -376,6 +520,14 @@ public class HttpResponse {
 		return sb.toString();
 	}
 	
+	/**
+	 * Streaming write of raw bytes: emits the status line + headers on the first call (setting
+	 * Content-Length to this buffer's size, or chunk-framing if {@link #useChunked}) then the body,
+	 * flushing immediately. Intended for a single full-body write or for repeated *chunked* writes;
+	 * the per-call flush routes through OP_WRITE so a full socket never silently drops payload.
+	 *
+	 * @return the number of bytes written by this call.
+	 */
 	public long write(ByteBuffer data) {
 		int size = data.remaining();
 
@@ -386,20 +538,15 @@ public class HttpResponse {
 			} else {
 				setHeader("Content-Length", String.valueOf(size));
 			}
+		} else if (!useChunked) {
+			throw new IllegalStateException("Non-chunked write(ByteBuffer) only supports a single call; use chunked mode or write(String) for multiple writes");
 		}
 
-		// Emit the initial line + headers (and any previously-buffered body). flush() routes
-		// through the partial-write/OP_WRITE machinery, so nothing is lost on a full socket.
 		long bytesWritten = flush();
 		if (isBodySuppressed()) {
 			return bytesWritten;
 		}
 
-		// Buffer the body (with chunk framing if chunked) and flush. Previously the body and the
-		// chunk-size/CRLF markers were written straight to the socket in a loop that stopped on a
-		// 0-byte (buffer-full) write, silently dropping the remaining payload AND desynchronising
-		// the chunked stream. Buffering via responseData lets flush() defer the remainder to
-		// OP_WRITE instead.
 		if (data.hasRemaining()) {
 			if (useChunked) {
 				responseData.put((Integer.toHexString(data.remaining()) + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
@@ -427,7 +574,14 @@ public class HttpResponse {
 			if (isBodySuppressed()) {
 				return bytesWritten;
 			}
-			
+
+			// Files larger than a single mmap window are served in chunks (avoids the 2 GiB
+			// FileChannel.map limit). The protocol layer owns the windowing + cleanup.
+			if (file.length() > HttpProtocol.FILE_WINDOW_SIZE) {
+				protocol.streamLargeFile(key, file, 0L, file.length());
+				return bytesWritten;
+			}
+
 			try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
 				FileChannel fc = raf.getChannel();
 				MappedByteBuffer mbb = raf.getChannel().map(MapMode.READ_ONLY, 0L, fc.size());
@@ -450,6 +604,13 @@ public class HttpResponse {
 		}
 	}
 
+	/**
+	 * Writes a byte range {@code [start, start+length)} of a file as the response body (the 206
+	 * Partial Content path). Ranges larger than one mmap window are streamed by the protocol layer;
+	 * smaller ones are mapped and written directly, deferring any unsent tail to OP_WRITE.
+	 *
+	 * @return the number of body bytes written by this call.
+	 */
 	public long write(File file, long start, long length) {
 		try {
 			long bytesWritten = 0;
@@ -457,7 +618,13 @@ public class HttpResponse {
 			if (isBodySuppressed()) {
 				return bytesWritten;
 			}
-			
+
+			// A range larger than a single mmap window is served in chunks too.
+			if (length > HttpProtocol.FILE_WINDOW_SIZE) {
+				protocol.streamLargeFile(key, file, start, length);
+				return bytesWritten;
+			}
+
 			try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
 				FileChannel fc = raf.getChannel();
 				MappedByteBuffer mbb = fc.map(MapMode.READ_ONLY, start, length);
@@ -480,6 +647,8 @@ public class HttpResponse {
 		}
 	}
 
+	/** True when this response must carry no body: a HEAD request ({@code suppressBody}), or a
+	 *  status that is defined to be bodiless (1xx, 204 No Content, 304 Not Modified). */
 	private boolean isBodySuppressed() {
 		return suppressBody || statusCode / 100 == 1 || statusCode == 204 || statusCode == 304;
 	}
@@ -503,6 +672,8 @@ public class HttpResponse {
 		return false;
 	}
 
+	/** Strips the weak-validator prefix ({@code W/}) from an ETag so weak and strong forms of the
+	 *  same tag compare equal (the weak comparison used for If-None-Match). */
 	private static String stripWeak(String etag) {
 		return etag.startsWith("W/") ? etag.substring(2) : etag;
 	}
