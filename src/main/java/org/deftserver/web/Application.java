@@ -40,7 +40,14 @@ public class Application {
 	private String staticContentDir;
 	private java.nio.file.Path staticContentRoot;
 	private boolean staticContentDirIsAbsolute;
-	
+
+	private static final NotFoundRequestHandler NOT_FOUND = NotFoundRequestHandler.getInstance();
+	private static final BadRequestRequestHandler BAD_REQUEST = BadRequestRequestHandler.getInstance();
+	private static final ForbiddenRequestHandler FORBIDDEN = ForbiddenRequestHandler.getInstance();
+	private static final CorsPreflightRequestHandler CORS_PREFLIGHT = CorsPreflightRequestHandler.getInstance();
+	private static final org.deftserver.web.handler.ServerOptionsRequestHandler SERVER_OPTIONS =
+		org.deftserver.web.handler.ServerOptionsRequestHandler.getInstance();
+
 	/** Builds the routing table from a path → handler map, splitting it into exact-path handlers and
 	 *  capturing-group handlers (paths whose final segment is a regex, e.g. {@code /persons/([0-9]+)}),
 	 *  pre-compiling those patterns. */
@@ -82,7 +89,7 @@ public class Application {
 				rh = getStaticContentHandler(path);
 			}
 		}
-		return rh != null ? rh : NotFoundRequestHandler.getInstance();	// TODO RS store in a final field for improved performance?
+		return rh != null ? rh : NOT_FOUND;
 	}
 	
 	/** Resolves the handler for a parsed request, applying (in order): malformed → 400, invalid →
@@ -94,15 +101,15 @@ public class Application {
 		// the sentinel having no Host header so verifyRequest would reject it; that coupling broke
 		// once the sentinel was given a valid Host to satisfy the constructor's RFC 9112 §3.2 check).
 		if (request instanceof org.deftserver.web.http.MalFormedHttpRequest) {
-			return BadRequestRequestHandler.getInstance();
+			return BAD_REQUEST;
 		}
 		if (!HttpUtil.verifyRequest(request)) {
-			return BadRequestRequestHandler.getInstance();
+			return BAD_REQUEST;
 		}
 		
 		// Server-wide "OPTIONS *" applies to the whole server, not a resource.
 		if (request.getMethod() == HttpVerb.OPTIONS && "*".equals(request.getRequestedPath())) {
-			return org.deftserver.web.handler.ServerOptionsRequestHandler.getInstance();
+			return SERVER_OPTIONS;
 		}
 
 		RequestHandler rh = getHandler(request.getRequestedPath());
@@ -111,17 +118,17 @@ public class Application {
 		if (request.getMethod() == HttpVerb.OPTIONS && 
 			request.getHeader("Origin") != null && 
 			request.getHeader("Access-Control-Request-Method") != null) {
-			if (rh != null && rh != NotFoundRequestHandler.getInstance() && rh.getCorsConfig() != null) {
+			if (rh != null && rh != NOT_FOUND && rh.getCorsConfig() != null) {
 				return rh;
 			}
-			return CorsPreflightRequestHandler.getInstance();
+			return CORS_PREFLIGHT;
 		}
 		
 		// if @Authenticated annotation is present, make sure that the request/user is authenticated 
 		// (i.e RequestHandler.getCurrentUser() != null).
-		if (rh == null) return NotFoundRequestHandler.getInstance();
+		if (rh == null) return NOT_FOUND;
 		if (rh.isMethodAuthenticated(request.getMethod()) && rh.getCurrentUser(request) == null) {
-			return ForbiddenRequestHandler.getInstance();
+			return FORBIDDEN;
 		}
 		return rh;
 	}
@@ -129,8 +136,19 @@ public class Application {
 	/** True if a path's final segment is a capturing-group pattern ({@code (...)}); also validates
 	 *  the pattern compiles (throwing at startup if it doesn't). */
 	private boolean containsCapturingGroup(String group) {
-		boolean containsGroup =  group.matches("^\\(.*\\)$");
-		Pattern.compile(group);	// throws PatternSyntaxException if group is malformed regular expression
+		// A capturing-group segment is wrapped in parentheses, e.g. "([0-9]+)". Use startsWith/endsWith
+		// rather than group.matches("^\\(.*\\)$"): identical for path segments (which can't contain a
+		// newline, the only case where "." would differ) but avoids compiling a throwaway regex on
+		// every registered route. Length >= 2 is implied by needing both a '(' and a ')'.
+		boolean containsGroup = group.startsWith("(") && group.endsWith(")") && group.length() >= 2;
+		// Only validate-compile a segment that is actually a capturing group (wrapped in parens) and
+		// will therefore be used as a regex. A literal route segment is just an exact-match map key —
+		// compiling it unconditionally would throw PatternSyntaxException for perfectly legal literal
+		// paths that happen to contain an unbalanced regex metacharacter (e.g. "/files/data[1"),
+		// crashing Application construction / server startup on a valid configuration.
+		if (containsGroup) {
+			Pattern.compile(group); // throws PatternSyntaxException if the group is a malformed regex
+		}
 		return containsGroup;
 	}
 

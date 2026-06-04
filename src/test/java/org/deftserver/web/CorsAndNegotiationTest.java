@@ -71,6 +71,22 @@ public class CorsAndNegotiationTest {
 			}
 		};
 		reqHandlers.put("/corsvary", corsVary);
+		// Wildcard-origin CORS WITH credentials: must echo the concrete request Origin (never the
+		// literal "*"), because "Access-Control-Allow-Origin: *" + "Allow-Credentials: true" is the
+		// invalid combination browsers reject (features_required.md §26 footgun).
+		RequestHandler corsWildcardCreds = new RequestHandler() {
+			{
+				CorsConfig c = new CorsConfig();
+				c.setAllowedOrigins("*");
+				c.setAllowCredentials(true);
+				setCorsConfig(c);
+			}
+			@Override
+			public void get(org.deftserver.web.http.HttpRequest req, org.deftserver.web.http.HttpResponse resp) {
+				resp.write("ok");
+			}
+		};
+		reqHandlers.put("/corswild", corsWildcardCreds);
 
 		server = new HttpServer(new Application(reqHandlers));
 
@@ -100,6 +116,25 @@ public class CorsAndNegotiationTest {
 		// Both the handler's token and the CORS Origin token must be present.
 		assertTrue("Vary must keep the handler's Accept-Language: " + vary, varyLower.contains("accept-language"));
 		assertTrue("Vary must keep the CORS Origin token: " + vary, varyLower.contains("origin"));
+	}
+
+	@Test
+	public void wildcardOriginWithCredentialsEchoesConcreteOriginNotStar() throws Exception {
+		// §26 footgun: a wildcard origin policy combined with credentials must reflect the actual
+		// request Origin and Allow-Credentials: true — but MUST NOT emit "Access-Control-Allow-Origin: *",
+		// which browsers reject when credentials are allowed.
+		HttpClient client = HttpClient.newHttpClient();
+		HttpRequest request = HttpRequest.newBuilder()
+				.uri(URI.create("http://localhost:" + PORT + "/corswild"))
+				.header("Origin", "http://anything.example")
+				.GET().build();
+		HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+		assertEquals(200, response.statusCode());
+		String allowOrigin = response.headers().firstValue("Access-Control-Allow-Origin").orElse(null);
+		assertEquals("must echo the concrete Origin, not '*'", "http://anything.example", allowOrigin);
+		assertEquals("true", response.headers().firstValue("Access-Control-Allow-Credentials").orElse(null));
+		String vary = response.headers().firstValue("Vary").orElse("");
+		assertTrue("must Vary: Origin when reflecting per-origin", vary.toLowerCase(java.util.Locale.ROOT).contains("origin"));
 	}
 
 	@Test

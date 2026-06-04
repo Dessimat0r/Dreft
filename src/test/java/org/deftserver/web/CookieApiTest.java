@@ -1,6 +1,7 @@
 package org.deftserver.web;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
@@ -136,5 +137,28 @@ public class CookieApiTest {
 		// Null value is legal (renders empty); must not throw.
 		Cookie c = new Cookie("x", null);
 		assertTrue(c.toString().startsWith("x="));
+	}
+
+	@Test
+	public void testSameSiteNoneImpliesSecure() {
+		// RFC 6265bis §5.4.7: SameSite=None requires Secure or the browser drops the cookie. The
+		// serializer must emit Secure automatically even when setSecure(true) was not called.
+		Cookie c = new Cookie("sid", "abc");
+		c.setSameSite(Cookie.SameSite.NONE);
+		String s = c.toString();
+		assertTrue("SameSite=None must imply Secure:\n" + s, s.contains("; Secure"));
+		assertTrue(s.contains("SameSite=None"));
+		// Secure must appear exactly once even if both the flag and None are set.
+		c.setSecure(true);
+		String s2 = c.toString();
+		assertEquals("Secure must not be duplicated", s2.indexOf("; Secure"), s2.lastIndexOf("; Secure"));
+	}
+
+	@Test
+	public void testSameSiteLaxDoesNotImplySecure() {
+		// Only None implies Secure; Lax/Strict must NOT silently add Secure.
+		Cookie c = new Cookie("sid", "abc");
+		c.setSameSite(Cookie.SameSite.LAX);
+		assertFalse("SameSite=Lax must not add Secure", c.toString().contains("; Secure"));
 	}
 }

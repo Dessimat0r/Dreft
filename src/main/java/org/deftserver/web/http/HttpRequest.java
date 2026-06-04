@@ -149,6 +149,7 @@ public class HttpRequest {
 	private static final int MAX_REQUEST_LINE_SIZE = 8 * 1024;
 	private static final int MAX_HEADER_SIZE = 64 * 1024;
 	private static final int MAX_HEADER_COUNT = 100;
+	/** Maximum request body size in bytes (16 MiB). Requests exceeding this → 413 Payload Too Large. */
 	public static final int MAX_BODY_SIZE = 16 * 1024 * 1024;
 	/** Cap on the number of multipart parts, to bound the object/memory amplification a body of
 	 *  many tiny parts would otherwise cause (a 16 MiB body could hold ~300k minimal parts). */
@@ -1588,10 +1589,20 @@ public class HttpRequest {
 		return true;
 	}
 
-	/** Turns a raw request target into a safe path: handles {@code OPTIONS *} and absolute-form URIs,
-	 *  percent-decodes (UTF-8, preserving a literal {@code +}), rejects null bytes, collapses dot
-	 *  segments and duplicate slashes, and blocks directory traversal — throwing 400/403 on attack
-	 *  patterns. */
+	/**
+	 * Turns a raw request target into a safe path: handles {@code OPTIONS *} and absolute-form
+	 * URIs, percent-decodes (UTF-8, preserving a literal {@code +}), rejects null bytes, collapses
+	 * dot segments and duplicate slashes, and blocks directory traversal — throwing 400/403 on
+	 * attack patterns.
+	 * <p>
+	 * <b>Security note:</b> percent-decoding includes {@code %2F} (encoded slash), which
+	 * decodes to {@code '/'}. If this server is deployed behind a reverse proxy that does
+	 * <b>not</b> decode {@code %2F}, the two systems will disagree on the path structure — a
+	 * front-end proxy treats {@code /public/%2F../admin} as a single path segment while Dreft
+	 * decodes it to {@code /public/../admin} → {@code /admin}, bypassing proxy-level access
+	 * controls. Ensure your proxy normalises percent-encoding before forwarding, or configure it
+	 * to reject/monitor {@code %2F} in paths.</p>
+	 */
 	public static String normalizeAndDecodePath(String path) throws HttpException {
 		if (path == null || path.isEmpty()) {
 			return "/";
@@ -1879,12 +1890,18 @@ public class HttpRequest {
 	 *  segments ({@link #parseSegments}) and inserting its value(s) ({@link #insertValue}). */
 	private Map<String, Object> parseParametersTree(Map<String, ? extends Collection<String>> flatParams) {
 		Map<String, Object> root = new LinkedHashMap<>();
+		// Per-map running "next append index" (= 1 + the largest non-negative integer key inserted so
+		// far). Lets an empty "[]" segment resolve its index in O(1) instead of re-scanning every key
+		// of the map on each append (the old getNextIntegerKey), which was O(n^2) for a form posting a
+		// large array under one name (e.g. thousands of a[]=...). Identity-keyed: each nested map is a
+		// distinct node. Kept exactly equivalent to the old max-key+1 behaviour.
+		Map<Map<String, Object>, Integer> autoIndex = new java.util.IdentityHashMap<>();
 		for (Map.Entry<String, ? extends Collection<String>> entry : flatParams.entrySet()) {
 			String rawName = entry.getKey();
 			Collection<String> values = entry.getValue();
 			List<String> segments = parseSegments(rawName);
 			for (String val : values) {
-				insertValue(root, segments, 0, val);
+				insertValue(root, segments, 0, val, autoIndex);
 			}
 		}
 		return root;
@@ -1936,42 +1953,57 @@ public class HttpRequest {
 	 *  {@code index}, creating intermediate maps and auto-numbering empty ({@code []}) segments.
 	 *  Recurses once per segment (bounded by the segment count from {@link #parseSegments}). */
 	@SuppressWarnings("unchecked")
-	private void insertValue(Map<String, Object> currentMap, List<String> segments, int index, String value) {
+	private void insertValue(Map<String, Object> currentMap, List<String> segments, int index, String value,
+			Map<Map<String, Object>, Integer> autoIndex) {
 		String segment = segments.get(index);
-		if (index == segments.size() - 1) {
-			if (segment.isEmpty()) {
-				int nextKey = getNextIntegerKey(currentMap);
-				currentMap.put(String.valueOf(nextKey), value);
-			} else {
-				currentMap.put(segment, value);
-			}
-			return;
-		}
-		String key = segment;
+		String key;
 		if (segment.isEmpty()) {
-			int nextKey = getNextIntegerKey(currentMap);
+			// Array-style "[]" append: take the running next index for this map in O(1).
+			int nextKey = autoIndex.getOrDefault(currentMap, 0);
 			key = String.valueOf(nextKey);
+			autoIndex.put(currentMap, nextKey + 1);
+		} else {
+			key = segment;
+			// Keep the running index in step with an explicit non-negative integer key, so a later
+			// "[]" append uses max(existing int keys)+1 — exactly the old getNextIntegerKey behaviour.
+			int parsed = asNonNegativeIntKey(segment);
+			if (parsed >= 0) {
+				int cur = autoIndex.getOrDefault(currentMap, 0);
+				if (parsed + 1 > cur) {
+					autoIndex.put(currentMap, parsed + 1);
+				}
+			}
+		}
+		if (index == segments.size() - 1) {
+			currentMap.put(key, value);
+			return;
 		}
 		Object child = currentMap.get(key);
 		if (!(child instanceof Map)) {
 			child = new LinkedHashMap<String, Object>();
 			currentMap.put(key, child);
 		}
-		insertValue((Map<String, Object>) child, segments, index + 1, value);
+		insertValue((Map<String, Object>) child, segments, index + 1, value, autoIndex);
 	}
 
-	/** Returns the next auto-increment integer key for an array-style ({@code []}) segment: one more
-	 *  than the largest existing integer key, or 0 if there are none. */
-	private int getNextIntegerKey(Map<String, Object> map) {
-		int max = -1;
-		for (String key : map.keySet()) {
-			try {
-				int val = Integer.parseInt(key);
-				if (val > max) max = val;
-			} catch (NumberFormatException e) {
-				// ignore
-			}
+	/** Parses {@code s} as a non-negative {@code int} key, or returns -1 if it isn't one. Matches the
+	 *  classification the old {@code getNextIntegerKey} got from {@link Integer#parseInt} (values that
+	 *  overflow {@code int} return -1, just as the old code's caught NumberFormatException ignored
+	 *  them), but cheaply rejects the common non-numeric key on its first character so no exception is
+	 *  thrown on the hot path. */
+	private static int asNonNegativeIntKey(String s) {
+		if (s.isEmpty()) {
+			return -1;
 		}
-		return max + 1;
+		char c0 = s.charAt(0);
+		if (c0 < '0' || c0 > '9') {
+			return -1;
+		}
+		try {
+			int v = Integer.parseInt(s);
+			return v >= 0 ? v : -1;
+		} catch (NumberFormatException e) {
+			return -1;
+		}
 	}
 }

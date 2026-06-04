@@ -30,6 +30,11 @@ public class SSLSessionHandler {
 
 	private boolean handshakeComplete = false;
 
+	// Set once the peer's close_notify has been unwrapped. We don't throw on it immediately if there
+	// is still buffered plaintext to deliver (a request can be coalesced with close_notify in one TCP
+	// segment); the closed signal is raised only once all decrypted application data has been drained.
+	private boolean inboundClosed = false;
+
 	/** Creates a server-side TLS session for a channel: builds the {@link SSLEngine}, sizes the
 	 *  net/app wrap/unwrap buffers from the session, and begins the handshake (driven by
 	 *  {@link #handshake()} as bytes arrive). */
@@ -298,6 +303,9 @@ public class SSLSessionHandler {
 	/** Decrypts inbound ciphertext: buffers {@code src} alongside any residual bytes, unwraps every
 	 *  complete TLS record into a (growable) destination, drives any TLS 1.3 post-handshake messages,
 	 *  and returns the recovered application bytes (read-ready). */
+	// Reusable destination for wrap() — avoids a ~130 KiB allocation on every HTTPS write.
+	private ByteBuffer wrapDst;
+
 	// Reusable plaintext destination for unwrap() — avoids a ~64 KiB allocation on every HTTPS read.
 	// This handler is per-connection and only touched on its reactor's loop thread, and the buffer
 	// returned by unwrap() is fully copied out by the caller before the next read can call unwrap()
@@ -339,10 +347,9 @@ public class SSLSessionHandler {
 				// The engine may have requested a post-handshake write (e.g. KeyUpdate response)
 				// before needing more inbound bytes — drive it now so the response isn't dropped.
 				driveHandshake(res.getHandshakeStatus());
-				// If driveHandshake deferred a write, we cannot drain the netReadBuf further; stop.
-				if (hasPendingWrite()) {
-					break;
-				}
+				// Underflow means the next record is incomplete, so we always stop here and wait for
+				// more inbound bytes (whether or not driveHandshake deferred a write — that pending
+				// write is drained independently on OP_WRITE).
 				break;
 			} else if (res.getStatus() == SSLEngineResult.Status.BUFFER_OVERFLOW) {
 				// Restore src position: the engine may have advanced it before detecting overflow.
@@ -353,7 +360,12 @@ public class SSLSessionHandler {
 				dst = newDst;
 				unwrapDst = newDst; // keep the grown buffer for reuse on subsequent reads
 			} else if (res.getStatus() == SSLEngineResult.Status.CLOSED) {
-				throw new SSLConnectionClosedException();
+				// Peer sent close_notify. Stop unwrapping, but DON'T discard any application bytes
+				// already decoded earlier in this same call — a complete request can arrive coalesced
+				// with close_notify in a single TCP segment. Deliver the buffered plaintext first; the
+				// closed signal is raised after the loop only once there's nothing left to return.
+				inboundClosed = true;
+				break;
 			} else {
 				// OK: a record may have triggered post-handshake handshaking (TLS 1.3
 				// NewSessionTicket / KeyUpdate) — drive it so the engine's response is sent.
@@ -365,6 +377,12 @@ public class SSLSessionHandler {
 		}
 		netReadBuf.compact();
 		dst.flip();
+		// Now that any buffered plaintext has been flipped for return, raise the closed signal only
+		// when there is nothing left to deliver. This lets a request coalesced with close_notify be
+		// processed; the next unwrap call (with no remaining plaintext) cleanly reports the close.
+		if (inboundClosed && !dst.hasRemaining()) {
+			throw new SSLConnectionClosedException();
+		}
 		return dst;
 	}
 
@@ -372,13 +390,19 @@ public class SSLSessionHandler {
 	 *  destination on overflow and stopping cleanly if the engine can make no progress (e.g. it must
 	 *  first read a peer handshake message). Returns the ciphertext ready to write. */
 	public synchronized ByteBuffer wrap(ByteBuffer src) throws IOException {
-		ByteBuffer dst = ByteBuffer.allocate(engine.getSession().getPacketBufferSize() * 2);
+		int wantCap = engine.getSession().getPacketBufferSize() * 2;
+		if (wrapDst == null || wrapDst.capacity() < wantCap) {
+			wrapDst = ByteBuffer.allocate(wantCap);
+		}
+		ByteBuffer dst = wrapDst;
+		dst.clear();
 		while (src.hasRemaining()) {
 			int srcPos = src.position();
 			SSLEngineResult res = engine.wrap(src, dst);
 			if (res.getStatus() == SSLEngineResult.Status.BUFFER_OVERFLOW) {
 				src.position(srcPos); // restore position — engine may have advanced it before overflow
 				ByteBuffer newDst = ByteBuffer.allocate(dst.capacity() * 2);
+				wrapDst = newDst;
 				dst.flip();
 				newDst.put(dst);
 				dst = newDst;

@@ -42,7 +42,12 @@ public class AsynchronousHttpClient {
 	private static final Logger logger = LoggerFactory.getLogger(AsynchronousHttpClient.class);
 
 	private static final long TIMEOUT = 15 * 1000;	// 15s
-	
+
+	/** Hard cap on a decoded response body (Content-Length or summed chunks). A hostile/buggy server
+	 *  must not be able to OOM the client by declaring a giant Content-Length or streaming endless
+	 *  chunks; once this is exceeded the request fails cleanly via onFailure. */
+	private static final int MAX_RESPONSE_BODY_SIZE = 64 * 1024 * 1024; // 64 MiB
+
 	private static final AsyncResult<Response> nopAsyncResult = NopAsyncResult.of(Response.class).nopAsyncResult;
 
 	private AsynchronousSocket socket;
@@ -240,6 +245,11 @@ public class AsynchronousHttpClient {
 				failAndClose(new IOException("Invalid Content-Length in response: " + contentLength));
 				return;
 			}
+			// Bound the declared body: a hostile server must not OOM us with a giant Content-Length.
+			if (bodyLength > MAX_RESPONSE_BODY_SIZE) {
+				failAndClose(new IOException("Response body exceeds maximum permitted size: " + bodyLength));
+				return;
+			}
 			socket.readBytes(
 					bodyLength,
 					new NaiveAsyncResult() { public void onSuccess(String body) { onBody(body); } }
@@ -269,7 +279,28 @@ public class AsynchronousHttpClient {
 				return;
 			}
 			String newUrl = UrlUtil.urlJoin(request.getURL(), location);
-			request = new Request(newUrl, HttpVerb.valueOf(request.getVerb()), true, request.getMaxRedirects() - 1);
+			// Only ever follow a redirect to http/https — a hostile server must not be able to point us
+			// at file://, gopher://, jar:// etc. (an SSRF / local-resource vector via a custom handler).
+			String scheme = null;
+			try {
+				scheme = new java.net.URI(newUrl).getScheme();
+			} catch (Exception e) {
+				// fall through to the null-scheme rejection below
+			}
+			if (scheme == null
+					|| !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
+				close();
+				AsyncResult<Response> cb = responseCallback;
+				responseCallback = nopAsyncResult;
+				cb.onFailure(new IOException("Refusing redirect to non-http(s) scheme: " + newUrl));
+				return;
+			}
+			// RFC 9110 §15.4.4: a 303 See Other redirect changes the method to GET regardless of the
+			// original; 307/308 preserve it, and historically 301/302 are also followed with GET by most
+			// agents for non-GET/HEAD. Switch to GET for 303 specifically (the spec-mandated case).
+			HttpVerb redirectVerb = isSeeOther(response.getStatusLine())
+				? HttpVerb.GET : HttpVerb.valueOf(request.getVerb());
+			request = new Request(newUrl, redirectVerb, true, request.getMaxRedirects() - 1);
 			logger.debug("Following redirect, new url: {}, redirects left: {}", newUrl, request.getMaxRedirects());
 			if (socket != null) socket.close();
 			doFetch(responseCallback, requestStarted);
@@ -280,16 +311,28 @@ public class AsynchronousHttpClient {
 	}
 
 	private static boolean isRedirectStatus(String statusLine) {
-		if (statusLine == null) return false;
+		return redirectCode(statusLine) != -1;
+	}
+
+	/** True if the response is a 303 See Other (the redirect that mandates switching to GET). */
+	private static boolean isSeeOther(String statusLine) {
+		return redirectCode(statusLine) == 303;
+	}
+
+	/** Returns the status code if {@code statusLine} is one of the followable redirects (301/302/303/
+	 *  307/308), else -1. */
+	private static int redirectCode(String statusLine) {
+		if (statusLine == null) return -1;
 		int sp1 = statusLine.indexOf(' ');
-		if (sp1 < 0) return false;
+		if (sp1 < 0) return -1;
 		int sp2 = statusLine.indexOf(' ', sp1 + 1);
 		String codeStr = (sp2 < 0) ? statusLine.substring(sp1 + 1) : statusLine.substring(sp1 + 1, sp2);
 		try {
-			int code = Integer.parseInt(codeStr);
-			return code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
+			int code = Integer.parseInt(codeStr.trim());
+			boolean followable = code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
+			return followable ? code : -1;
 		} catch (NumberFormatException e) {
-			return false;
+			return -1;
 		}
 	}
 	
@@ -328,6 +371,14 @@ public class AsynchronousHttpClient {
 			return;
 		}
 		logger.debug("chunk octet: {} (decimal: {})", octet, readBytes);
+		// Bound a single chunk and the running total: this both caps memory and makes the
+		// `readBytes + NEWLINE.length()` below safe from int overflow (a near-MAX_VALUE chunk size
+		// would otherwise wrap to a negative/small read count and hang the client).
+		if (readBytes > MAX_RESPONSE_BODY_SIZE
+				|| (long) response.currentBodyLength() + readBytes > MAX_RESPONSE_BODY_SIZE) {
+			failAndClose(new IOException("Chunked response body exceeds maximum permitted size"));
+			return;
+		}
 		cancelTimeout();
 		startTimeout();
 		if (readBytes != 0) {

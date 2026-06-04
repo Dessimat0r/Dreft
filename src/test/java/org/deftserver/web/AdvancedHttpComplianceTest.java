@@ -1,6 +1,7 @@
 package org.deftserver.web;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
@@ -101,6 +102,24 @@ public class AdvancedHttpComplianceTest {
 		String del = raw("DELETE /compliance HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
 		assertTrue("DELETE must dispatch, got: " + del.substring(0, Math.min(40, del.length())), del.startsWith("HTTP/1.1 200"));
 		assertTrue("DELETE handled", del.endsWith("DELETE"));
+	}
+
+	@Test
+	public void ifNoneMatchOnNonGetMethodIs412Not304() throws Exception {
+		// RFC 9110 §13.1.2: for a method other than GET/HEAD, a *matching* If-None-Match is a
+		// precondition failure -> 412, NOT a 304 Not Modified (304 is GET/HEAD-only semantics).
+		// The PUT handler writes a body, so the server auto-generates an ETag that "*" matches.
+		String put = raw("PUT /compliance HTTP/1.1\r\nHost: localhost\r\n"
+			+ "If-None-Match: *\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc");
+		assertTrue("PUT + If-None-Match:* must be 412, got: "
+			+ put.substring(0, Math.min(40, put.length())), put.startsWith("HTTP/1.1 412"));
+		assertFalse("must not be 304 on a non-GET method", put.startsWith("HTTP/1.1 304"));
+
+		// Sanity: the same precondition on GET is the normal 304 Not Modified.
+		String get = raw("GET /compliance HTTP/1.1\r\nHost: localhost\r\n"
+			+ "If-None-Match: *\r\nConnection: close\r\n\r\n");
+		assertTrue("GET + If-None-Match:* must be 304, got: "
+			+ get.substring(0, Math.min(40, get.length())), get.startsWith("HTTP/1.1 304"));
 	}
 
 	@BeforeClass

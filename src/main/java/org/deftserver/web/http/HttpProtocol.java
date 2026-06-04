@@ -354,7 +354,7 @@ public class HttpProtocol implements IOHandler {
 	/** Not used server-side (OP_CONNECT is a client-side concern); logged if ever invoked. */
 	@Override
 	public void handleConnect(SelectionKey key) throws IOException {
-		logger.error("handle connect in HttpProcotol...");
+		logger.error("handle connect in HttpProtocol...");
 	}
 
 	/**
@@ -1290,8 +1290,11 @@ public class HttpProtocol implements IOHandler {
 					bytesRead = 0;
 				} else {
 					netReadBuf.flip();
+					// unwrap() already returns the plaintext flipped (read-ready); do NOT flip again —
+					// a second flip zeroes remaining() and silently drops every decrypted wss:// frame
+					// (the HTTP SSL read path at the top of getHttpRequest consumes unwrap()'s result
+					// directly for exactly this reason).
 					ByteBuffer appReadBuf = sslHandler.unwrap(netReadBuf);
-					appReadBuf.flip();
 					if (appReadBuf.remaining() > buffer.remaining()) {
 						buffer.flip();
 						ByteBuffer temp = ByteBuffer.allocate(appReadBuf.remaining() + buffer.capacity());
@@ -1435,6 +1438,10 @@ public class HttpProtocol implements IOHandler {
 						code = 1000; // no status code → normal closure
 					} else if (payload.length == 1 || !isValidWebSocketCloseCode(((payload[0] & 0xFF) << 8) | (payload[1] & 0xFF))) {
 						code = 1002; // protocol error
+					} else if (payload.length > 2 && !isValidUtf8(payload, 2, payload.length - 2)) {
+						// RFC 6455 §8.1 / §7.1.6: the Close reason (after the 2-byte code) MUST be valid
+						// UTF-8; otherwise fail with 1007 Invalid frame payload data (Autobahn 7.5.1).
+						code = 1007;
 					} else {
 						code = ((payload[0] & 0xFF) << 8) | (payload[1] & 0xFF);
 					}
@@ -1537,6 +1544,20 @@ public class HttpProtocol implements IOHandler {
 				return true;
 			default:
 				return false; // includes 1004, 1005, 1006, 1015 and all other reserved/invalid codes
+		}
+	}
+
+	/** True if {@code [offset, offset+length)} of {@code data} decodes as strict UTF-8 (no malformed
+	 *  or unmappable sequences) — used to validate a WebSocket Close-frame reason (RFC 6455 §8.1). */
+	private static boolean isValidUtf8(byte[] data, int offset, int length) {
+		try {
+			java.nio.charset.StandardCharsets.UTF_8.newDecoder()
+				.onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+				.onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+				.decode(ByteBuffer.wrap(data, offset, length));
+			return true;
+		} catch (java.nio.charset.CharacterCodingException e) {
+			return false;
 		}
 	}
 

@@ -46,6 +46,16 @@ public class DynamicCompressionTest {
 		}
 	}
 
+	private static class UppercaseTypeRequestHandler extends RequestHandler {
+		@Override
+		public void get(org.deftserver.web.http.HttpRequest request, org.deftserver.web.http.HttpResponse response) throws IOException {
+			// Mixed/upper-case media type — RFC 9110 §8.3.1 says media types are case-insensitive,
+			// so this must still be recognised as compressible.
+			response.setHeader("Content-Type", "TEXT/Plain; charset=UTF-8");
+			response.write(PAYLOAD);
+		}
+	}
+
 	private static class DoubleFinishRequestHandler extends RequestHandler {
 		@Override
 		public void get(org.deftserver.web.http.HttpRequest request, org.deftserver.web.http.HttpResponse response) throws IOException {
@@ -67,6 +77,7 @@ public class DynamicCompressionTest {
 		Map<String, RequestHandler> reqHandlers = new HashMap<>();
 		reqHandlers.put("/compress", new CompressibleRequestHandler());
 		reqHandlers.put("/double_finish", new DoubleFinishRequestHandler());
+		reqHandlers.put("/uppercase_type", new UppercaseTypeRequestHandler());
 		
 		server = new HttpServer(new Application(reqHandlers));
 		
@@ -170,6 +181,24 @@ public class DynamicCompressionTest {
 		String decompressed = decompressGzip(bodyBytes);
 		
 		assertEquals(PAYLOAD, decompressed);
+	}
+
+	@Test
+	public void testUppercaseContentTypeStillCompresses() throws Exception {
+		// Regression: the compressibility gate folds the media type case-insensitively, so a handler
+		// that sets "TEXT/Plain" (rather than lower-case "text/plain") must still get gzip+chunked.
+		HttpClient client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
+		HttpRequest request = HttpRequest.newBuilder()
+				.uri(URI.create("http://localhost:" + PORT + "/uppercase_type"))
+				.header("Accept-Encoding", "gzip")
+				.GET()
+				.build();
+		HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+		assertEquals(200, response.statusCode());
+		assertEquals("upper-case text/* must still compress", "gzip",
+			response.headers().firstValue("Content-Encoding").orElse(null));
+		assertEquals("chunked", response.headers().firstValue("Transfer-Encoding").orElse(null));
+		assertEquals(PAYLOAD, decompressGzip(response.body()));
 	}
 
 	private String decompressGzip(byte[] compressed) throws IOException {

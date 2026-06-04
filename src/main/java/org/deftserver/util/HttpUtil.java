@@ -429,24 +429,34 @@ public class HttpUtil {
 		return bestType;
 	}
 
-	public static byte[] compress(byte[] bytes, String encoding) throws java.io.IOException {
+	public static byte[] compress(byte[] buf, int offset, int length, String encoding) throws java.io.IOException {
 		if (encoding == null) {
-			return bytes;
+			if (offset == 0 && length == buf.length) return buf;
+			byte[] copy = new byte[length];
+			System.arraycopy(buf, offset, copy, 0, length);
+			return copy;
 		}
 		String enc = encoding.trim().toLowerCase(java.util.Locale.ROOT);
 		java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
 		if (enc.equals("gzip")) {
 			try (java.util.zip.GZIPOutputStream gzos = new java.util.zip.GZIPOutputStream(baos)) {
-				gzos.write(bytes);
+				gzos.write(buf, offset, length);
 			}
 		} else if (enc.equals("zstd")) {
 			try (com.github.luben.zstd.ZstdOutputStream zos = new com.github.luben.zstd.ZstdOutputStream(baos)) {
-				zos.write(bytes);
+				zos.write(buf, offset, length);
 			}
 		} else {
-			return bytes;
+			if (offset == 0 && length == buf.length) return buf;
+			byte[] copy = new byte[length];
+			System.arraycopy(buf, offset, copy, 0, length);
+			return copy;
 		}
 		return baos.toByteArray();
+	}
+
+	public static byte[] compress(byte[] bytes, String encoding) throws java.io.IOException {
+		return compress(bytes, 0, bytes.length, encoding);
 	}
 
 	public static byte[] decompress(byte[] bytes, String encoding) throws java.io.IOException {

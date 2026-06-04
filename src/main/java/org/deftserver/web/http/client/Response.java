@@ -66,6 +66,13 @@ public class Response {
 				+ "\n, statusLine=" + statusLine + "]\n" + ", request time: " + requestTime +"ms";
 	}
 
+	/** Current accumulated body length (chunks received so far). Unlike {@link #getBody()} this does
+	 *  NOT materialise/cache the body, so it is safe to call mid-stream (e.g. for a size-cap check)
+	 *  without freezing the still-growing body to an incomplete value. */
+	public int currentBodyLength() {
+		return body != null ? body.length() : bodyBuilder.length();
+	}
+
 	/** Appends a received body chunk (used while streaming/dechunking the response). */
 	public void addChunk(String chunk) {
 		bodyBuilder.append(chunk);

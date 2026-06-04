@@ -368,11 +368,15 @@ public class HttpResponse {
 			String preferred = org.deftserver.util.HttpUtil.getPreferredCompression(acceptEncoding);
 			if (preferred != null) {
 				String contentType = headers.get("Content-Type");
-				if (contentType != null && (
-					contentType.contains("text") || 
-					contentType.contains("json") || 
-					contentType.contains("xml") || 
-					contentType.contains("javascript"))) {
+				// RFC 9110 §8.3.1: media types are case-insensitive. Fold to lower (Locale.ROOT,
+				// per the project convention) so "TEXT/HTML" or "Application/JSON" still compress.
+				String ctLower = contentType == null ? null
+					: contentType.toLowerCase(java.util.Locale.ROOT);
+				if (ctLower != null && (
+					ctLower.contains("text") ||
+					ctLower.contains("json") ||
+					ctLower.contains("xml") ||
+					ctLower.contains("javascript"))) {
 					compressionEncoding = preferred;
 					useChunked = true;
 					setHeader("Content-Encoding", preferred);
@@ -400,9 +404,8 @@ public class HttpResponse {
 
 		if (compressionEncoding != null && responseData.position() > 0) {
 			try {
-				byte[] compressed = org.deftserver.util.HttpUtil.compress(
-					java.util.Arrays.copyOfRange(responseData.array(), 0, responseData.position()),
-					compressionEncoding
+				byte[] compressed = HttpUtil.compress(
+					responseData.array(), 0, responseData.position(), compressionEncoding
 				);
 				responseData.clear();
 				responseData.put(compressed);
@@ -450,14 +453,20 @@ public class HttpResponse {
 					return;
 				}
 			}
-			// 3. If-None-Match: 304 (for the GET/HEAD path here) if the current ETag matches.
+			// RFC 9110 §13.1.2/§13.1.3: If-None-Match and If-Modified-Since are only "not modified"
+			// (304) semantics for GET/HEAD. For any other method a *matching* If-None-Match is a
+			// precondition failure (412), and If-Modified-Since MUST be ignored entirely.
+			org.deftserver.web.HttpVerb method = request.getMethod();
+			boolean isGetOrHead = method == org.deftserver.web.HttpVerb.GET
+					|| method == org.deftserver.web.HttpVerb.HEAD;
+			// 3. If-None-Match: matches → 304 for GET/HEAD, 412 for any other method.
 			if (inm != null && etag != null && ifMatchHeaderMatches(inm, etag)) {
-				setStatusCode(304);
+				setStatusCode(isGetOrHead ? 304 : 412);
 				markBodiless();
 				return;
 			}
-			// 4. If-Modified-Since: only when If-None-Match is absent (§13.1.3). 304 if not modified.
-			if (inm == null && ims != null && lm != null) {
+			// 4. If-Modified-Since: only when If-None-Match is absent (§13.1.3) and only for GET/HEAD.
+			if (isGetOrHead && inm == null && ims != null && lm != null) {
 				long imsTime = DateUtil.parseRFC1123ToMillis(ims);
 				long lmTime = DateUtil.parseRFC1123ToMillis(lm);
 				if (imsTime != -1 && lmTime != -1 && lmTime <= imsTime) {

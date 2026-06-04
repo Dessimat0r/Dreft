@@ -122,6 +122,29 @@ public class HttpRequestTest {
 	}
 
 	@Test
+	public void queryStringEdgeCasesParseSafely() {
+		// features_required.md §8: the parser must handle the awkward query variants without crashing
+		// and with well-defined behaviour: empty key (=value) kept, empty segments (&&) skipped,
+		// multi-value (x=1&x=2) preserved in order, empty value (y=) dropped, flag-only (z) dropped.
+		HttpRequest request = HttpRequest.of(
+			raw("GET /?=value&&x=1&x=2&y=&z HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+		assertTrue(request.isComplete());
+		Map<String, Collection<String>> params = request.getParameters();
+
+		// Empty key is kept with its value.
+		assertEquals("value", request.getParameter(""));
+		// Multi-value preserves both, in order; getParameter returns the first.
+		assertEquals(2, params.get("x").size());
+		assertEquals("1", request.getParameter("x"));
+		assertTrue(params.get("x").contains("2"));
+		// Empty value and flag-only are dropped entirely.
+		assertEquals(null, request.getParameter("y"));
+		assertEquals(null, request.getParameter("z"));
+		assertFalse("empty-value param must not appear", params.containsKey("y"));
+		assertFalse("flag-only param must not appear", params.containsKey("z"));
+	}
+
+	@Test
 	public void testSingleParameterWithoutValue() {
 		HttpRequestHelper helper = new HttpRequestHelper();
 		helper.addGetParameter("firstname", null);
@@ -693,6 +716,52 @@ public class HttpRequestTest {
 		Map<String, HttpRequest.Part> parts = request.getMultiParts();
 		assertNotNull("field1 part must be parsed", parts.get("field1"));
 		assertEquals("value1", parts.get("field1").getData());
+	}
+
+	@Test
+	public void testBracketArrayAppendAutoIndexSemantics() {
+		// Locks the PHP-style auto-index semantics of getParametersTree() so the O(1) optimisation
+		// of getNextIntegerKey stays exactly equivalent to the old max-key+1 scan.
+
+		// (1) Plain append: a[]=x&a[]=y&a[]=z -> {a:{0:x,1:y,2:z}}
+		HttpRequest r1 = HttpRequest.of(
+			raw("GET /?a[]=x&a[]=y&a[]=z HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+		@SuppressWarnings("unchecked")
+		Map<String, Object> a1 = (Map<String, Object>) r1.getParametersTree().get("a");
+		assertEquals("x", a1.get("0"));
+		assertEquals("y", a1.get("1"));
+		assertEquals("z", a1.get("2"));
+
+		// (2) Explicit numeric then append: a[5]=x&a[]=y -> append goes to max(5)+1 = 6
+		HttpRequest r2 = HttpRequest.of(
+			raw("GET /?a[5]=x&a[]=y HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+		@SuppressWarnings("unchecked")
+		Map<String, Object> a2 = (Map<String, Object>) r2.getParametersTree().get("a");
+		assertEquals("x", a2.get("5"));
+		assertEquals("append after a[5] must use index 6", "y", a2.get("6"));
+
+		// (3) Same-named params are GROUPED in the flat map first, so "a[]" holds [x,z] and is
+		// processed as one entry before "a[2]": a[]=x&a[2]=y&a[]=z -> {0:x, 1:z, 2:y}. (Both a[]
+		// appends are consecutive; then a[2] is the explicit numeric key.)
+		HttpRequest r3 = HttpRequest.of(
+			raw("GET /?a[]=x&a[2]=y&a[]=z HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+		@SuppressWarnings("unchecked")
+		Map<String, Object> a3 = (Map<String, Object>) r3.getParametersTree().get("a");
+		assertEquals("first a[] append -> 0", "x", a3.get("0"));
+		assertEquals("second a[] append (grouped) -> 1", "z", a3.get("1"));
+		assertEquals("explicit a[2] -> 2", "y", a3.get("2"));
+
+		// (4) Intermediate append creating sub-maps: a[][b]=x&a[][c]=y -> {a:{0:{b:x},1:{c:y}}}
+		HttpRequest r4 = HttpRequest.of(
+			raw("GET /?a[][b]=x&a[][c]=y HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+		@SuppressWarnings("unchecked")
+		Map<String, Object> a4 = (Map<String, Object>) r4.getParametersTree().get("a");
+		@SuppressWarnings("unchecked")
+		Map<String, Object> a4_0 = (Map<String, Object>) a4.get("0");
+		@SuppressWarnings("unchecked")
+		Map<String, Object> a4_1 = (Map<String, Object>) a4.get("1");
+		assertEquals("x", a4_0.get("b"));
+		assertEquals("y", a4_1.get("c"));
 	}
 
 	@Test

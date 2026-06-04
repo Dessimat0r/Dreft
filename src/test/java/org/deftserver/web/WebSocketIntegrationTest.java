@@ -283,6 +283,57 @@ public class WebSocketIntegrationTest {
 	}
 
 	@Test
+	public void testCloseFrameWithInvalidUtf8ReasonYields1007() throws Exception {
+		// RFC 6455 §8.1 / §7.1.6: the Close reason (bytes after the 2-byte code) must be valid UTF-8.
+		// A Close with a valid code (1000) but an invalid-UTF-8 reason must make the server reply with
+		// close code 1007 (Invalid frame payload data), not echo 1000 (Autobahn 7.5.1).
+		try (java.net.Socket s = new java.net.Socket("localhost", PORT)) {
+			s.setSoTimeout(3000);
+			String req = "GET /ws HTTP/1.1\r\n" +
+				"Host: localhost\r\n" +
+				"Upgrade: websocket\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+				"Sec-WebSocket-Version: 13\r\n\r\n";
+			java.io.OutputStream os = s.getOutputStream();
+			os.write(req.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+			os.flush();
+			java.io.InputStream in = s.getInputStream();
+			java.io.ByteArrayOutputStream acc = new java.io.ByteArrayOutputStream();
+			int c;
+			while (!acc.toString(java.nio.charset.StandardCharsets.ISO_8859_1).contains("\r\n\r\n")
+					&& (c = in.read()) != -1) {
+				acc.write(c);
+			}
+			assertTrue("handshake must succeed first:\n" + acc,
+				acc.toString(java.nio.charset.StandardCharsets.ISO_8859_1).startsWith("HTTP/1.1 101"));
+			// Masked Close frame: code 1000 (0x03E8) + invalid UTF-8 reason byte 0xFF.
+			byte[] code = {0x03, (byte) 0xE8};
+			byte[] reason = {(byte) 0xFF, (byte) 0xFE};
+			byte[] payload = new byte[code.length + reason.length];
+			System.arraycopy(code, 0, payload, 0, 2);
+			System.arraycopy(reason, 0, payload, 2, reason.length);
+			byte[] key = {0x21, 0x43, 0x65, (byte) 0x87};
+			java.io.ByteArrayOutputStream f = new java.io.ByteArrayOutputStream();
+			f.write(0x88);                 // FIN + Close opcode
+			f.write(0x80 | payload.length); // MASK + len
+			f.write(key, 0, 4);
+			for (int i = 0; i < payload.length; i++) f.write(payload[i] ^ key[i % 4]);
+			os.write(f.toByteArray());
+			os.flush();
+			// Read the server's Close frame: 0x88, len(2), code-hi, code-lo.
+			int b0 = in.read();
+			int len = in.read();
+			int hi = in.read();
+			int lo = in.read();
+			assertEquals("server must reply with a Close frame", 0x88, b0);
+			assertEquals("close payload length must be 2 (code only)", 2, len);
+			int replyCode = ((hi & 0xFF) << 8) | (lo & 0xFF);
+			assertEquals("invalid-UTF-8 close reason must yield 1007", 1007, replyCode);
+		}
+	}
+
+	@Test
 	public void testLargeMessageExceedingReadBuffer() throws Exception {
 		// A message far larger than READ_BUFFER_SIZE (2048) must round-trip — the non-SSL WS
 		// read buffer has to grow to hold the whole frame instead of stalling.

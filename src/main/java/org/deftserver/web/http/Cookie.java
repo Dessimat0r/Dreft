@@ -143,7 +143,10 @@ public class Cookie {
 		if (maxAge != null) {
 			sb.append("; Max-Age=").append(maxAge);
 		}
-		if (secure) {
+		// RFC 6265bis §5.4.7: a SameSite=None cookie MUST also be Secure or browsers reject (drop) it.
+		// Emit Secure when explicitly set OR implied by SameSite=None, so the cookie isn't silently
+		// discarded by the client.
+		if (secure || sameSite == SameSite.NONE) {
 			sb.append("; Secure");
 		}
 		if (httpOnly) {

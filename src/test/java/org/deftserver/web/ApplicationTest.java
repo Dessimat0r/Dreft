@@ -105,6 +105,28 @@ public class ApplicationTest {
 		
 	}
 	
+	@Test
+	public void literalPathWithRegexMetacharacterDoesNotCrashConstruction() {
+		// Regression: a LITERAL route (not wrapped in parens, so not a capturing group) whose last
+		// segment contains an unbalanced regex metacharacter — e.g. "[" — must NOT be compiled as a
+		// regex. Compiling it threw PatternSyntaxException and crashed Application construction (and
+		// thus server startup) on a perfectly legal route. It must register as an exact-match path.
+		Map<String, RequestHandler> handlers = new HashMap<String, RequestHandler>();
+		final RequestHandler literal = new RequestHandler() {
+			@Override public void get(HttpRequest request, HttpResponse response) { }
+		};
+		handlers.put("/files/data[1", literal);   // unbalanced '[' — legal literal, invalid regex
+		handlers.put("/api/v(1", literal);          // unbalanced '(' — also a legal literal
+		Application app = new Application(handlers); // must not throw
+
+		// '(' is a URI sub-delim (allowed in a path and preserved by normalisation), so this routes
+		// as an exact match — proving the literal segment was registered rather than compiled.
+		Map<String, String> headers = new HashMap<String, String>();
+		headers.put("host", "localhost");
+		HttpRequest request = new HttpRequest("GET /api/v(1 HTTP/1.1", headers);
+		assertEquals("literal path with regex metachar must route as an exact match", literal, app.getHandler(request));
+	}
+
 	@Test(expected=PatternSyntaxException.class)
 	public void malFormedRegularExpressionTest() {
 		Map<String, RequestHandler> handlers = new HashMap<String, RequestHandler>();

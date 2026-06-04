@@ -119,7 +119,7 @@ public class HttpServer {
 			channel.socket().setReuseAddress(true);
 			channel.socket().bind(endpoint, org.deftserver.web.http.HttpServerDescriptor.ACCEPT_BACKLOG);
 		} catch (IOException e) {
-			logger.error("Could not bind socket: {}", e);
+			logger.error("Could not bind socket", e);
 			try { channel.close(); } catch (IOException ignore) {}
 			throw e;
 		}
