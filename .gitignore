@@ -11,3 +11,13 @@
 /bin
 scratch_jstack_dump.txt
 CLAUDE.md
+.claude/
+.context/
+.contextignore
+.github/
+.vscode/
+opencode.json
+AGENTS.md
+progress.md
+features_required.md
+gen-context.config.json
