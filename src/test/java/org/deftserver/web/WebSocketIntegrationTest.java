@@ -56,6 +56,17 @@ public class WebSocketIntegrationTest {
 		}
 	}
 
+	private static class ThrowingWebSocketHandler extends WebSocketHandler {
+		@Override
+		public void onOpen(WebSocketConnection connection) { /* nop */ }
+		@Override
+		public void onMessage(WebSocketConnection connection, String message) {
+			throw new RuntimeException("Intentional WS handler exception");
+		}
+		@Override
+		public void onClose(WebSocketConnection connection) { /* nop */ }
+	}
+
 	@BeforeClass
 	public static void setUp() throws Exception {
 		// Find a free ephemeral port
@@ -66,6 +77,7 @@ public class WebSocketIntegrationTest {
 
 		Map<String, RequestHandler> reqHandlers = new HashMap<>();
 		reqHandlers.put("/ws", new MyWebSocketHandler());
+		reqHandlers.put("/throw-ws", new ThrowingWebSocketHandler());
 		
 		server = new HttpServer(new Application(reqHandlers));
 		
@@ -226,6 +238,51 @@ public class WebSocketIntegrationTest {
 	}
 
 	@Test
+	public void testRsvBitSetFailsTheConnection() throws Exception {
+		// RFC 6455 §5.2: with no extension negotiated, any data frame whose RSV1/2/3 bits are set
+		// is a protocol error and the server MUST fail (close) the connection. We send an otherwise
+		// well-formed masked text frame but with RSV1 set in the first byte (0xC1 = FIN|RSV1|text).
+		try (java.net.Socket s = new java.net.Socket("localhost", PORT)) {
+			s.setSoTimeout(3000);
+			String req = "GET /ws HTTP/1.1\r\n" +
+				"Host: localhost\r\n" +
+				"Upgrade: websocket\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+				"Sec-WebSocket-Version: 13\r\n\r\n";
+			java.io.OutputStream os = s.getOutputStream();
+			os.write(req.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+			os.flush();
+			// Consume the 101 handshake response headers.
+			java.io.InputStream in = s.getInputStream();
+			java.io.ByteArrayOutputStream acc = new java.io.ByteArrayOutputStream();
+			int c;
+			while (!acc.toString(java.nio.charset.StandardCharsets.ISO_8859_1).contains("\r\n\r\n")
+					&& (c = in.read()) != -1) {
+				acc.write(c);
+			}
+			assertTrue("handshake must succeed first:\n" + acc,
+				acc.toString(java.nio.charset.StandardCharsets.ISO_8859_1).startsWith("HTTP/1.1 101"));
+			// Masked text frame with RSV1 set: 0xC1, MASK|len, key, masked payload "hi".
+			byte[] payload = "hi".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+			byte[] key = {0x11, 0x22, 0x33, 0x44};
+			java.io.ByteArrayOutputStream f = new java.io.ByteArrayOutputStream();
+			f.write(0xC1);                 // FIN + RSV1 + opcode text
+			f.write(0x80 | payload.length); // MASK + len
+			f.write(key, 0, 4);
+			for (int i = 0; i < payload.length; i++) f.write(payload[i] ^ key[i % 4]);
+			os.write(f.toByteArray());
+			os.flush();
+			// The server must close the connection. Reading should return either a Close frame
+			// (0x88 first byte) or EOF — never an echo. We assert the stream ends or yields a close.
+			int first = in.read();
+			boolean closedOrCloseFrame = (first == -1) || (first == 0x88);
+			assertTrue("RSV-bit frame must fail the connection (got first byte 0x"
+				+ Integer.toHexString(first & 0xFF) + ")", closedOrCloseFrame);
+		}
+	}
+
+	@Test
 	public void testLargeMessageExceedingReadBuffer() throws Exception {
 		// A message far larger than READ_BUFFER_SIZE (2048) must round-trip — the non-SSL WS
 		// read buffer has to grow to hold the whole frame instead of stalling.
@@ -287,5 +344,75 @@ public class WebSocketIntegrationTest {
 		assertEquals("echo: Frag-mented", serverResponse);
 
 		webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "Bye!").get(5, TimeUnit.SECONDS);
+	}
+
+	@Test
+	public void testWebSocketHandlerRuntimeExceptionClosesConnection() throws Exception {
+		// A RuntimeException thrown from onMessage must close the connection (the catch in
+		// HttpProtocol.handleRead closes the channel) but must NOT take down the I/O loop.
+		try (java.net.Socket s = new java.net.Socket("localhost", PORT)) {
+			s.setSoTimeout(3000);
+			String upgrade = "GET /throw-ws HTTP/1.1\r\n" +
+				"Host: localhost\r\n" +
+				"Upgrade: websocket\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+				"Sec-WebSocket-Version: 13\r\n\r\n";
+			s.getOutputStream().write(upgrade.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+			s.getOutputStream().flush();
+
+			java.io.InputStream in = s.getInputStream();
+			java.io.ByteArrayOutputStream acc = new java.io.ByteArrayOutputStream();
+			int c;
+			while (!acc.toString(java.nio.charset.StandardCharsets.ISO_8859_1).contains("\r\n\r\n")
+					&& (c = in.read()) != -1) {
+				acc.write(c);
+			}
+			assertTrue("handshake must succeed",
+				acc.toString(java.nio.charset.StandardCharsets.ISO_8859_1).startsWith("HTTP/1.1 101"));
+
+			// Send a valid masked text frame — the handler will throw and the server must close.
+			byte[] payload = "hi".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+			byte[] key = {0x11, 0x22, 0x33, 0x44};
+			java.io.ByteArrayOutputStream f = new java.io.ByteArrayOutputStream();
+			f.write(0x81); // FIN + text opcode
+			f.write(0x80 | payload.length); // MASK + len
+			f.write(key, 0, 4);
+			for (int i = 0; i < payload.length; i++) f.write(payload[i] ^ key[i % 4]);
+			s.getOutputStream().write(f.toByteArray());
+			s.getOutputStream().flush();
+
+			// The server must close the connection (either a close frame 0x88 or EOF).
+			int first = in.read();
+			boolean closedOrCloseFrame = (first == -1) || (first == 0x88);
+			assertTrue("RuntimeException in onMessage must close the connection (got first byte 0x"
+				+ Integer.toHexString(first & 0xFF) + ")", closedOrCloseFrame);
+		}
+
+		// Verify the I/O loop is still alive: a second (valid) WebSocket connection works.
+		CompletableFuture<String> messageFuture = new CompletableFuture<>();
+		CountDownLatch closeLatch = new CountDownLatch(1);
+		WebSocket.Listener listener = new WebSocket.Listener() {
+			@Override public void onOpen(WebSocket webSocket) { webSocket.request(1); }
+			@Override public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+				messageFuture.complete(data.toString());
+				webSocket.request(1);
+				return null;
+			}
+			@Override public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
+				closeLatch.countDown();
+				return null;
+			}
+			@Override public void onError(WebSocket ws, Throwable error) { closeLatch.countDown(); }
+		};
+		HttpClient client = HttpClient.newHttpClient();
+		WebSocket ws = client.newWebSocketBuilder()
+				.buildAsync(URI.create("ws://localhost:" + PORT + "/ws"), listener)
+				.get(5, TimeUnit.SECONDS);
+		assertNotNull(ws);
+		ws.sendText("ping", true);
+		assertEquals("echo: ping", messageFuture.get(5, TimeUnit.SECONDS));
+		ws.sendClose(WebSocket.NORMAL_CLOSURE, "Bye!").get(5, TimeUnit.SECONDS);
+		assertTrue(closeLatch.await(5, TimeUnit.SECONDS));
 	}
 }

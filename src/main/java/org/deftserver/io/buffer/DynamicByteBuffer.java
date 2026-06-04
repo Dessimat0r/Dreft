@@ -162,6 +162,9 @@ public class DynamicByteBuffer {
 
 	/**
 	 * See {@link ByteBuffer#array}
+	 *
+	 * <p><b>Warning:</b> callers must not modify the returned array — it is the internal
+	 * backing storage and mutation corrupts the buffer's state.</p>
 	 */	
 	public byte[] array() {
 		return backend.array();

@@ -40,6 +40,7 @@ public class HttpResponse {
 	private boolean useChunked = false;
 	private String compressionEncoding = null;
 	private boolean finished = false;
+	private boolean suppressContentLength = false;
 	private final java.util.List<Cookie> cookies = new java.util.ArrayList<>();
 
 	/** Queues a cookie to be emitted as its own {@code Set-Cookie} response header line. */
@@ -220,6 +221,12 @@ public class HttpResponse {
 				responseData.compact();	// make room for more data be 'read' in
 				key.channel().register(key.selector(), SelectionKey.OP_WRITE, responseData);
 			}
+			if (sslPending) {
+				// The encrypted bytes are deferred to OP_WRITE (non-blocking); arm the idle write
+				// timeout so a peer that stops reading the response is reaped rather than holding the
+				// pending buffer + connection forever.
+				protocol.armWriteTimeout(channel);
+			}
 		} catch (IOException e) {
 			logger.debug("Client disconnected during flush (broken pipe): {}", e.getMessage());
 			// Route through closeChannel so the protocol's channel set / per-channel maps are
@@ -266,6 +273,8 @@ public class HttpResponse {
 					if (closeConnection) {
 						protocol.markCloseAfterWrite(clientChannel);
 					}
+					// Deferred write still draining — reap the peer if it stalls reading the response.
+					protocol.armWriteTimeout(clientChannel);
 				} else {
 					if (!mbb.hasRemaining()) {
 						finishConnection(closeConnection);
@@ -308,6 +317,8 @@ public class HttpResponse {
 					if (closeConnection) {
 						protocol.markCloseAfterWrite(clientChannel);
 					}
+					// Deferred write still draining — reap the peer if it stalls reading the response.
+					protocol.armWriteTimeout(clientChannel);
 				} else {
 					boolean isWriting = key.isValid() && (key.interestOps() & SelectionKey.OP_WRITE) != 0;
 					if (isWriting) {
@@ -498,6 +509,9 @@ public class HttpResponse {
 		// (robustness/interop over a pedantic reading; a 1xx body is forbidden regardless, RFC 9110
 		// §6.2, so the header is harmless).
 		setHeader("Content-Length", "0");
+		// RFC 9110 §8.6: a server MUST NOT send Content-Length on 1xx (except 101), 204, or 304.
+		// createInitalLineAndHeaders() checks the flag and skips it for non-101 statuses.
+		suppressContentLength = true;
 	}
 
 	/** Serializes the status line, all headers, and one {@code Set-Cookie} line per queued cookie,
@@ -505,6 +519,11 @@ public class HttpResponse {
 	private String createInitalLineAndHeaders() {
 		StringBuilder sb = new StringBuilder(HttpUtil.createInitialLine(statusCode));
 		for (Map.Entry<String, String> header : headers.entrySet()) {
+			// RFC 9110 §8.6: MUST NOT send Content-Length on 1xx (except 101), 204, or 304.
+			// The 101 exception is required by the JDK java.net.http WebSocket client.
+			if (suppressContentLength && statusCode != 101 && "Content-Length".equals(header.getKey())) {
+				continue;
+			}
 			// A header field is always "name ':' OWS value"; emitting the name alone (when the
 			// value is empty) produces a malformed, colon-less line.
 			sb.append(header.getKey()).append(": ");

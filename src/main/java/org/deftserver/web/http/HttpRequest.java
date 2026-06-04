@@ -122,7 +122,7 @@ public class HttpRequest {
 
 		/** This part's body as raw bytes (e.g. an uploaded file's contents). */
 		public byte[] getRawData() {
-			return rawData;
+			return rawData == null ? null : Arrays.copyOf(rawData, rawData.length);
 		}
 
 		/** This part's body decoded as an ISO-8859-1 string (convenient for text fields). */
@@ -852,7 +852,7 @@ public class HttpRequest {
 	/** Parsed {@code application/x-www-form-urlencoded} body parameters (empty if none). */
 	@SuppressWarnings("unchecked")
 	public Map<String, Collection<String>> getPostParameters() {
-		return postParameters == null ? Collections.emptyMap() : (Map) postParameters;
+		return postParameters == null ? Collections.emptyMap() : Collections.unmodifiableMap((Map) postParameters);
 	}
 	
 	/** Parses one multipart part-header line (e.g. Content-Disposition) into its name, base value and
@@ -951,7 +951,7 @@ public class HttpRequest {
 	/** All query-string parameters as an unmodifiable multi-valued map. */
 	@SuppressWarnings("unchecked")
 	public Map<String, Collection<String>> getParameters() {
-		return (Map) parameters;
+		return Collections.unmodifiableMap((Map) parameters);
 	}
 
 	/** The raw request body as a string (ISO-8859-1), or null if there is no body. */

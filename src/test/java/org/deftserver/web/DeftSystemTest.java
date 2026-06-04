@@ -1559,6 +1559,23 @@ public class DeftSystemTest {
 	}
 
 	@Test
+	public void multiRangeRequestServedAsFull200Test() throws IOException {
+		// §22: a multi-range request (comma-separated ranges → multipart/byteranges) is OPTIONAL.
+		// This server does not implement multipart/byteranges, so per RFC 9110 §14.2 it ignores the
+		// Range and serves the full representation (200) rather than crashing or sending a malformed
+		// partial response. (test.txt is the 8-byte "test.txt".)
+		String response = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Range: bytes=0-1,3-4\r\n\r\n"
+		);
+		assertTrue("multi-range must be served as full 200, got: "
+			+ response.substring(0, Math.min(40, response.length())), response.startsWith("HTTP/1.1 200"));
+		assertFalse("multi-range must not produce a 206 partial", response.startsWith("HTTP/1.1 206"));
+		assertTrue("full body must be present", response.trim().endsWith("test.txt"));
+	}
+
+	@Test
 	public void rangeRequestTest() throws IOException {
 		// Valid range 0-3
 		String resp1 = sendRawRequest(
@@ -1601,6 +1618,16 @@ public class DeftSystemTest {
 		);
 		assertTrue(resp4.startsWith("HTTP/1.1 416"));
 		assertTrue(resp4.contains("Content-Range: bytes */8"));
+
+		// RFC 9110 §14.1.2: a suffix range of zero length (bytes=-0) is unsatisfiable -> 416.
+		String resp5 = sendRawRequest(
+			"GET /src/test/resources/test.txt HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Range: bytes=-0\r\n\r\n"
+		);
+		assertTrue("zero-length suffix range must be 416, got: "
+			+ resp5.substring(0, Math.min(40, resp5.length())), resp5.startsWith("HTTP/1.1 416"));
+		assertTrue(resp5.contains("Content-Range: bytes */8"));
 	}
 
 	@Test
@@ -2724,6 +2751,37 @@ public class DeftSystemTest {
 		assertNotNull(hobbies);
 		assertEquals("NIO", hobbies.get("0"));
 		assertEquals("SSL", hobbies.get("1"));
+	}
+
+	@Test
+	public void postWithoutContentLengthReturns411Test() throws IOException {
+		// POST, PUT, and PATCH without Content-Length or Transfer-Encoding must be 411.
+		String response = sendRawRequest(
+			"POST /post HTTP/1.1\r\n" +
+			"Host: localhost\r\n\r\n"
+		);
+		assertTrue("expected 411 for POST, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 411"));
+	}
+
+	@Test
+	public void putWithoutContentLengthReturns411Test() throws IOException {
+		String response = sendRawRequest(
+			"PUT /put HTTP/1.1\r\n" +
+			"Host: localhost\r\n\r\n"
+		);
+		assertTrue("expected 411 for PUT, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 411"));
+	}
+
+	@Test
+	public void patchWithoutContentLengthReturns411Test() throws IOException {
+		String response = sendRawRequest(
+			"PATCH /post HTTP/1.1\r\n" +
+			"Host: localhost\r\n\r\n"
+		);
+		assertTrue("expected 411 for PATCH, got: " + response.substring(0, Math.min(40, response.length())),
+			response.startsWith("HTTP/1.1 411"));
 	}
 
 }

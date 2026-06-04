@@ -54,6 +54,53 @@ public class AdvancedHttpComplianceTest {
 			response.setHeader("X-Bar-Recv", barTrailer != null ? barTrailer : "none");
 			response.write("body:" + body);
 		}
+
+		@Override
+		public void put(org.deftserver.web.http.HttpRequest q, org.deftserver.web.http.HttpResponse r) {
+			r.write("PUT:" + q.getBody());
+		}
+
+		@Override
+		public void patch(org.deftserver.web.http.HttpRequest q, org.deftserver.web.http.HttpResponse r) {
+			r.write("PATCH:" + q.getBody());
+		}
+
+		@Override
+		public void delete(org.deftserver.web.http.HttpRequest q, org.deftserver.web.http.HttpResponse r) {
+			r.write("DELETE");
+		}
+	}
+
+	/** Sends a raw request and returns the full response (status line + headers + body). */
+	private static String raw(String request) throws Exception {
+		try (Socket socket = new Socket("127.0.0.1", PORT)) {
+			socket.setSoTimeout(5000);
+			socket.getOutputStream().write(request.getBytes());
+			socket.getOutputStream().flush();
+			java.io.ByteArrayOutputStream acc = new java.io.ByteArrayOutputStream();
+			byte[] buf = new byte[4096];
+			int r;
+			while ((r = socket.getInputStream().read(buf)) != -1) {
+				acc.write(buf, 0, r);
+			}
+			return acc.toString(java.nio.charset.StandardCharsets.ISO_8859_1);
+		}
+	}
+
+	@Test
+	public void putPatchDeleteMethodsDispatchToTheHandler() throws Exception {
+		// §3/§9: PUT, PATCH and DELETE must dispatch to the handler's overridden method (not 501/405).
+		String put = raw("PUT /compliance HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc");
+		assertTrue("PUT must dispatch, got: " + put.substring(0, Math.min(40, put.length())), put.startsWith("HTTP/1.1 200"));
+		assertTrue("PUT body echoed", put.endsWith("PUT:abc"));
+
+		String patch = raw("PATCH /compliance HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+		assertTrue("PATCH must dispatch, got: " + patch.substring(0, Math.min(40, patch.length())), patch.startsWith("HTTP/1.1 200"));
+		assertTrue("PATCH body echoed", patch.endsWith("PATCH:hi"));
+
+		String del = raw("DELETE /compliance HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+		assertTrue("DELETE must dispatch, got: " + del.substring(0, Math.min(40, del.length())), del.startsWith("HTTP/1.1 200"));
+		assertTrue("DELETE handled", del.endsWith("DELETE"));
 	}
 
 	@BeforeClass

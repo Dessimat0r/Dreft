@@ -14,7 +14,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-import org.deftserver.util.ArrayUtil;
 import org.deftserver.util.HttpRequestHelper;
 import org.deftserver.util.HttpUtil;
 import org.deftserver.web.http.HttpRequest;
@@ -65,14 +64,6 @@ public class HttpRequestTest {
 		}
 
 		// TODO RS 100920 verify that the headers exist
-	}
-
-	public void testRemoveTrailingEmptyStrings() {
-		String fields1[] = new String[]{"a", "b", "c", "", ""};
-		String fields2[] = new String[]{"a", "b", "c"};
-
-		assertEquals(3, ArrayUtil.dropFromEndWhile(fields1, "").length);
-		assertEquals(3, ArrayUtil.dropFromEndWhile(fields2, "").length);
 	}
 
 	@Test

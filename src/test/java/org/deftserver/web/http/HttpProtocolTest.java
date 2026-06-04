@@ -10,6 +10,7 @@ import java.util.Map;
 
 import org.deftserver.io.IOLoop;
 import org.deftserver.web.Application;
+import org.deftserver.web.HttpVerb;
 import org.junit.Test;
 
 public class HttpProtocolTest {
@@ -27,8 +28,11 @@ public class HttpProtocolTest {
 
 		// Open a real unconnected SocketChannel
 		try (SocketChannel channel = SocketChannel.open()) {
-			// Populate partials map to simulate a half-received request
-			partials.put(channel, null);
+			// Populate partials map to simulate a half-received request.
+			// Use a dummy HttpRequest (not null) because ConcurrentHashMap rejects null values.
+			java.util.Map<String, String> emptyHeaders = java.util.Collections.emptyMap();
+			HttpRequest dummy = new HttpRequest("GET / HTTP/1.1", emptyHeaders);
+			partials.put(channel, dummy);
 			assertEquals(1, partials.size());
 
 			// Trigger closeChannel

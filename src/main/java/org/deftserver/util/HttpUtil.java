@@ -45,8 +45,8 @@ public class HttpUtil {
 	private static final String _410_GONE					= "HTTP/1.1 410 Gone\r\n"; 
 	private static final String _411_LENGTH_REQUIRED		= "HTTP/1.1 411 Length Required\r\n"; 
 	private static final String _412_PRECONDITION_FAILED	= "HTTP/1.1 412 Precondition Failed\r\n"; 
-	private static final String _413_REQUEST_ENTITY_LARGE	= "HTTP/1.1 413 Request Entity Too Large\r\n"; 
-	private static final String _414_REQUEST_URI_TOO_LONG	= "HTTP/1.1 414 Request-URI Too Long\r\n"; 
+	private static final String _413_PAYLOAD_TOO_LARGE		= "HTTP/1.1 413 Payload Too Large\r\n"; 
+	private static final String _414_URI_TOO_LONG			= "HTTP/1.1 414 URI Too Long\r\n"; 
 	private static final String _415_UNSUPPORTED_MEDIA_TYPE	= "HTTP/1.1 415 Unsupported Media Type\r\n"; 
 	private static final String _416_REQUEST_RANGE_NOT_SAT	= "HTTP/1.1 416 Requested Range Not Satisfiable\r\n"; 
 	private static final String _417_EXPECTATION_FAILED		= "HTTP/1.1 417 Expectation Failed\r\n";
@@ -123,9 +123,9 @@ public class HttpUtil {
 		case 412:
 			return _412_PRECONDITION_FAILED;
 		case 413:
-			return _413_REQUEST_ENTITY_LARGE;
+			return _413_PAYLOAD_TOO_LARGE;
 		case 414:
-			return _414_REQUEST_URI_TOO_LONG;
+			return _414_URI_TOO_LONG;
 		case 415:
 			return _415_UNSUPPORTED_MEDIA_TYPE;
 		case 416:

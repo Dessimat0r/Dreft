@@ -298,9 +298,20 @@ public class SSLSessionHandler {
 	/** Decrypts inbound ciphertext: buffers {@code src} alongside any residual bytes, unwraps every
 	 *  complete TLS record into a (growable) destination, drives any TLS 1.3 post-handshake messages,
 	 *  and returns the recovered application bytes (read-ready). */
+	// Reusable plaintext destination for unwrap() — avoids a ~64 KiB allocation on every HTTPS read.
+	// This handler is per-connection and only touched on its reactor's loop thread, and the buffer
+	// returned by unwrap() is fully copied out by the caller before the next read can call unwrap()
+	// again, so reuse is safe. Grown (and re-kept) on BUFFER_OVERFLOW.
+	private ByteBuffer unwrapDst;
+
 	public synchronized ByteBuffer unwrap(ByteBuffer src) throws IOException {
-		// Allocate destination large enough for multiple records being unwrapped in one call
-		ByteBuffer dst = ByteBuffer.allocate(engine.getSession().getApplicationBufferSize() * 4);
+		// Destination large enough for multiple records unwrapped in one call (reused across reads).
+		int wantCap = engine.getSession().getApplicationBufferSize() * 4;
+		if (unwrapDst == null || unwrapDst.capacity() < wantCap) {
+			unwrapDst = ByteBuffer.allocate(wantCap);
+		}
+		ByteBuffer dst = unwrapDst;
+		dst.clear();
 
 		appReadBuf.flip();
 		if (appReadBuf.hasRemaining()) {
@@ -340,6 +351,7 @@ public class SSLSessionHandler {
 				dst.flip();
 				newDst.put(dst);
 				dst = newDst;
+				unwrapDst = newDst; // keep the grown buffer for reuse on subsequent reads
 			} else if (res.getStatus() == SSLEngineResult.Status.CLOSED) {
 				throw new SSLConnectionClosedException();
 			} else {

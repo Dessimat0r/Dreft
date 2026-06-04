@@ -12,9 +12,10 @@ import java.nio.channels.SelectableChannel;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.util.HashMap;
 import java.util.Map;
 
-import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.deftserver.io.IOHandler;
 import org.deftserver.io.IOLoop;
@@ -36,47 +37,58 @@ public class HttpProtocol implements IOHandler {
 
 	
 	// a queue of half-baked (pending/unfinished) HTTP post request
-	private final Map<SelectableChannel, HttpRequest> partials = new HashMap<>();
-	private final Map<SocketChannel, ByteBuffer> readBuffers = new HashMap<>();
-	
-	private javax.net.ssl.SSLContext sslContext;
-	private final Map<SocketChannel, SSLSessionHandler> sslSessionHandlers = new HashMap<>();
+	private final Map<SelectableChannel, HttpRequest> partials = new ConcurrentHashMap<>();
+	private final Map<SocketChannel, ByteBuffer> readBuffers = new ConcurrentHashMap<>();
+	// Reusable scratch buffer for reading TLS ciphertext off the socket — avoids allocating ~16 KiB on
+	// every HTTPS read. Loop-thread-only (this HttpProtocol's reactor); grown if a session needs more.
+	private ByteBuffer sslReadScratch;
 
-	private final Map<SocketChannel, WebSocketHandler> websocketHandlers = new HashMap<>();
-	private final Map<SocketChannel, WebSocketConnection> websocketConnections = new HashMap<>();
+	private javax.net.ssl.SSLContext sslContext;
+	private final Map<SocketChannel, SSLSessionHandler> sslSessionHandlers = new ConcurrentHashMap<>();
+
+	private final Map<SocketChannel, WebSocketHandler> websocketHandlers = new ConcurrentHashMap<>();
+	private final Map<SocketChannel, WebSocketConnection> websocketConnections = new ConcurrentHashMap<>();
 	// Accumulates the payload of a fragmented WebSocket message (data frame with FIN=0 followed
 	// by continuation frames) until the final fragment arrives.
-	private final Map<SocketChannel, java.io.ByteArrayOutputStream> websocketFragments = new HashMap<>();
+	private final Map<SocketChannel, java.io.ByteArrayOutputStream> websocketFragments = new ConcurrentHashMap<>();
 	// Whether the in-progress WebSocket data message is text (opcode 0x1) — text messages are
 	// validated as UTF-8 at completion (RFC 6455 §8.1).
-	private final Map<SocketChannel, Boolean> websocketTextMessage = new HashMap<>();
+	private final Map<SocketChannel, Boolean> websocketTextMessage = new ConcurrentHashMap<>();
 
-	private final Map<SocketChannel, Timeout> headerReadTimeouts = new HashMap<>();
-	private final Map<SocketChannel, Timeout> bodyReadTimeouts = new HashMap<>();
+	private final Map<SocketChannel, Timeout> headerReadTimeouts = new ConcurrentHashMap<>();
+	private final Map<SocketChannel, Timeout> bodyReadTimeouts = new ConcurrentHashMap<>();
 	// Bounds the time an ASYNC/offloaded handler may take to finish its response (it runs off the
 	// loop, so the loop can't otherwise notice it hanging). Armed when dispatch reports async,
 	// cancelled when the response finishes. Distinct from the keep-alive (idle) timeout so a long
 	// async handler isn't cut off by the idle timer, and a hung async handler on a Connection: close
 	// connection (which has no keep-alive timeout) is still bounded rather than leaking forever.
-	private final Map<SocketChannel, Timeout> processingTimeouts = new HashMap<>();
+	private final Map<SocketChannel, Timeout> processingTimeouts = new ConcurrentHashMap<>();
+	// Idle response-write timeout for a DEFERRED (non-blocking TLS) write: a client that stops reading
+	// the response keeps the encrypted pendingWriteBuffer (and the connection) alive indefinitely.
+	// Since the write no longer blocks the loop (it's deferred to OP_WRITE), nothing else reaps it —
+	// so without this a slow/stalled response-reader is a memory/connection DoS (esp. with no
+	// max-connections cap). Reset on each OP_WRITE (= the peer drained some bytes = progress); fires
+	// (closes the channel) after RESPONSE_WRITE_TIMEOUT_MS of NO progress. Cancelled when the write
+	// completes or the channel closes.
+	private final Map<SocketChannel, Timeout> writeTimeouts = new ConcurrentHashMap<>();
 	/** How long an async/offloaded handler may take to finish its response before the connection is
 	 *  closed (anti-hang). Non-final so it can be tuned (raise it for legitimately long requests). */
-	public static long REQUEST_PROCESSING_TIMEOUT_MS = 60_000;
+	public static volatile long REQUEST_PROCESSING_TIMEOUT_MS = 60_000;
 	/** Idle timeout for an established WebSocket connection — longer than the HTTP keep-alive idle
 	 *  timeout because WebSockets are long-lived and may legitimately sit quiet between messages.
 	 *  Reset on every frame; on expiry the (presumed dead) connection is closed. Tunable. */
-	public static long WEBSOCKET_IDLE_TIMEOUT_MS = 300_000; // 5 min
+	public static volatile long WEBSOCKET_IDLE_TIMEOUT_MS = 300_000; // 5 min
 	// Channels whose current response declared Connection: close but whose body write was deferred
 	// to OP_WRITE (didn't fit the socket buffer). When that deferred write finally completes, the
 	// channel must be closed — NOT re-registered for read — so the server honours its own header.
-	private final java.util.Set<SocketChannel> closeAfterWrite = new java.util.HashSet<>();
+	private final java.util.Set<SocketChannel> closeAfterWrite = ConcurrentHashMap.newKeySet();
 
 	/** Maximum number of requests served on a single keep-alive connection before the server
 	 *  gracefully closes it (forces a fresh connection). Bounds per-connection resource use and
 	 *  connection monopolisation (cf. nginx keepalive_requests / Apache MaxKeepAliveRequests).
 	 *  Non-final so tests can lower it. */
-	public static int MAX_KEEP_ALIVE_REQUESTS = 1000;
-	private final Map<SocketChannel, Integer> keepAliveRequestCount = new HashMap<>();
+	public static volatile int MAX_KEEP_ALIVE_REQUESTS = 1000;
+	private final Map<SocketChannel, Integer> keepAliveRequestCount = new ConcurrentHashMap<>();
 	private int maxConnections = -1;
 	// Set of live client channels (not an int counter): channels can be closed via several paths
 	// that don't all funnel through closeChannel (IOLoop exception handlers, generic Closeables,
@@ -90,12 +102,13 @@ public class HttpProtocol implements IOHandler {
 	private static final long MAX_WS_FRAME_PAYLOAD = 16L * 1024 * 1024;
 
 	/** Absolute cap on how long a request body may take to arrive after its headers. Bounds
-	 *  the resources a slow/stalled body upload can hold (Slowloris-on-body). */
-	private static final long BODY_READ_TIMEOUT_MS = 30_000;
+	 *  the resources a slow/stalled body upload can hold (Slowloris-on-body). Non-final so tests
+	 *  can shorten it. */
+	public static volatile long BODY_READ_TIMEOUT_MS = 30_000;
 
 	/** How long a client may take to send its complete request-header section before the
 	 *  connection is timed out (Slowloris-on-headers). Non-final so tests can shorten it. */
-	public static long HEADER_READ_TIMEOUT_MS = 5000;
+	public static volatile long HEADER_READ_TIMEOUT_MS = 5000;
 
 	/** Largest the (plaintext) header read buffer may grow to while accumulating a request's
 	 *  header block; beyond this the request is answered with 431. Matches the header-section
@@ -103,11 +116,11 @@ public class HttpProtocol implements IOHandler {
 	private static final int MAX_HEADER_BUFFER_SIZE = 64 * 1024;
 
 	/** Per-channel state for serving a file larger than a single mmap window. */
-	private final Map<SocketChannel, FileStreamState> fileStreams = new HashMap<>();
+	private final Map<SocketChannel, FileStreamState> fileStreams = new ConcurrentHashMap<>();
 	/** Window size for chunked serving of large files. A single {@code FileChannel.map()} is capped
 	 *  at {@code Integer.MAX_VALUE}, so files/ranges larger than this are served window-by-window.
 	 *  Tunable (and lowerable by tests to exercise the chunked path with a small file). */
-	public static int FILE_WINDOW_SIZE = 256 * 1024 * 1024;
+	public static volatile int FILE_WINDOW_SIZE = 256 * 1024 * 1024;
 
 	private static final class FileStreamState {
 		final java.io.RandomAccessFile raf;
@@ -189,6 +202,8 @@ public class HttpProtocol implements IOHandler {
 			keepAliveRequestCount.remove(channel);
 			Timeout pt = processingTimeouts.remove(channel);
 			if (pt != null) pt.cancel();
+			Timeout wt = writeTimeouts.remove(channel);
+			if (wt != null) wt.cancel();
 			closeFileStream(channel); // release any in-progress large-file handle
 			partials.remove(channel);
 			readBuffers.remove(channel);
@@ -465,7 +480,9 @@ public class HttpProtocol implements IOHandler {
 			bt.cancel();
 		}
 		key.interestOps(key.interestOps() & ~SelectionKey.OP_READ);
-		logger.debug("handle read 3..., req class: {}, req: {}", request.getClass(), request);
+		if (logger.isDebugEnabled()) {
+			logger.debug("handle read 3..., req class: {}, req: {}", request.getClass(), request);
+		}
 		
 		final boolean keepAlive;
 
@@ -537,6 +554,10 @@ public class HttpProtocol implements IOHandler {
 
 		SSLSessionHandler sslHandler = sslSessionHandlers.get(channel);
 		if (sslHandler != null && sslHandler.hasPendingWrite()) {
+			// OP_WRITE fired ⇒ the socket made room ⇒ the peer drained some bytes ⇒ progress: reset
+			// the idle response-write timeout so a steadily-reading client isn't reaped (only a
+			// no-progress / stalled reader is).
+			prolongWriteTimeout(channel);
 			try {
 				sslHandler.onWritable();
 			} catch (IOException e) {
@@ -544,8 +565,11 @@ public class HttpProtocol implements IOHandler {
 				closeChannel(channel);
 				return;
 			}
-			if (!sslHandler.hasPendingWrite() && attachment == null) {
-				key.interestOps(key.interestOps() & ~SelectionKey.OP_WRITE);
+			if (!sslHandler.hasPendingWrite()) {
+				cancelWriteTimeout(channel); // deferred write drained
+				if (attachment == null) {
+					key.interestOps(key.interestOps() & ~SelectionKey.OP_WRITE);
+				}
 			}
 			// Fall through to service any concurrently pending response-body write (attachment).
 		}
@@ -896,10 +920,47 @@ public class HttpProtocol implements IOHandler {
 	}
 
 	private void finishDeferredWrite(SelectionKey key, SocketChannel channel) throws IOException {
+		cancelWriteTimeout(channel); // the deferred write completed — no longer a slow-reader risk
 		if (closeAfterWrite.remove(channel)) {
 			closeChannel(channel);
 		} else {
 			handleConnectionIdle(key, channel);
+		}
+	}
+
+	/** Arms (once) the idle response-write timeout for a deferred (non-blocking TLS) write. Idempotent. */
+	public void armWriteTimeout(SocketChannel channel) {
+		if (channel == null || writeTimeouts.containsKey(channel)) {
+			return;
+		}
+		Timeout t = new Timeout(
+			System.currentTimeMillis() + HttpServerDescriptor.RESPONSE_WRITE_TIMEOUT_MS,
+			new AsyncCallback() {
+				@Override public void onCallback() {
+					logger.warn("Response-write idle timeout (peer not reading the response) for {} — closing", channel);
+					closeChannel(channel);
+				}
+			});
+		writeTimeouts.put(channel, t);
+		ioLoop.addTimeout(t);
+	}
+
+	/** Resets the idle response-write timeout on write progress (the peer drained some bytes). No-op
+	 *  if no write timeout is currently armed. */
+	public void prolongWriteTimeout(SocketChannel channel) {
+		Timeout old = writeTimeouts.remove(channel);
+		if (old == null) {
+			return;
+		}
+		old.cancel();
+		armWriteTimeout(channel);
+	}
+
+	/** Cancels the response-write timeout (the deferred write completed or the channel is closing). */
+	public void cancelWriteTimeout(SocketChannel channel) {
+		Timeout t = writeTimeouts.remove(channel);
+		if (t != null) {
+			t.cancel();
 		}
 	}
 
@@ -995,9 +1056,17 @@ public class HttpProtocol implements IOHandler {
 		if (!buffer.hasRemaining()) throw new IllegalStateException("Cleared channel buffer has no remaining space.");
 		SSLSessionHandler sslHandler = sslSessionHandlers.get(clientChannel);
 		if (sslHandler != null) {
-			// Use the actual TLS packet buffer size (up to ~16 KB) — not the tiny READ_BUFFER_SIZE
+			// Use the actual TLS packet buffer size (up to ~16 KB) — not the tiny READ_BUFFER_SIZE.
+			// Reuse a per-protocol scratch buffer rather than allocating ~16 KB on EVERY HTTPS read:
+			// the loop is single-threaded and unwrap() copies all ciphertext into the handler's
+			// netReadBuf, so the scratch is fully consumed before the next read can touch it. (Each
+			// reactor thread has its own HttpProtocol, so there is no cross-thread sharing.)
 			int pktSize = sslHandler.getPacketBufferSize();
-			ByteBuffer encrypted = ByteBuffer.allocate(pktSize);
+			if (sslReadScratch == null || sslReadScratch.capacity() < pktSize) {
+				sslReadScratch = ByteBuffer.allocate(pktSize);
+			}
+			ByteBuffer encrypted = sslReadScratch;
+			encrypted.clear();
 			int read;
 			try {
 				read = clientChannel.read(encrypted);
@@ -1310,6 +1379,16 @@ public class HttpProtocol implements IOHandler {
 			}
 			if ((opcode >= 0x3 && opcode <= 0x7) || opcode >= 0xB) {
 				logger.warn("Reserved WebSocket opcode {} — closing channel", opcode);
+				closeChannel(clientChannel);
+				return;
+			}
+			// RFC 6455 §5.2: RSV1/RSV2/RSV3 (the three bits below FIN in the first byte) MUST be 0
+			// unless an extension that defines them was negotiated. Dreft negotiates no WebSocket
+			// extensions, so any set RSV bit is a protocol error and we fail the connection.
+			int rsv = b0 & 0x70;
+			if (rsv != 0) {
+				logger.warn("WebSocket frame with reserved RSV bits set (0x{}) — closing per RFC 6455 §5.2",
+						Integer.toHexString(rsv));
 				closeChannel(clientChannel);
 				return;
 			}

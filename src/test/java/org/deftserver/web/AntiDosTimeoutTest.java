@@ -112,4 +112,33 @@ public class AntiDosTimeoutTest {
 		s2.close();
 		s3.close();
 	}
+
+	@Test
+	public void testBodyReadTimeout() throws Exception {
+		long original = org.deftserver.web.http.HttpProtocol.BODY_READ_TIMEOUT_MS;
+		org.deftserver.web.http.HttpProtocol.BODY_READ_TIMEOUT_MS = 600;
+		try {
+			Socket socket = new Socket("127.0.0.1", PORT);
+			assertTrue(socket.isConnected());
+			// Send complete headers declaring a large body, then only 1 byte of body.
+			String headers = "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000000\r\n\r\n";
+			socket.getOutputStream().write(headers.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+			socket.getOutputStream().flush();
+			socket.getOutputStream().write('X');
+			socket.getOutputStream().flush();
+			// The server arms the body-read timeout after parsing headers. Wait for the 408.
+			java.io.InputStream is = socket.getInputStream();
+			byte[] buf = new byte[256];
+			int n = is.read(buf);
+			String response = n > 0
+				? new String(buf, 0, n, java.nio.charset.StandardCharsets.ISO_8859_1)
+				: "";
+			assertTrue("expected 408, got: " + response, response.startsWith("HTTP/1.1 408"));
+			// Connection must be closed after the 408.
+			assertEquals(-1, is.read());
+			socket.close();
+		} finally {
+			org.deftserver.web.http.HttpProtocol.BODY_READ_TIMEOUT_MS = original;
+		}
+	}
 }

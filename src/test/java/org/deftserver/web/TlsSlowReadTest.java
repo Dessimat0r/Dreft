@@ -99,6 +99,30 @@ public class TlsSlowReadTest {
 		return s;
 	}
 
+	@Test
+	public void largeHttpsResponseToNormalReaderArrivesComplete() throws Exception {
+		// A 4 MiB HTTPS response read normally must arrive byte-for-byte complete. This exercises the
+		// deferred (non-blocking) TLS write path over many OP_WRITE events — if the response completion
+		// fires before the deferred encrypted bytes finish draining, the body would be truncated.
+		try (SSLSocket s = connect()) {
+			s.getOutputStream().write(
+				"GET /big HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".getBytes());
+			s.getOutputStream().flush();
+			InputStream in = s.getInputStream();
+			java.io.ByteArrayOutputStream acc = new java.io.ByteArrayOutputStream();
+			byte[] buf = new byte[16384];
+			int r;
+			while ((r = in.read(buf)) != -1) {
+				acc.write(buf, 0, r);
+			}
+			String full = acc.toString(java.nio.charset.StandardCharsets.ISO_8859_1);
+			int bodyStart = full.indexOf("\r\n\r\n") + 4;
+			int bodyLen = full.length() - bodyStart;
+			assertTrue("large HTTPS response truncated: body was " + bodyLen + " of " + BIG.length
+				+ " bytes", bodyLen == BIG.length);
+		}
+	}
+
 	private static boolean smallRequest() {
 		try (SSLSocket victim = connect()) {
 			victim.getOutputStream().write(
@@ -139,8 +163,10 @@ public class TlsSlowReadTest {
 		try { attacker.close(); } catch (Exception ignore) { }
 
 		assertTrue("victim request must eventually succeed", ok);
-		assertTrue("the stalled SSL writer must be bounded by the write-timeout, not block the loop "
-			+ "indefinitely — victim took " + elapsedMs + " ms (timeout is 2000 ms)", elapsedMs < 8000);
+		// With non-blocking TLS writes the stalled reader does NOT block the loop at all, so the victim
+		// is served essentially immediately (not merely bounded by the write-timeout).
+		assertTrue("a stalled HTTPS reader must not block other clients (non-blocking TLS write) — "
+			+ "victim took " + elapsedMs + " ms", elapsedMs < 3000);
 
 		// Recovery: after the attacker is dropped, the server serves normally and promptly.
 		long start2 = System.nanoTime();

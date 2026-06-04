@@ -132,7 +132,18 @@ public class WebSocketFuzzTest {
 
 	/** Builds one random malformed/abusive WebSocket frame (or raw garbage). */
 	private static byte[] malformedFrame(ThreadLocalRandom rnd) {
-		switch (rnd.nextInt(9)) {
+		switch (rnd.nextInt(10)) {
+			case 9: { // RSV bit set with no extension negotiated (server MUST fail — RFC 6455 §5.2)
+				byte[] p = "rsv".getBytes(StandardCharsets.UTF_8);
+				byte[] key = {9, 8, 7, 6};
+				java.io.ByteArrayOutputStream f = new java.io.ByteArrayOutputStream();
+				int rsv = (1 + rnd.nextInt(7)) << 4;     // one or more of RSV1/2/3 set
+				f.write(0x80 | rsv | 0x1);               // FIN + RSV + text
+				f.write(0x80 | p.length);                // MASK + len
+				f.write(key, 0, 4);
+				for (int i = 0; i < p.length; i++) f.write(p[i] ^ key[i % 4]);
+				return f.toByteArray();
+			}
 			case 0: { // unmasked client text frame (server MUST close — RFC 6455 §5.1)
 				byte[] p = "unmasked".getBytes(StandardCharsets.UTF_8);
 				java.io.ByteArrayOutputStream f = new java.io.ByteArrayOutputStream();
