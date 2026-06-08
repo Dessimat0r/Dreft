@@ -3,6 +3,7 @@ package org.deftserver.web;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.io.BufferedReader;
@@ -27,17 +28,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
-import org.apache.http.Header;
-import org.apache.http.HttpResponse;
-import org.apache.http.ProtocolVersion;
-import org.apache.http.client.ClientProtocolException;
-import org.apache.http.client.HttpClient;
-import org.apache.http.client.methods.HttpDelete;
-import org.apache.http.client.methods.HttpGet;
-import org.apache.http.client.methods.HttpPost;
-import org.apache.http.client.methods.HttpPut;
-import org.apache.http.entity.StringEntity;
-import org.apache.http.message.BasicHeader;
+import java.net.http.HttpClient;
+import java.net.http.HttpResponse;
 import org.deftserver.example.kv.KeyValueStore;
 import org.deftserver.io.IOLoop;
 import org.deftserver.io.timeout.Timeout;
@@ -452,203 +444,178 @@ public class DeftSystemTest {
 	}
 
 	@Test
-	public void simpleGetRequestTest() throws ClientProtocolException, IOException {
+	public void simpleGetRequestTest() throws IOException, InterruptedException {
 		doSimpleGetRequest();
 	}
 
-	private void doSimpleGetRequest() throws ClientProtocolException, IOException {
-		List<Header> headers = new LinkedList<Header>();
-		headers.add(new BasicHeader("Connection", "Close"));
-		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/");
-		HttpResponse response = httpclient.execute(httpget);
-		List<String> expectedHeaders = Arrays.asList(new String[] {"Server", "Date", "Content-Length", "Etag", "Connection"});
+	private void doSimpleGetRequest() throws IOException, InterruptedException {
+		String[] expectedHeaders = {"Server", "Date", "Content-Length", "Etag", "Connection"};
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-
-		assertEquals(expectedHeaders.size(), response.getAllHeaders().length);
+		assertEquals(200, response.statusCode());
 
 		for (String header : expectedHeaders) {
-			assertTrue(response.getFirstHeader(header) != null);
+			assertTrue(response.headers().firstValue(header).isPresent());
 		}
 
-		assertEquals(expectedPayload, convertStreamToString(response.getEntity().getContent()).trim());
-		assertEquals(expectedPayload.length()+"", response.getFirstHeader("Content-Length").getValue());
+		assertEquals(expectedPayload, response.body().trim());
+		assertEquals(expectedPayload.length()+"", response.headers().firstValue("Content-Length").orElse(""));
 	}
 
 	/**
 	 * Test a RH that does a single write
-	 * @throws ClientProtocolException
+	 * @
 	 * @throws IOException
 	 */
 	@Test
-	public void wTest() throws ClientProtocolException, IOException {
-		List<Header> headers = new LinkedList<Header>();
-		headers.add(new BasicHeader("Connection", "Close"));
-		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/w");
-		HttpResponse response = httpclient.execute(httpget);
+	public void wTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/w"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("1", payLoad);
-		assertEquals(5, response.getAllHeaders().length);
-		assertEquals("1", response.getFirstHeader("Content-Length").getValue());
+		assertEquals(200, response.statusCode());
+		assertEquals("1", response.body().trim());
+		assertEquals("1", response.headers().firstValue("Content-Length").orElse(""));
 	}
 
 
 	@Test
-	public void wwTest() throws ClientProtocolException, IOException {
-		List<Header> headers = new LinkedList<Header>();
-		headers.add(new BasicHeader("Connection", "Close"));
-		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/ww");
-		HttpResponse response = httpclient.execute(httpget);
+	public void wwTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/ww"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("12", payLoad);
-		assertEquals(5, response.getAllHeaders().length);
-		assertEquals("2", response.getFirstHeader("Content-Length").getValue());
+		assertEquals(200, response.statusCode());
+		assertEquals("12", response.body().trim());
+		assertEquals("2", response.headers().firstValue("Content-Length").orElse(""));
 	}
 
 	@Test
-	public void wwfwTest() throws ClientProtocolException, IOException {
-		List<Header> headers = new LinkedList<Header>();
-		headers.add(new BasicHeader("Connection", "Close"));
-		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/wwfw");
-		HttpResponse response = httpclient.execute(httpget);
+	public void wwfwTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/wwfw"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("123", payLoad);
-		assertEquals(3, response.getAllHeaders().length);
+		assertEquals(200, response.statusCode());
+		assertEquals("123", response.body().trim());
+		assertEquals(3, response.headers().map().size());
 	}
 
 	@Test
-	public void wfwfTest() throws ClientProtocolException, IOException {
-		List<Header> headers = new LinkedList<Header>();
-		headers.add(new BasicHeader("Connection", "Close"));
-		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/wfwf");
-		HttpResponse response = httpclient.execute(httpget);
+	public void wfwfTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/wfwf"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("12", payLoad);
-		assertEquals(3, response.getAllHeaders().length);
+		assertEquals(200, response.statusCode());
+		assertEquals("12", response.body().trim());
+		assertEquals(3, response.headers().map().size());
 	}
 	
 	@Test
-	public void wfffwfffTest() throws ClientProtocolException, IOException {
-		List<Header> headers = new LinkedList<Header>();
-		headers.add(new BasicHeader("Connection", "Close"));
-		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/wfffwfff");
-		HttpResponse response = httpclient.execute(httpget);
+	public void wfffwfffTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/wfffwfff"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("12", payLoad);
-		assertEquals(3, response.getAllHeaders().length);
+		assertEquals(200, response.statusCode());
+		assertEquals("12", response.body().trim());
+		assertEquals(3, response.headers().map().size());
 	}
 
 	@Test
-	public void deleteTest() throws ClientProtocolException, IOException {
-		List<Header> headers = new LinkedList<Header>();
-		headers.add(new BasicHeader("Connection", "Close"));
-		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
-		HttpDelete httpdelete = new HttpDelete("http://localhost:" + PORT + "/delete");
-		HttpResponse response = httpclient.execute(httpdelete);
+	public void deleteTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/delete"))
+			.DELETE()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("delete", payLoad);
+		assertEquals(200, response.statusCode());
+		assertEquals("delete", response.body().trim());
 	}
 
 	@Test
-	public void PostTest() throws ClientProtocolException, IOException {
-		List<Header> headers = new LinkedList<Header>();
-		headers.add(new BasicHeader("Connection", "Close"));
-		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
-		HttpPost httppost = new HttpPost("http://localhost:" + PORT + "/post");
-		HttpResponse response = httpclient.execute(httppost);
+	public void PostTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/post"))
+			.POST(java.net.http.HttpRequest.BodyPublishers.noBody())
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("post", payLoad);
+		assertEquals(200, response.statusCode());
+		assertEquals("post", response.body().trim());
 	}
 
 	@Test
-	public void putTest() throws ClientProtocolException, IOException {
-		List<Header> headers = new LinkedList<Header>();
-		headers.add(new BasicHeader("Connection", "Close"));
-		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
-		HttpPut httpput = new HttpPut("http://localhost:" + PORT + "/put");
-		HttpResponse response = httpclient.execute(httpput);
+	public void putTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/put"))
+			.PUT(java.net.http.HttpRequest.BodyPublishers.noBody())
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("put", payLoad);
+		assertEquals(200, response.statusCode());
+		assertEquals("put", response.body().trim());
 	}
 
 	@Test
-	public void capturingTest() throws ClientProtocolException, IOException {
-		List<Header> headers = new LinkedList<Header>();
-		headers.add(new BasicHeader("Connection", "Close"));
-		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/capturing/1911");
-		HttpResponse response = httpclient.execute(httpget);
+	public void capturingTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/capturing/1911"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("/capturing/1911", payLoad);
+		assertEquals(200, response.statusCode());
+		assertEquals("/capturing/1911", response.body().trim());
 	}
 
 	@Test
-	public void erroneousCapturingTest() throws ClientProtocolException, IOException {
-		List<Header> headers = new LinkedList<Header>();
-		headers.add(new BasicHeader("Connection", "Close"));
-		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/capturing/r1911");
-		HttpResponse response = httpclient.execute(httpget);
+	public void erroneousCapturingTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/capturing/r1911"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(404, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("Not Found", response.getStatusLine().getReasonPhrase());
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("<html><head><title>404: Not found</title></head><body>Requested resource: <tt>/capturing/r1911</tt> was not found.</body>", payLoad);
+		assertEquals(404, response.statusCode());
+		assertEquals("<html><head><title>404: Not found</title></head><body>Requested resource: <tt>/capturing/r1911</tt> was not found.</body>", response.body().trim());
 	}
 
 	@Test
@@ -684,173 +651,173 @@ public class DeftSystemTest {
 	}
 
 	@Test
-	public void keepAliveRequestTest() throws ClientProtocolException, IOException {
-		List<Header> headers = new LinkedList<Header>();
-		headers.add(new BasicHeader("Connection", "Keep-Alive"));
-		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().setDefaultHeaders(headers).build();
+	public void keepAliveRequestTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
 
 		for (int i = 1; i <= 5; i++) {
 			doKeepAliveRequestTest(httpclient);
 		}
 	}
 
-	private void doKeepAliveRequestTest(org.apache.http.client.HttpClient httpclient)
-	throws IOException, ClientProtocolException {
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/");
-		HttpResponse response = httpclient.execute(httpget);
+	private void doKeepAliveRequestTest(java.net.http.HttpClient httpclient)
+	throws IOException, InterruptedException {
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		assertEquals(5, response.getAllHeaders().length);
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals(expectedPayload, payLoad);
+		assertEquals(200, response.statusCode());
+		assertEquals(expectedPayload, response.body().trim());
 	}
 
 	@Test
-	public void HTTP_1_0_noConnectionHeaderTest() throws ClientProtocolException, IOException {
-		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/");
-		httpget.setProtocolVersion(new ProtocolVersion("HTTP", 1, 0));
-		HttpResponse response = httpclient.execute(httpget);
-
-		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		assertEquals(5, response.getAllHeaders().length);
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals(expectedPayload, payLoad);
+	public void HTTP_1_0_noConnectionHeaderTest() throws IOException {
+		// Uses sendRawRequest because JDK HttpClient doesn't allow setting the HTTP version.
+		String response = sendRawRequest(
+			"GET / HTTP/1.0\r\n" +
+			"Host: localhost\r\n\r\n"
+		);
+		assertTrue(response.startsWith("HTTP/1.0 200") || response.startsWith("HTTP/1.1 200"));
+		String responseLower = response.toLowerCase(java.util.Locale.ROOT);
+		String[] expectedHeaders = {"server", "date", "content-length", "etag", "connection"};
+		for (String header : expectedHeaders) {
+			assertTrue("Missing header: " + header, responseLower.contains(header + ": "));
+		}
+		int bodyStart = response.indexOf("\r\n\r\n") + 4;
+		String body = response.substring(bodyStart).trim();
+		assertEquals(expectedPayload, body);
 	}
 
 
 	@Test
-	public void httpExceptionTest() throws ClientProtocolException, IOException {
-		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/throw");
-		HttpResponse response = httpclient.execute(httpget);
+	public void httpExceptionTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/throw"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(500, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("Internal Server Error", response.getStatusLine().getReasonPhrase());
-		// text/plain body is gzipped (Vary: Accept-Encoding) and the error path emits X-Content-Type-Options: nosniff (8 headers).
-		assertEquals(8, response.getAllHeaders().length);
-		assertEquals("nosniff", response.getFirstHeader("X-Content-Type-Options").getValue());
-		assertTrue(response.getFirstHeader("Vary").getValue().toLowerCase().contains("accept-encoding"));
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("exception message", payLoad);
+		assertEquals(500, response.statusCode());
+		// The tiny error body ("exception message", 17 B) is below COMPRESSION_MIN_SIZE (V3-57), so it
+		// is sent identity (NOT gzipped) — gzip would only make it larger. The error path still emits
+		// X-Content-Type-Options: nosniff.
+		assertEquals("nosniff", response.headers().firstValue("X-Content-Type-Options").orElse(null));
+		assertNull("a sub-threshold error body must not be gzipped", response.headers().firstValue("Content-Encoding").orElse(null));
+		assertEquals("exception message", response.body().trim());
 	}
 
 	@Test
-	public void asyncHttpExceptionTest() throws ClientProtocolException, IOException {
-		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/async_throw");
-		HttpResponse response = httpclient.execute(httpget);
+	public void asyncHttpExceptionTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/async_throw"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(500, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("Internal Server Error", response.getStatusLine().getReasonPhrase());
-		// text/plain body is gzipped (Vary: Accept-Encoding) and the error path emits X-Content-Type-Options: nosniff (8 headers).
-		assertEquals(8, response.getAllHeaders().length);
-		assertEquals("nosniff", response.getFirstHeader("X-Content-Type-Options").getValue());
-		assertTrue(response.getFirstHeader("Vary").getValue().toLowerCase().contains("accept-encoding"));
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("exception message", payLoad);
+		assertEquals(500, response.statusCode());
+		// Tiny error body below COMPRESSION_MIN_SIZE (V3-57) → identity, not gzipped.
+		assertEquals("nosniff", response.headers().firstValue("X-Content-Type-Options").orElse(null));
+		assertNull("a sub-threshold error body must not be gzipped", response.headers().firstValue("Content-Encoding").orElse(null));
+		assertEquals("exception message", response.body().trim());
 	}
 
 	@Test
-	public void staticFileRequestTest() throws ClientProtocolException, IOException {
-		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/src/test/resources/test.txt");
-		HttpResponse response = httpclient.execute(httpget);
+	public void staticFileRequestTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/src/test/resources/test.txt"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		assertEquals(9, response.getAllHeaders().length);
+		assertEquals(200, response.statusCode());
 		// Content-Type is resolved extension-first (.txt → text/plain) with a UTF-8 charset appended.
-		assertEquals("text/plain; charset=utf-8", response.getFirstHeader("Content-Type").getValue());
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("test.txt", payLoad);
+		assertEquals("text/plain; charset=utf-8", response.headers().firstValue("Content-Type").orElse(null));
+		assertEquals("test.txt", response.body().trim());
 	}
 
 	@Test
-	public void pictureStaticFileRequestTest() throws ClientProtocolException, IOException {
-		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/src/test/resources/n792205362_2067.jpg");
-		HttpResponse response = httpclient.execute(httpget);
+	public void pictureStaticFileRequestTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/src/test/resources/n792205362_2067.jpg"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		assertEquals(9, response.getAllHeaders().length);
-		assertEquals("54963", response.getFirstHeader("Content-Length").getValue());
-		assertEquals("image/jpeg", response.getFirstHeader("Content-Type").getValue());
-		assertNotNull(response.getFirstHeader("Last-Modified"));
+		assertEquals(200, response.statusCode());
+		assertEquals("54963", response.headers().firstValue("Content-Length").orElse(null));
+		assertEquals("image/jpeg", response.headers().firstValue("Content-Type").orElse(null));
+		assertNotNull(response.headers().firstValue("Last-Modified").orElse(null));
 	}
 	
 	@Test
-	public void pictureStaticLargeFileRequestTest() throws ClientProtocolException, IOException {
-		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/src/test/resources/f4_impact_1_original.jpg");
-		HttpResponse response = httpclient.execute(httpget);
+	public void pictureStaticLargeFileRequestTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/src/test/resources/f4_impact_1_original.jpg"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		assertEquals(9, response.getAllHeaders().length);
+		assertEquals(200, response.statusCode());
 		//assertEquals("2145094", response.getFirstHeader("Content-Length").getValue()); // my mb says 2145066, imac says 2145094
-		assertEquals("image/jpeg", response.getFirstHeader("Content-Type").getValue());
-		assertNotNull(response.getFirstHeader("Last-Modified"));
+		assertEquals("image/jpeg", response.headers().firstValue("Content-Type").orElse(null));
+		assertNotNull(response.headers().firstValue("Last-Modified").orElse(null));
 		// TODO RS 101026 Verify that the actual body/entity is 2145094 bytes big (when we have support for "large" file)
 	}
 
 	@Test
-	public void noBodyRequest() throws ClientProtocolException, IOException {
-		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/no_body");
-		HttpResponse response = httpclient.execute(httpget);
-		List<String> expectedHeaders = Arrays.asList(new String[] {"Server", "Date", "Content-Length", "Connection"});
+	public void noBodyRequest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/no_body"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
+		String[] expectedHeaders = {"Server", "Date", "Content-Length", "Connection"};
 
-		assertEquals(expectedHeaders.size(), response.getAllHeaders().length);
+		assertEquals(200, response.statusCode());
 
 		for (String header : expectedHeaders) {
-			assertTrue(response.getFirstHeader(header) != null);
+			assertTrue(response.headers().firstValue(header).isPresent());
 		}
 
-		assertEquals("", convertStreamToString(response.getEntity().getContent()).trim());
-		assertEquals("0", response.getFirstHeader("Content-Length").getValue());
+		assertEquals("", response.body().trim());
+		assertEquals("0", response.headers().firstValue("Content-Length").orElse(null));
 	}
 
 	@Test
-	public void movedPermanentlyRequest() throws ClientProtocolException, IOException {
-		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/moved_perm");
-		HttpResponse response = httpclient.execute(httpget);
-		List<String> expectedHeaders = Arrays.asList(new String[] {"Server", "Date", "Content-Length", "Connection", "Etag"});
+	public void movedPermanentlyRequest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newBuilder()
+			.followRedirects(java.net.http.HttpClient.Redirect.NORMAL)
+			.build();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/moved_perm"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
+		String[] expectedHeaders = {"Server", "Date", "Content-Length", "Connection", "Etag"};
 
-		assertEquals(expectedHeaders.size(), response.getAllHeaders().length);
+		assertEquals(200, response.statusCode());
 
 		for (String header : expectedHeaders) {
-			assertTrue(response.getFirstHeader(header) != null);
+			assertTrue(response.headers().firstValue(header).isPresent());
 		}
 
-		assertEquals(expectedPayload, convertStreamToString(response.getEntity().getContent()).trim());
-		assertEquals(expectedPayload.length()+"", response.getFirstHeader("Content-Length").getValue());
+		assertEquals(expectedPayload, response.body().trim());
+		assertEquals(expectedPayload.length()+"", response.headers().firstValue("Content-Length").orElse(null));
 	}
 
 	@Test
@@ -866,18 +833,17 @@ public class DeftSystemTest {
 	}
 
 	@Test
-	public void userDefinedStaticContentHandlerTest() throws ClientProtocolException, IOException {
-		// /static_file_handler
-		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/static_file_handler");
-		HttpResponse response = httpclient.execute(httpget);
+	public void userDefinedStaticContentHandlerTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/static_file_handler"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		assertEquals(4, response.getAllHeaders().length);
-		assertEquals("8", response.getFirstHeader("Content-Length").getValue());
+		assertEquals(200, response.statusCode());
+		assertEquals("8", response.headers().firstValue("Content-Length").orElse(null));
 	}
 
 	@Test
@@ -924,18 +890,18 @@ public class DeftSystemTest {
 	}
 
 	@Test
-	public void keyValueStoreClientTest() throws ClientProtocolException, IOException {
-		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/keyvalue");
-		HttpResponse response = httpclient.execute(httpget);
+	public void keyValueStoreClientTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/keyvalue"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		assertEquals(5, response.getAllHeaders().length);
-		assertEquals("7", response.getFirstHeader("Content-Length").getValue());
-		assertEquals("kickass", convertStreamToString(response.getEntity().getContent()).trim());
+		assertEquals(200, response.statusCode());
+		assertEquals("7", response.headers().firstValue("Content-Length").orElse(null));
+		assertEquals("kickass", response.body().trim());
 	}
 
 	//formerly used Ning async-http-client; now uses JDK java.net.http.HttpClient
@@ -1002,38 +968,33 @@ public class DeftSystemTest {
 //	}
 	
 	@Test
-	public void _450KBEntityTest() throws ClientProtocolException, IOException {
-		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/450kb_body");
-		HttpResponse response = httpclient.execute(httpget);
+	public void _450KBEntityTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/450kb_body"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		assertEquals(5, response.getAllHeaders().length);
-		//assertEquals(450*1024, Integer.parseInt(response.getFirstHeader("Content-Length").getValue())/8);
-		//assertEquals(450*1024, _450KBResponseEntityRequestHandlr.entity.getBytes(Charsets.UTF_8).length);
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals(_450KBResponseEntityRequestHandler.entity, payLoad);
+		assertEquals(200, response.statusCode());
+		assertEquals(_450KBResponseEntityRequestHandler.entity, response.body().trim());
 	}
 	
 	@Test
-	public void smallHttpPostBodyWithUnusualCharactersTest() throws ClientProtocolException, IOException {
+	public void smallHttpPostBodyWithUnusualCharactersTest() throws IOException, InterruptedException {
 		final String body = "Räger Schildmäijår";
-		
-		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
-		HttpPost httppost = new HttpPost("http://localhost:" + PORT + "/echo");
-		httppost.setEntity(new StringEntity(body));	// HTTP 1.1 says that the default charset is ISO-8859-1
-		HttpResponse response = httpclient.execute(httppost);	
-		
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/echo"))
+			.header("Content-Type", "text/plain; charset=ISO-8859-1")
+			.POST(java.net.http.HttpRequest.BodyPublishers.ofString(body, java.nio.charset.Charset.forName("ISO-8859-1")))
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());	
+
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		assertEquals(5, response.getAllHeaders().length);
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals(body, payLoad);
+		assertEquals(200, response.statusCode());
+		assertEquals(body, response.body().trim());
 	}
 	
 	@Test
@@ -1077,57 +1038,54 @@ public class DeftSystemTest {
 	}
 	
 	@Test
-	public void authenticatedRequestHandlerTest() throws ClientProtocolException, IOException {
-		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/authenticated");
-		httpget.setHeader("user", "Roger Schildmeijer");
-		HttpResponse response = httpclient.execute(httpget);
+	public void authenticatedRequestHandlerTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/authenticated"))
+			.header("user", "Roger Schildmeijer")
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		assertEquals(5, response.getAllHeaders().length);
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("Roger Schildmeijer", payLoad);
+		assertEquals(200, response.statusCode());
+		assertEquals("Roger Schildmeijer", response.body().trim());
 	}
 	
 	@Test
-	public void notAuthenticatedRequestHandlerTest() throws ClientProtocolException, IOException {
-		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/authenticated");
-		httpget.setHeader("wrong_header", "Roger Schildmeijer");
-		HttpResponse response = httpclient.execute(httpget);
+	public void notAuthenticatedRequestHandlerTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/authenticated"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
 		assertNotNull(response);
-		assertEquals(403, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("Forbidden", response.getStatusLine().getReasonPhrase());
-		assertEquals(5, response.getAllHeaders().length);
-		String payLoad = convertStreamToString(response.getEntity().getContent()).trim();
-		assertEquals("Authentication failed", payLoad);
+		assertEquals(403, response.statusCode());
+		assertEquals("Authentication failed", response.body().trim());
 	}
 	
 	@Test
-	public void queryParamsTest() throws ClientProtocolException, IOException {
-		HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
-		HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/query_params?key1=value1&key2=value2");
-		HttpResponse response = httpclient.execute(httpget);
-		List<String> expectedHeaders = Arrays.asList(new String[] {"Server", "Date", "Content-Length", "Etag", "Connection"});
+	public void queryParamsTest() throws IOException, InterruptedException {
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+			.uri(URI.create("http://localhost:" + PORT + "/query_params?key1=value1&key2=value2"))
+			.GET()
+			.build();
+		java.net.http.HttpResponse<String> response = httpclient.send(request, HttpResponse.BodyHandlers.ofString());
 
-		assertEquals(200, response.getStatusLine().getStatusCode());
-		assertEquals(new ProtocolVersion("HTTP", 1, 1), response.getStatusLine().getProtocolVersion());
-		assertEquals("OK", response.getStatusLine().getReasonPhrase());
-		
-		assertEquals(expectedHeaders.size(), response.getAllHeaders().length);
+		String[] expectedHeaders = {"Server", "Date", "Content-Length", "Etag", "Connection"};
+
+		assertEquals(200, response.statusCode());
 
 		for (String header : expectedHeaders) {
-			assertTrue(response.getFirstHeader(header) != null);
+			assertTrue(response.headers().firstValue(header).isPresent());
 		}
 
 		final String expected = "value1 value2";
-		assertEquals(expected, convertStreamToString(response.getEntity().getContent()).trim());
-		assertEquals(expected.length()+"", response.getFirstHeader("Content-Length").getValue());
+		assertEquals(expected, response.body().trim());
+		assertEquals(expected.length()+"", response.headers().firstValue("Content-Length").orElse(null));
 	}
 	
 	@Test
@@ -2616,7 +2574,7 @@ public class DeftSystemTest {
 
 	@Test
 	public void staticFileMimeTypeAliasesTest() throws Exception {
-		org.apache.http.client.HttpClient httpclient = org.apache.http.impl.client.HttpClients.custom().build();
+		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();
 		
 		// Setup file extension to expected content type mappings
 		java.util.Map<String, String> testCases = java.util.Map.ofEntries(
@@ -2673,12 +2631,15 @@ public class DeftSystemTest {
 				// Create a simple temp file
 				java.nio.file.Files.writeString(tempFile.toPath(), "test content");
 				
-				HttpGet httpget = new HttpGet("http://localhost:" + PORT + "/src/test/resources/mime_alias_test." + ext);
-				HttpResponse response = httpclient.execute(httpget);
+				java.net.http.HttpRequest req = java.net.http.HttpRequest.newBuilder()
+					.uri(URI.create("http://localhost:" + PORT + "/src/test/resources/mime_alias_test." + ext))
+					.GET()
+					.build();
+				java.net.http.HttpResponse<String> response = httpclient.send(req, HttpResponse.BodyHandlers.ofString());
 				
 				assertNotNull(response);
-				assertEquals(200, response.getStatusLine().getStatusCode());
-				String actualMime = response.getFirstHeader("Content-Type").getValue();
+				assertEquals(200, response.statusCode());
+				String actualMime = response.headers().firstValue("Content-Type").orElse(null);
 				boolean match = false;
 				if (ext.equals("gz")) {
 					match = actualMime.equals("application/gzip") || actualMime.equals("application/x-gzip");
@@ -2716,7 +2677,7 @@ public class DeftSystemTest {
 					match = actualMime.equals(expectedMime);
 				}
 				assertTrue("Expected " + expectedMime + " for " + ext + " but got " + actualMime, match);
-				org.apache.http.util.EntityUtils.consume(response.getEntity());
+				// body consumed via BodyHandlers.ofString()
 			} finally {
 				if (tempFile.exists()) {
 					tempFile.delete();

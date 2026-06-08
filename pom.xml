@@ -2,8 +2,8 @@
 	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
 	<modelVersion>4.0.0</modelVersion>
 	<groupId>org.deftserver</groupId>
-	<artifactId>deft</artifactId>
-	<version>0.4.0-SNAPSHOT</version>
+	<artifactId>dreft</artifactId>
+	<version>0.8.0</version>
 
 	<dependencies>
 		<dependency>
@@ -22,13 +22,6 @@
 		</dependency>
 
 		<dependency>
-			<groupId>org.apache.httpcomponents</groupId>
-			<artifactId>httpclient</artifactId>
-			<version>4.5.14</version>
-			<scope>test</scope>
-		</dependency>
-
-		<dependency>
 			<groupId>javax.activation</groupId>
 			<artifactId>activation</artifactId>
 			<version>1.1.1</version>
@@ -39,9 +32,16 @@
 			<artifactId>zstd-jni</artifactId>
 			<version>1.5.6-3</version>
 		</dependency>
+
+		<dependency>
+			<groupId>com.brotjli</groupId>
+			<artifactId>brotjli</artifactId>
+			<version>0.1.0</version>
+			<scope>system</scope>
+			<systemPath>${project.basedir}/brotjli-0.1.0.jar</systemPath>
+			<optional>true</optional>
+		</dependency>
 	</dependencies>
-
-
 
 	<build>
 		<plugins>
@@ -56,24 +56,31 @@
 			</plugin>
 
 			<plugin>
-				<!--
-					NOTE: We don't need a groupId specification because the group is
-					org.apache.maven.plugins ...which is assumed by default.
-				-->
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-javadoc-plugin</artifactId>
+				<version>3.11.2</version>
+				<configuration>
+					<doclint>none</doclint>
+				</configuration>
+				<executions>
+					<execution>
+						<id>attach-javadoc</id>
+						<goals>
+							<goal>jar</goal>
+						</goals>
+					</execution>
+				</executions>
+			</plugin>
+
+			<plugin>
 				<artifactId>maven-assembly-plugin</artifactId>
 				<version>2.2-beta-5</version>
 				<configuration>
-					<!--
-						<descriptorRefs>
-						<descriptorRef>jar-with-dependencies</descriptorRef>
-						<descriptorRef>bin</descriptorRef> </descriptorRefs>
-					-->
 					<descriptors>
-						<descriptor>src/main/assembly/deft-binary.xml</descriptor>
+						<descriptor>src/main/assembly/dreft-binary.xml</descriptor>
 						<descriptor>src/main/assembly/deft-binary-with-deps.xml</descriptor>
 						<descriptor>src/main/assembly/deft-src.xml</descriptor>
 					</descriptors>
-
 				</configuration>
 			</plugin>
 
@@ -84,6 +91,7 @@
 				<configuration>
 					<forkCount>1</forkCount>
 					<reuseForks>true</reuseForks>
+					<forkedProcessTimeoutInSeconds>600</forkedProcessTimeoutInSeconds>
 				</configuration>
 			</plugin>
 
@@ -94,8 +102,7 @@
 		<repository>
 			<id>Sonatype</id>
 			<name>Sonatype Release</name>
-			<url>http://oss.sonatype.org/content/repositories/releases </url>
+			<url>http://oss.sonatype.org/content/repositories/releases</url>
 		</repository>
-
 	</repositories>
 </project>
