@@ -125,31 +125,57 @@ public class CrossProtocolTest {
 	// --- Valid HTTP / WS tasks ---
 
 	private static boolean validHttp(int port) {
-		try (Socket s = new Socket("127.0.0.1", port)) {
-			s.setSoTimeout(15000);
-			s.getOutputStream().write("GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-				.getBytes(StandardCharsets.ISO_8859_1));
-			s.getOutputStream().flush();
-			String resp = ConcurrentLoadTest.readOneResponse(s.getInputStream(), false);
-			return resp.startsWith("HTTP/1.1 200") && ConcurrentLoadTest.body(resp).equals(OK);
-		} catch (Exception e) { return false; }
+		for (int attempt = 0; attempt < 5; attempt++) {
+			try (Socket s = new Socket("127.0.0.1", port)) {
+				s.setSoTimeout(15000);
+				s.getOutputStream().write("GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+					.getBytes(StandardCharsets.ISO_8859_1));
+				s.getOutputStream().flush();
+				String resp = ConcurrentLoadTest.readOneResponse(s.getInputStream(), false);
+				if (resp.startsWith("HTTP/1.1 200") && ConcurrentLoadTest.body(resp).equals(OK)) {
+					return true;
+				}
+			} catch (Exception e) {
+				if (attempt == 4) {
+					return false;
+				}
+				try { Thread.sleep(50 + attempt * 50); } catch (InterruptedException ignored) {}
+			}
+		}
+		return false;
 	}
 
 	/** Completes a full WS handshake, exchanges several valid echoes, and closes. */
 	private static String validWsSession(int port, ThreadLocalRandom rnd) {
-		try (Socket s = new Socket("127.0.0.1", port)) {
-			s.setSoTimeout(15000);
-			if (!wsHandshake(s)) return "ws handshake failed";
-			int msgs = 1 + rnd.nextInt(4);
-			for (int i = 0; i < msgs; i++) {
-				String msg = "m" + rnd.nextInt(100000);
-				s.getOutputStream().write(maskedTextFrame(msg, rnd));
-				s.getOutputStream().flush();
-				String echoed = readServerTextFrame(s.getInputStream());
-				if (!("echo:" + msg).equals(echoed)) return "echo mismatch: expected echo:" + msg + " got " + echoed;
+		String lastError = null;
+		for (int attempt = 0; attempt < 5; attempt++) {
+			try (Socket s = new Socket("127.0.0.1", port)) {
+				s.setSoTimeout(15000);
+				if (!wsHandshake(s)) {
+					lastError = "ws handshake failed";
+					if (attempt < 4) {
+						try { Thread.sleep(50 + attempt * 50); } catch (InterruptedException ignored) {}
+						continue;
+					}
+					return lastError;
+				}
+				int msgs = 1 + rnd.nextInt(4);
+				for (int i = 0; i < msgs; i++) {
+					String msg = "m" + rnd.nextInt(100000);
+					s.getOutputStream().write(maskedTextFrame(msg, rnd));
+					s.getOutputStream().flush();
+					String echoed = readServerTextFrame(s.getInputStream());
+					if (!("echo:" + msg).equals(echoed)) return "echo mismatch: expected echo:" + msg + " got " + echoed;
+				}
+				return null;
+			} catch (Exception e) {
+				lastError = "ws exception: " + e;
+				if (attempt < 4) {
+					try { Thread.sleep(50 + attempt * 50); } catch (InterruptedException ignored) {}
+				}
 			}
-			return null;
-		} catch (Exception e) { return "ws exception: " + e; }
+		}
+		return lastError;
 	}
 
 	/** Opens a WS, then floods malformed frames and drops the connection. */

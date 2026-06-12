@@ -89,20 +89,40 @@ public abstract class WebSocketHandler extends RequestHandler {
 
 	/** True if the comma-separated token list contains the given token (case-insensitive). */
 	private static boolean connectionHasToken(String header, String token) {
-		for (String t : header.split(",")) {
-			if (t.trim().equalsIgnoreCase(token)) {
+		if (header == null) return false;
+		int len = header.length();
+		int tokenLen = token.length();
+		int i = 0;
+		while (i < len) {
+			while (i < len && header.charAt(i) == ' ') i++;
+			int start = i;
+			while (i < len && header.charAt(i) != ',') i++;
+			int end = i;
+			while (end > start && header.charAt(end - 1) == ' ') end--;
+			if (end - start == tokenLen && header.regionMatches(true, start, token, 0, tokenLen)) {
 				return true;
 			}
+			i++;
 		}
 		return false;
 	}
 
 	/** True if a comma-separated version list (RFC 6455 §4.1) contains the given version string. */
 	private static boolean versionListContains(String header, String version) {
-		for (String v : header.split(",")) {
-			if (v.trim().equals(version)) {
+		if (header == null) return false;
+		int len = header.length();
+		int versionLen = version.length();
+		int i = 0;
+		while (i < len) {
+			while (i < len && header.charAt(i) == ' ') i++;
+			int start = i;
+			while (i < len && header.charAt(i) != ',') i++;
+			int end = i;
+			while (end > start && header.charAt(end - 1) == ' ') end--;
+			if (end - start == versionLen && header.regionMatches(false, start, version, 0, versionLen)) {
 				return true;
 			}
+			i++;
 		}
 		return false;
 	}

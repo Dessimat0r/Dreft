@@ -335,39 +335,46 @@ public class HttpUtil {
 		}
 
 		java.util.List<AcceptItem> items = new java.util.ArrayList<>();
-		String[] parts = acceptHeader.split(",");
-		for (String part : parts) {
-			String[] mediaAndParams = part.split(";");
-			String mediaType = mediaAndParams[0].trim();
-			// Skip empty media-ranges produced by stray/trailing commas ("a/b,,c/d") — an empty
-			// type is never a valid Accept entry and would otherwise pollute the result list.
-			if (mediaType.isEmpty()) {
-				continue;
-			}
-			double q = 1.0;
-			for (int i = 1; i < mediaAndParams.length; i++) {
-				String param = mediaAndParams[i].trim();
-				if (param.startsWith("q=")) {
-					try {
-						q = Double.parseDouble(param.substring(2).trim());
-					} catch (NumberFormatException e) {
-						q = 0.0;
-					}
-					// RFC 9110 §12.4.2: qvalue is in [0, 1]. Clamp out-of-range or non-finite
-					// values (e.g. a malicious "q=Infinity"/"q=5") so a bogus weight can't sort
-					// itself ahead of legitimate entries; NaN is treated as 0 (dropped below).
-					if (Double.isNaN(q)) {
-						q = 0.0;
-					} else if (q > 1.0) {
-						q = 1.0;
-					} else if (q < 0.0) {
-						q = 0.0;
+		int len = acceptHeader.length();
+		int idx = 0;
+		while (idx < len) {
+			int nextComma = acceptHeader.indexOf(',', idx);
+			int endSegment = (nextComma == -1) ? len : nextComma;
+			
+			int firstSemi = acceptHeader.indexOf(';', idx);
+			int endType = (firstSemi == -1 || firstSemi > endSegment) ? endSegment : firstSemi;
+			
+			String mediaType = acceptHeader.substring(idx, endType).trim();
+			if (!mediaType.isEmpty()) {
+				double q = 1.0;
+				if (firstSemi != -1 && firstSemi < endSegment) {
+					int pIdx = firstSemi + 1;
+					while (pIdx < endSegment) {
+						int nextSemi = acceptHeader.indexOf(';', pIdx);
+						int endParam = (nextSemi == -1 || nextSemi > endSegment) ? endSegment : nextSemi;
+						String param = acceptHeader.substring(pIdx, endParam).trim();
+						if (param.startsWith("q=")) {
+							try {
+								q = Double.parseDouble(param.substring(2).trim());
+							} catch (NumberFormatException e) {
+								q = 0.0;
+							}
+							if (Double.isNaN(q)) {
+								q = 0.0;
+							} else if (q > 1.0) {
+								q = 1.0;
+							} else if (q < 0.0) {
+								q = 0.0;
+							}
+						}
+						pIdx = endParam + 1;
 					}
 				}
+				if (q > 0.0) {
+					items.add(new AcceptItem(mediaType, q));
+				}
 			}
-			if (q > 0.0) {
-				items.add(new AcceptItem(mediaType, q));
-			}
+			idx = endSegment + 1;
 		}
 		java.util.Collections.sort(items);
 
@@ -378,6 +385,69 @@ public class HttpUtil {
 		return result;
 	}
 
+	private static final boolean BROTLI_SUPPORTED;
+	private static final boolean ZSTD_SUPPORTED;
+
+	static {
+		boolean br;
+		try {
+			Class.forName("com.brotjli.stream.BrotliOutputStream");
+			br = true;
+		} catch (ClassNotFoundException e) {
+			br = false;
+		}
+		BROTLI_SUPPORTED = br;
+
+		boolean zstd;
+		try {
+			Class.forName("com.github.luben.zstd.ZstdOutputStream");
+			zstd = true;
+		} catch (ClassNotFoundException e) {
+			zstd = false;
+		}
+		ZSTD_SUPPORTED = zstd;
+	}
+
+	public static boolean isBrotliSupported() {
+		return BROTLI_SUPPORTED;
+	}
+
+	public static boolean isZstdSupported() {
+		return ZSTD_SUPPORTED;
+	}
+
+	private static class ZstdCodec {
+		static void compress(byte[] buf, int offset, int length, java.io.OutputStream out) throws java.io.IOException {
+			try (com.github.luben.zstd.ZstdOutputStream zos = new com.github.luben.zstd.ZstdOutputStream(out)) {
+				zos.write(buf, offset, length);
+			}
+		}
+
+		static java.io.InputStream decompress(java.io.InputStream in) throws java.io.IOException {
+			return new com.github.luben.zstd.ZstdInputStream(in);
+		}
+	}
+
+	private static class BrotliCodec {
+		static void compress(byte[] buf, int offset, int length, java.io.OutputStream out) throws java.io.IOException {
+			try (com.brotjli.stream.BrotliOutputStream bos = new com.brotjli.stream.BrotliOutputStream(out)) {
+				bos.write(buf, offset, length);
+			}
+		}
+
+		static java.io.InputStream decompress(java.io.InputStream in) throws java.io.IOException {
+			return new com.brotjli.stream.BrotliInputStream(in);
+		}
+	}
+
+	public static java.io.OutputStream createZstdOutputStream(java.io.OutputStream out) throws java.io.IOException {
+		return new com.github.luben.zstd.ZstdOutputStream(out);
+	}
+
+	public static java.io.OutputStream createBrotliOutputStream(java.io.OutputStream out) throws java.io.IOException {
+		return new com.brotjli.stream.BrotliOutputStream(out);
+	}
+
 	public static String getPreferredCompression(String acceptEncoding) {
 		if (acceptEncoding == null || acceptEncoding.trim().isEmpty()) {
 			return null;
@@ -385,46 +455,63 @@ public class HttpUtil {
 		double bestQ = 0.0;
 		String bestType = null;
 		int bestPref = -1;
-		String[] parts = acceptEncoding.split(",");
-		for (String part : parts) {
-			String[] encodingAndParams = part.split(";");
-			String encoding = encodingAndParams[0].trim().toLowerCase(java.util.Locale.ROOT);
-			double q = 1.0;
-			for (int i = 1; i < encodingAndParams.length; i++) {
-				String param = encodingAndParams[i].trim();
-				if (param.startsWith("q=")) {
-					try {
-						q = Double.parseDouble(param.substring(2).trim());
-					} catch (NumberFormatException e) {
-						q = 0.0;
+		int len = acceptEncoding.length();
+		int idx = 0;
+		while (idx < len) {
+			int nextComma = acceptEncoding.indexOf(',', idx);
+			int endSegment = (nextComma == -1) ? len : nextComma;
+			
+			int firstSemi = acceptEncoding.indexOf(';', idx);
+			int endType = (firstSemi == -1 || firstSemi > endSegment) ? endSegment : firstSemi;
+			
+			String encoding = acceptEncoding.substring(idx, endType).trim().toLowerCase(java.util.Locale.ROOT);
+			if (!encoding.isEmpty()) {
+				double q = 1.0;
+				if (firstSemi != -1 && firstSemi < endSegment) {
+					int pIdx = firstSemi + 1;
+					while (pIdx < endSegment) {
+						int nextSemi = acceptEncoding.indexOf(';', pIdx);
+						int endParam = (nextSemi == -1 || nextSemi > endSegment) ? endSegment : nextSemi;
+						String param = acceptEncoding.substring(pIdx, endParam).trim();
+						if (param.startsWith("q=")) {
+							try {
+								q = Double.parseDouble(param.substring(2).trim());
+							} catch (NumberFormatException e) {
+								q = 0.0;
+							}
+							if (Double.isNaN(q)) {
+								q = 0.0;
+							} else if (q > 1.0) {
+								q = 1.0;
+							} else if (q < 0.0) {
+								q = 0.0;
+							}
+						}
+						pIdx = endParam + 1;
 					}
-					if (Double.isNaN(q)) {
-						q = 0.0;
-					} else if (q > 1.0) {
-						q = 1.0;
-					} else if (q < 0.0) {
-						q = 0.0;
+				}
+				if (q > 0.0) {
+					int pref = 0;
+					if (encoding.equals("br") && BROTLI_SUPPORTED) {
+						pref = 3;
+					} else if (encoding.equals("zstd") && ZSTD_SUPPORTED) {
+						pref = 2;
+					} else if (encoding.equals("gzip") || encoding.equals("*")) {
+						pref = 1;
+					}
+					if (pref > 0) {
+						if (q > bestQ) {
+							bestQ = q;
+							bestType = encoding.equals("*") ? "gzip" : encoding;
+							bestPref = pref;
+						} else if (q == bestQ && pref > bestPref) {
+							bestType = encoding.equals("*") ? "gzip" : encoding;
+							bestPref = pref;
+						}
 					}
 				}
 			}
-			if (q > 0.0) {
-				int pref = 0;
-				if (encoding.equals("zstd")) {
-					pref = 2;
-				} else if (encoding.equals("gzip") || encoding.equals("*")) {
-					pref = 1;
-				}
-				if (pref > 0) {
-					if (q > bestQ) {
-						bestQ = q;
-						bestType = encoding.equals("*") ? "gzip" : encoding;
-						bestPref = pref;
-					} else if (q == bestQ && pref > bestPref) {
-						bestType = encoding.equals("*") ? "gzip" : encoding;
-						bestPref = pref;
-					}
-				}
-			}
+			idx = endSegment + 1;
 		}
 		return bestType;
 	}
@@ -443,8 +530,16 @@ public class HttpUtil {
 				gzos.write(buf, offset, length);
 			}
 		} else if (enc.equals("zstd")) {
-			try (com.github.luben.zstd.ZstdOutputStream zos = new com.github.luben.zstd.ZstdOutputStream(baos)) {
-				zos.write(buf, offset, length);
+			if (ZSTD_SUPPORTED) {
+				ZstdCodec.compress(buf, offset, length, baos);
+			} else {
+				throw new UnsupportedOperationException("Zstd not supported");
+			}
+		} else if (enc.equals("br")) {
+			if (BROTLI_SUPPORTED) {
+				BrotliCodec.compress(buf, offset, length, baos);
+			} else {
+				throw new UnsupportedOperationException("Brotli not supported");
 			}
 		} else {
 			if (offset == 0 && length == buf.length) return buf;
@@ -468,7 +563,17 @@ public class HttpUtil {
 		if (enc.equals("gzip")) {
 			in = new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(bytes));
 		} else if (enc.equals("zstd")) {
-			in = new com.github.luben.zstd.ZstdInputStream(new java.io.ByteArrayInputStream(bytes));
+			if (ZSTD_SUPPORTED) {
+				in = ZstdCodec.decompress(new java.io.ByteArrayInputStream(bytes));
+			} else {
+				throw new UnsupportedOperationException("Zstd not supported");
+			}
+		} else if (enc.equals("br")) {
+			if (BROTLI_SUPPORTED) {
+				in = BrotliCodec.decompress(new java.io.ByteArrayInputStream(bytes));
+			} else {
+				throw new UnsupportedOperationException("Brotli not supported");
+			}
 		} else {
 			return bytes;
 		}

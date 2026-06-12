@@ -52,18 +52,17 @@ public class DynamicByteBuffer {
 	 * may legitimately be UTF-8, is added separately via {@code write(String)}.)
 	 */
 	public long prepend(String data) {
-		byte[] bytes = data.getBytes(StandardCharsets.ISO_8859_1);
-		int headerLen = bytes.length;
+		int headerLen = data.length();
 		int bodyLen = backend.position();
 		ensureCapacity(headerLen, true);
 		
-		// Shift existing body bytes to the right by headerLen
 		System.arraycopy(backend.array(), 0, backend.array(), headerLen, bodyLen);
 		
-		// Copy header bytes to the beginning
-		System.arraycopy(bytes, 0, backend.array(), 0, headerLen);
+		byte[] arr = backend.array();
+		for (int i = 0; i < headerLen; i++) {
+			arr[i] = (byte) data.charAt(i);
+		}
 		
-		// Update position
 		backend.position(headerLen + bodyLen);
 		return headerLen;
 	}

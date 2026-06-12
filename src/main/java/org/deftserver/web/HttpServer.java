@@ -47,7 +47,12 @@ public class HttpServer {
 	}
 
 	public int getPort() {
-		return serverChannels.isEmpty() ? -1 : serverChannels.get(0).socket().getLocalPort();
+		if (serverChannels.isEmpty()) return -1;
+		try {
+			return serverChannels.get(0).socket().getLocalPort();
+		} catch (UnsupportedOperationException e) {
+			return -1;
+		}
 	}
 
 	/** Enables HTTPS by loading a PKCS12 keystore from disk and building a TLS {@link SSLContext}
@@ -120,6 +125,28 @@ public class HttpServer {
 			channel.socket().bind(endpoint, org.deftserver.web.http.HttpServerDescriptor.ACCEPT_BACKLOG);
 		} catch (IOException e) {
 			logger.error("Could not bind socket", e);
+			try { channel.close(); } catch (IOException ignore) {}
+			throw e;
+		}
+		serverChannels.add(channel);
+		if (ssl) {
+			sslServerChannels.add(channel);
+		}
+	}
+
+	public void bind(java.nio.file.Path path) throws IOException {
+		bind(path, isSSLEnabled());
+	}
+
+	public void bind(java.nio.file.Path path, boolean ssl) throws IOException {
+		java.nio.file.Files.deleteIfExists(path);
+		ServerSocketChannel channel = ServerSocketChannel.open(java.net.StandardProtocolFamily.UNIX);
+		channel.configureBlocking(false);
+		java.net.UnixDomainSocketAddress endpoint = java.net.UnixDomainSocketAddress.of(path);
+		try {
+			channel.bind(endpoint, org.deftserver.web.http.HttpServerDescriptor.ACCEPT_BACKLOG);
+		} catch (IOException e) {
+			logger.error("Could not bind Unix domain socket at {}", path, e);
 			try { channel.close(); } catch (IOException ignore) {}
 			throw e;
 		}

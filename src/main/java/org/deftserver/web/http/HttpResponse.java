@@ -29,19 +29,19 @@ public class HttpResponse {
 	private final HttpProtocol protocol;
 	private final SelectionKey key;
 	
-	private int statusCode = 200;	// default response status code
+	protected int statusCode = 200;	// default response status code
 	
-	private final Map<String, String> headers = new HashMap<String, String>();
-	private boolean headersCreated = false;
+	protected final Map<String, String> headers = new HashMap<String, String>();
+	protected boolean headersCreated = false;
 	private final DynamicByteBuffer responseData = DynamicByteBuffer.allocate(WRITE_BUFFER_SIZE);
 	private final boolean suppressBody;
 	
 	private HttpRequest request;
 	private boolean useChunked = false;
 	private String compressionEncoding = null;
-	private boolean finished = false;
+	protected boolean finished = false;
 	private boolean suppressContentLength = false;
-	private final java.util.List<Cookie> cookies = new java.util.ArrayList<>();
+	protected final java.util.List<Cookie> cookies = new java.util.ArrayList<>();
 
 	/** Queues a cookie to be emitted as its own {@code Set-Cookie} response header line. */
 	public void setCookie(Cookie cookie) {
@@ -108,7 +108,27 @@ public class HttpResponse {
 	 *  header stream (HTTP response-splitting defence — see {@link #validateHeaderField}). */
 	public void setHeader(String header, String value) {
 		validateHeaderField(header, value);
+		removeHeader(header);
 		headers.put(header, value);
+	}
+
+	private boolean hasHeader(String name) {
+		return headers.keySet().stream().anyMatch(name::equalsIgnoreCase);
+	}
+
+	private String getHeaderValue(String name) {
+		return headers.entrySet().stream()
+				.filter(entry -> entry.getKey().equalsIgnoreCase(name))
+				.map(Map.Entry::getValue)
+				.findFirst()
+				.orElse(null);
+	}
+
+	private void removeHeader(String name) {
+		headers.keySet().stream()
+				.filter(name::equalsIgnoreCase)
+				.findFirst()
+				.ifPresent(headers::remove);
 	}
 
 	/**
@@ -119,7 +139,7 @@ public class HttpResponse {
 	 * never serves the wrong compressed/CORS/negotiated representation to another client.
 	 */
 	public void addVary(String fieldName) {
-		String existing = headers.get("Vary");
+		String existing = getHeaderValue("Vary");
 		if (existing == null || existing.isEmpty()) {
 			setHeader("Vary", fieldName);
 			return;
@@ -127,10 +147,19 @@ public class HttpResponse {
 		if ("*".equals(existing.trim())) {
 			return; // already varies on everything
 		}
-		for (String token : existing.split(",")) {
-			if (token.trim().equalsIgnoreCase(fieldName)) {
+		int len = existing.length();
+		int fieldLen = fieldName.length();
+		int i = 0;
+		while (i < len) {
+			while (i < len && existing.charAt(i) == ' ') i++;
+			int start = i;
+			while (i < len && existing.charAt(i) != ',') i++;
+			int end = i;
+			while (end > start && existing.charAt(end - 1) == ' ') end--;
+			if (end - start == fieldLen && existing.regionMatches(true, start, fieldName, 0, fieldLen)) {
 				return; // already listed
 			}
+			i++;
 		}
 		setHeader("Vary", existing + ", " + fieldName);
 	}
@@ -185,7 +214,7 @@ public class HttpResponse {
 		long bytesWritten = 0;
 		try {
 			if (!headersCreated) {
-				if (!useChunked && !headers.containsKey("Content-Length") && !suppressBody) {
+				if (!useChunked && !hasHeader("Content-Length") && !suppressBody) {
 					setHeader("Connection", "Close");
 				}
 				if (useChunked && responseData.position() > 0) {
@@ -267,7 +296,7 @@ public class HttpResponse {
 						bytesWritten += written;
 					} while (written > 0 && mbb.hasRemaining() && clientChannel.isOpen());
 				}
-				boolean closeConnection = "close".equalsIgnoreCase(headers.get("Connection"));
+				boolean closeConnection = "close".equalsIgnoreCase(getHeaderValue("Connection"));
 				SSLSessionHandler sslHandler = protocol.getSslSessionHandler(clientChannel);
 				if (sslHandler != null && sslHandler.hasPendingWrite()) {
 					if (closeConnection) {
@@ -311,7 +340,7 @@ public class HttpResponse {
 						bytesWritten = flush();
 					}
 				}
-				boolean closeConnection = "close".equalsIgnoreCase(headers.get("Connection"));
+				boolean closeConnection = "close".equalsIgnoreCase(getHeaderValue("Connection"));
 				SSLSessionHandler sslHandler = protocol.getSslSessionHandler(clientChannel);
 				if (sslHandler != null && sslHandler.hasPendingWrite()) {
 					if (closeConnection) {
@@ -362,12 +391,12 @@ public class HttpResponse {
 		// that would double-encode it into garbage.
 		if (request != null && !isBodySuppressed() && responseData.position() > 0
 				&& statusCode != 206
-				&& !headers.containsKey("Content-Encoding")
+				&& !hasHeader("Content-Encoding")
 				&& "HTTP/1.1".equals(request.getVersion())) {
 			String acceptEncoding = request.getHeader("Accept-Encoding");
 			String preferred = org.deftserver.util.HttpUtil.getPreferredCompression(acceptEncoding);
 			if (preferred != null) {
-				String contentType = headers.get("Content-Type");
+				String contentType = getHeaderValue("Content-Type");
 				// RFC 9110 §8.3.1: media types are case-insensitive. Fold to lower (Locale.ROOT,
 				// per the project convention) so "TEXT/HTML" or "Application/JSON" still compress.
 				String ctLower = contentType == null ? null
@@ -392,8 +421,8 @@ public class HttpResponse {
 		// A CORS response varies by Origin. Re-ensure it here, at finish time (after the handler has
 		// run), so a handler that set its own Vary can't drop the Origin token the CORS layer added
 		// before dispatch — which would let a cache serve one origin's response to another.
-		if (headers.containsKey("Access-Control-Allow-Origin")
-				&& !"*".equals(headers.get("Access-Control-Allow-Origin"))) {
+		if (hasHeader("Access-Control-Allow-Origin")
+				&& !"*".equals(getHeaderValue("Access-Control-Allow-Origin"))) {
 			addVary("Origin");
 		}
 
@@ -435,7 +464,7 @@ public class HttpResponse {
 			String inm = request.getHeader("If-None-Match");
 			String ius = request.getHeader("If-Unmodified-Since");
 			String ims = request.getHeader("If-Modified-Since");
-			String lm = headers.get("Last-Modified");
+			String lm = getHeaderValue("Last-Modified");
 
 			// 1. If-Match: precondition fails (→412) if the current ETag matches none of the listed tags.
 			if (im != null && etag != null && !ifMatchHeaderMatches(im, etag)) {
@@ -478,9 +507,9 @@ public class HttpResponse {
 		}
 
 		if (useChunked) {
-			headers.remove("Content-Length");
+			removeHeader("Content-Length");
 			setHeader("Transfer-Encoding", "chunked");
-		} else if (isBodySuppressed() && headers.containsKey("Content-Length")) {
+		} else if (isBodySuppressed() && hasHeader("Content-Length")) {
 			// HEAD: keep the Content-Length the handler set (the size the GET body would be).
 			// The actual body bytes are absent, so don't overwrite it with the empty-buffer size.
 		} else {
@@ -510,8 +539,8 @@ public class HttpResponse {
 		responseData.clear();
 		useChunked = false;
 		compressionEncoding = null;
-		headers.remove("Transfer-Encoding");
-		headers.remove("Content-Encoding");
+		removeHeader("Transfer-Encoding");
+		removeHeader("Content-Encoding");
 		// Content-Length: 0 is the unambiguous framing for a bodiless response. Note: although a 1xx
 		// (e.g. 101 Switching Protocols) strictly carries no Content-Length, the JDK java.net.http
 		// WebSocket client rejects a 101 handshake that lacks it — so we keep it for interop
@@ -526,7 +555,8 @@ public class HttpResponse {
 	/** Serializes the status line, all headers, and one {@code Set-Cookie} line per queued cookie,
 	 *  terminated by the blank line that separates headers from the body. */
 	private String createInitalLineAndHeaders() {
-		StringBuilder sb = new StringBuilder(HttpUtil.createInitialLine(statusCode));
+		StringBuilder sb = new StringBuilder(32 + headers.size() * 45 + cookies.size() * 60);
+		sb.append(HttpUtil.createInitialLine(statusCode));
 		for (Map.Entry<String, String> header : headers.entrySet()) {
 			// RFC 9110 §8.6: MUST NOT send Content-Length on 1xx (except 101), 204, or 304.
 			// The 101 exception is required by the JDK java.net.http WebSocket client.
@@ -562,7 +592,7 @@ public class HttpResponse {
 		if (!headersCreated) {
 			if (useChunked) {
 				setHeader("Transfer-Encoding", "chunked");
-				headers.remove("Content-Length");
+				removeHeader("Content-Length");
 			} else {
 				setHeader("Content-Length", String.valueOf(size));
 			}
@@ -677,7 +707,7 @@ public class HttpResponse {
 
 	/** True when this response must carry no body: a HEAD request ({@code suppressBody}), or a
 	 *  status that is defined to be bodiless (1xx, 204 No Content, 304 Not Modified). */
-	private boolean isBodySuppressed() {
+	protected boolean isBodySuppressed() {
 		return suppressBody || statusCode / 100 == 1 || statusCode == 204 || statusCode == 304;
 	}
 
@@ -688,14 +718,26 @@ public class HttpResponse {
 	 */
 	private static boolean ifMatchHeaderMatches(String headerValue, String etag) {
 		if (headerValue == null || etag == null) return false;
-		headerValue = headerValue.trim();
-		if (headerValue.equals("*")) return true;
+		String trimmedHeader = headerValue.trim();
+		if (trimmedHeader.equals("*")) return true;
 		String target = stripWeak(etag);
-		for (String candidate : headerValue.split(",")) {
-			candidate = candidate.trim();
-			if (!candidate.isEmpty() && stripWeak(candidate).equals(target)) {
+		int len = trimmedHeader.length();
+		int i = 0;
+		while (i < len) {
+			while (i < len && trimmedHeader.charAt(i) == ' ') i++;
+			int start = i;
+			while (i < len && trimmedHeader.charAt(i) != ',') i++;
+			int end = i;
+			while (end > start && trimmedHeader.charAt(end - 1) == ' ') end--;
+			int candStart = start;
+			if (end - start >= 2 && trimmedHeader.charAt(start) == 'W' && trimmedHeader.charAt(start + 1) == '/') {
+				candStart += 2;
+			}
+			int candLen = end - candStart;
+			if (candLen == target.length() && trimmedHeader.regionMatches(candStart, target, 0, candLen)) {
 				return true;
 			}
+			i++;
 		}
 		return false;
 	}

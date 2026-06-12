@@ -58,6 +58,8 @@
 - ETag and `Last-Modified` support
 - `HEAD` with correct `Content-Length`
 - Directory traversal and symlink boundary enforcement
+- **Per-directory configuration (`.dreft-cfg`)** — analogous to Apache's `.htaccess`, enabling directory-level settings such as compression algorithms, enabled state, and glob inclusions/exclusions, loaded dynamically with a 2-second reload TTL.
+
 
 ### TLS
 - Non-blocking `SSLEngine` with growable buffers
@@ -145,6 +147,31 @@ Dependencies: JUnit 4 (test), Logback, Apache HttpClient (test), `javax.activati
 | `MAX_KEEP_ALIVE_REQUESTS` | 1000 | Requests per keep-alive connection |
 | `MAX_CONNECTIONS` | 10000 | Global connection limit |
 | `MAX_CONNECTIONS_PER_IP` | 0 | Per-IP limit (0 = unlimited) |
+
+## Configuration (.dreft-cfg)
+
+Conceptually analogous to Apache's `.htaccess`, placing a `.dreft-cfg` file in a directory dynamically overrides serving and behavior configuration for that directory and its subdirectories (without requiring a server restart). 
+
+The `.dreft-cfg` is an INI-style file. The configuration is cached in memory with a 2-second reload throttle (detecting file updates via modified timestamps).
+
+### Section: `[compression]`
+Currently, it supports configuring on-demand static content compression rules:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Enables or disables compression caching for files in the directory. |
+| `algorithms` | `br, zstd, gzip` | Order of preferred compression algorithms. |
+| `include` | (Based on mime type) | Comma-separated list of glob patterns for files to compress (e.g. `*.html, *.css`). |
+| `exclude` | (None) | Comma-separated list of glob patterns to exclude from compression. |
+
+Example:
+```ini
+[compression]
+enabled = true
+algorithms = br, zstd, gzip
+include = *.html, *.css, *.js, *.json
+exclude = *large-data*
+```
 
 ## License
 

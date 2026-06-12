@@ -143,6 +143,21 @@ public class AsynchronousSocket implements IOHandler {
 			});
 		}
 	}
+
+	public java.util.concurrent.CompletableFuture<Boolean> connect(String host, int port) {
+		java.util.concurrent.CompletableFuture<Boolean> future = new java.util.concurrent.CompletableFuture<>();
+		connect(host, port, new AsyncResult<Boolean>() {
+			@Override
+			public void onSuccess(Boolean result) {
+				future.complete(result);
+			}
+			@Override
+			public void onFailure(Throwable caught) {
+				future.completeExceptionally(caught);
+			}
+		});
+		return future;
+	}
 	
 	/**
 	 * Close the socket.
@@ -254,6 +269,21 @@ public class AsynchronousSocket implements IOHandler {
 		checkReadState();
 	}
 
+	public java.util.concurrent.CompletableFuture<String> readUntil(String delimiter) {
+		java.util.concurrent.CompletableFuture<String> future = new java.util.concurrent.CompletableFuture<>();
+		readUntil(delimiter, new AsyncResult<String>() {
+			@Override
+			public void onSuccess(String result) {
+				future.complete(result);
+			}
+			@Override
+			public void onFailure(Throwable caught) {
+				future.completeExceptionally(caught);
+			}
+		});
+		return future;
+	}
+
 	/**
 	 * Reads from the underlaying SelectableChannel until n bytes are read. When it its, the given
 	 * AsyncResult will be invoked.
@@ -263,6 +293,21 @@ public class AsynchronousSocket implements IOHandler {
 		readBytes = n;
 		readCallback = rcb;
 		checkReadState();
+	}
+
+	public java.util.concurrent.CompletableFuture<String> readBytes(int n) {
+		java.util.concurrent.CompletableFuture<String> future = new java.util.concurrent.CompletableFuture<>();
+		readBytes(n, new AsyncResult<String>() {
+			@Override
+			public void onSuccess(String result) {
+				future.complete(result);
+			}
+			@Override
+			public void onFailure(Throwable caught) {
+				future.completeExceptionally(caught);
+			}
+		});
+		return future;
 	}
 	
 	/**
@@ -339,6 +384,17 @@ public class AsynchronousSocket implements IOHandler {
 		logger.debug("writeBuffer size: {}", writeBuffer.position());
 		writeCallback = wcb;
 		doWrite();
+	}
+
+	public java.util.concurrent.CompletableFuture<Void> write(String data) {
+		java.util.concurrent.CompletableFuture<Void> future = new java.util.concurrent.CompletableFuture<>();
+		write(data, new AsyncCallback() {
+			@Override
+			public void onCallback() {
+				future.complete(null);
+			}
+		});
+		return future;
 	}
 	
 	/**

@@ -19,7 +19,7 @@ public class MXBeanUtil {
 	public static void registerMXBean(Object self, String type) {
 		MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
 		try {
-			String mbeanName = "org.deftserver:type=" + type + ",name=" + self.getClass().getSimpleName();
+			String mbeanName = "org.deftserver:type=" + type + ",name=" + self.getClass().getSimpleName() + "-" + System.identityHashCode(self);
 			ObjectName objectName = new ObjectName(mbeanName);
 			if (!mbs.isRegistered(objectName)) {
 				mbs.registerMBean(self, objectName);
@@ -34,7 +34,7 @@ public class MXBeanUtil {
 	public static void unregisterMXBean(Object self, String type) {
 		MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
 		try {
-			String mbeanName = "org.deftserver:type=" + type + ",name=" + self.getClass().getSimpleName();
+			String mbeanName = "org.deftserver:type=" + type + ",name=" + self.getClass().getSimpleName() + "-" + System.identityHashCode(self);
 			ObjectName objectName = new ObjectName(mbeanName);
 			if (mbs.isRegistered(objectName)) {
 				mbs.unregisterMBean(objectName);

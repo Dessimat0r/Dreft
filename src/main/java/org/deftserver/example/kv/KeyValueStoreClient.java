@@ -42,6 +42,21 @@ public class KeyValueStoreClient {
 		socket.write("GET deft\r\n", new WriteCallback(cb));
 	}
 
+	public java.util.concurrent.CompletableFuture<String> get(String value) {
+		java.util.concurrent.CompletableFuture<String> future = new java.util.concurrent.CompletableFuture<>();
+		get(value, new AsyncResult<String>() {
+			@Override
+			public void onSuccess(String result) {
+				future.complete(result);
+			}
+			@Override
+			public void onFailure(Throwable caught) {
+				future.completeExceptionally(caught);
+			}
+		});
+		return future;
+	}
+
 	/** Callback that, once the GET command is written, reads the store's reply line. */
 	private class WriteCallback implements AsyncCallback {
 

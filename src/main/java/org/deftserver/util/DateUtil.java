@@ -46,7 +46,7 @@ public class DateUtil {
 		if (nowSeconds != lastSeconds) {
 			synchronized (DateUtil.class) {
 				if (nowSeconds != lastSeconds) {
-					cachedDateString = OUTPUT_FORMATTER.format(ZonedDateTime.now(GMT_ZONE));
+					cachedDateString = OUTPUT_FORMATTER.format(ZonedDateTime.ofInstant(Instant.ofEpochSecond(nowSeconds), GMT_ZONE));
 					lastSeconds = nowSeconds;
 				}
 			}

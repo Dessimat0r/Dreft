@@ -97,7 +97,19 @@ public class AsynchronousSocketTest {
 		latch.await(5, TimeUnit.SECONDS);
 		
 		assertEquals(0, latch.getCount());
-		// TODO stop ioloop
+	}
+
+	@Test
+	public void connectWriteAndReadFutureTest() throws Exception {
+		CountDownLatch futureLatch = new CountDownLatch(1);
+		socket.connect(HOST, port)
+			.thenCompose(res -> socket.write("roger|\r\n"))
+			.thenCompose(res -> socket.readUntil("|"))
+			.thenAccept(res -> {
+				assertEquals("ROGER", res);
+				futureLatch.countDown();
+			});
+		assertTrue(futureLatch.await(5, TimeUnit.SECONDS));
 	}
 	
 	private void onConnect() {

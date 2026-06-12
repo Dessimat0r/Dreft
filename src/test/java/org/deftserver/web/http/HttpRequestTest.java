@@ -796,4 +796,24 @@ public class HttpRequestTest {
 		assertEquals("2", request.getParameter("z"));
 	}
 
+	@Test
+	public void testPathOptimizationEdgeCases() throws HttpException {
+		assertEquals("/", HttpRequest.normalizeAndDecodePath(""));
+		assertEquals("/", HttpRequest.normalizeAndDecodePath(null));
+		assertEquals("*", HttpRequest.normalizeAndDecodePath("*"));
+		assertEquals("/foo/bar", HttpRequest.normalizeAndDecodePath("/foo/bar"));
+		assertEquals("/foo/bar/", HttpRequest.normalizeAndDecodePath("/foo/bar/"));
+		assertEquals("/a/b/c", HttpRequest.normalizeAndDecodePath("/a/b/c"));
+	}
+
+	@Test
+	public void testCookieAndChunkOptimizations() {
+		HttpRequest r1 = HttpRequest.of(
+			raw("GET / HTTP/1.1\r\nHost: localhost\r\nCookie:   a=1;   b=\"2\"  ; c  = 3  \r\n\r\n"));
+		Map<String, String> cookies = r1.getCookies();
+		assertEquals("1", cookies.get("a"));
+		assertEquals("2", cookies.get("b"));
+		assertEquals("3", cookies.get("c"));
+	}
+
 }

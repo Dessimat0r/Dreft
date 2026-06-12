@@ -1,12 +1,30 @@
 package org.deftserver.web.handler;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.InputStreamReader;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.util.Locale;
+import java.util.Map;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
 
 import javax.activation.FileTypeMap;
 import javax.activation.MimetypesFileTypeMap;
 
+import org.deftserver.util.HttpUtil;
 import org.deftserver.web.http.HttpException;
 import org.deftserver.web.http.HttpRequest;
 import org.deftserver.web.http.HttpResponse;
@@ -28,15 +46,257 @@ public class StaticContentHandler extends RequestHandler {
 
 	private String staticContentDir;
 	private java.nio.file.Path staticContentRoot;
+	private java.nio.file.Path cacheDir;
 
-	/** Sets the root directory served by this handler, caching its canonical path for the
-	 *  symlink-boundary check performed on every request. */
+	private final static java.util.concurrent.ConcurrentHashMap<String, Object> locks = new java.util.concurrent.ConcurrentHashMap<>();
+
+	private static class FolderConfig {
+		final long lastCheck;
+		final long configLastModified;
+		final boolean exists;
+		final boolean enabled;
+		final java.util.List<String> includePatterns;
+		final java.util.List<String> excludePatterns;
+		final java.util.List<String> algorithms;
+
+		FolderConfig(long lastCheck, long configLastModified, boolean exists, boolean enabled,
+					 java.util.List<String> includePatterns, java.util.List<String> excludePatterns,
+					 java.util.List<String> algorithms) {
+			this.lastCheck = lastCheck;
+			this.configLastModified = configLastModified;
+			this.exists = exists;
+			this.enabled = enabled;
+			this.includePatterns = includePatterns;
+			this.excludePatterns = excludePatterns;
+			this.algorithms = algorithms;
+		}
+	}
+
+	private final static java.util.concurrent.ConcurrentHashMap<String, FolderConfig> configCache = new java.util.concurrent.ConcurrentHashMap<>();
+
+	private void runStartupCleanup() {
+		if (cacheDir == null || !java.nio.file.Files.exists(cacheDir)) {
+			return;
+		}
+		try (java.util.stream.Stream<java.nio.file.Path> stream = java.nio.file.Files.walk(cacheDir)) {
+			stream.filter(java.nio.file.Files::isRegularFile)
+				.forEach(path -> {
+					String filename = path.getFileName().toString();
+					String originalRelative = null;
+					if (filename.endsWith(".br")) {
+						originalRelative = cacheDir.relativize(path).toString();
+						originalRelative = originalRelative.substring(0, originalRelative.length() - 3);
+					} else if (filename.endsWith(".zstd")) {
+						originalRelative = cacheDir.relativize(path).toString();
+						originalRelative = originalRelative.substring(0, originalRelative.length() - 5);
+					} else if (filename.endsWith(".gzip")) {
+						originalRelative = cacheDir.relativize(path).toString();
+						originalRelative = originalRelative.substring(0, originalRelative.length() - 5);
+					} else if (filename.endsWith(".gz")) {
+						originalRelative = cacheDir.relativize(path).toString();
+						originalRelative = originalRelative.substring(0, originalRelative.length() - 3);
+					}
+					if (originalRelative != null) {
+						java.nio.file.Path originalFile = staticContentRoot.resolve(originalRelative);
+						if (!java.nio.file.Files.exists(originalFile)) {
+							try {
+								java.nio.file.Files.delete(path);
+							} catch (IOException e) {
+								logger.warn("Failed to delete orphaned cache file: {}", path, e);
+							}
+						}
+					}
+				});
+		} catch (IOException e) {
+			logger.warn("Failed to clean up cache directory: {}", cacheDir, e);
+		}
+	}
+
 	public void setStaticContentDir(String staticContentDir) {
 		this.staticContentDir = staticContentDir;
 		if (staticContentDir != null) {
 			this.staticContentRoot = java.nio.file.Path.of(staticContentDir).toAbsolutePath().normalize();
+			this.cacheDir = this.staticContentRoot.resolve(".dreft");
+			configCache.clear();
+			runStartupCleanup();
 		} else {
 			this.staticContentRoot = null;
+			this.cacheDir = null;
+			configCache.clear();
+		}
+	}
+
+	public void setCacheDir(String cacheDir) {
+		if (cacheDir != null) {
+			this.cacheDir = java.nio.file.Path.of(cacheDir).toAbsolutePath().normalize();
+		} else {
+			this.cacheDir = this.staticContentRoot != null ? this.staticContentRoot.resolve(".dreft") : null;
+		}
+		configCache.clear();
+		runStartupCleanup();
+	}
+
+	private static java.util.List<String> parseCommaList(String val) {
+		java.util.List<String> list = new java.util.ArrayList<>();
+		for (String s : val.split(",")) {
+			s = s.trim();
+			if (!s.isEmpty()) {
+				list.add(s);
+			}
+		}
+		return list;
+	}
+
+	private static java.util.Map<String, java.util.Map<String, String>> parseIni(File file) {
+		java.util.Map<String, java.util.Map<String, String>> sections = new java.util.HashMap<>();
+		if (!file.exists()) return sections;
+		try (java.io.BufferedReader reader = new java.io.BufferedReader(
+				new java.io.InputStreamReader(new java.io.FileInputStream(file), java.nio.charset.StandardCharsets.UTF_8))) {
+			String line;
+			String currentSection = "";
+			while ((line = reader.readLine()) != null) {
+				line = line.trim();
+				if (line.isEmpty() || line.startsWith("#") || line.startsWith(";")) {
+					continue;
+				}
+				if (line.startsWith("[") && line.endsWith("]")) {
+					currentSection = line.substring(1, line.length() - 1).trim().toLowerCase(java.util.Locale.ROOT);
+					continue;
+				}
+				int eq = line.indexOf('=');
+				if (eq != -1) {
+					String key = line.substring(0, eq).trim().toLowerCase(java.util.Locale.ROOT);
+					String val = line.substring(eq + 1).trim();
+					sections.computeIfAbsent(currentSection, k -> new java.util.HashMap<>()).put(key, val);
+				}
+			}
+		} catch (IOException e) {
+			logger.error("Failed to parse config file: {}", file, e);
+		}
+		return sections;
+	}
+
+	private FolderConfig getFolderConfig(File folder) {
+		String path = folder.getAbsolutePath();
+		FolderConfig cached = configCache.get(path);
+		long now = System.currentTimeMillis();
+		if (cached != null && now - cached.lastCheck < 2000) {
+			return cached;
+		}
+
+		File configFile = new File(folder, ".dreft-cfg");
+		boolean exists = configFile.exists();
+		long lastMod = exists ? configFile.lastModified() : 0L;
+
+		if (cached != null && cached.exists == exists && cached.configLastModified == lastMod) {
+			FolderConfig updated = new FolderConfig(now, lastMod, exists, cached.enabled,
+				cached.includePatterns, cached.excludePatterns, cached.algorithms);
+			configCache.put(path, updated);
+			return updated;
+		}
+
+		boolean enabled = true;
+		java.util.List<String> include = java.util.Collections.emptyList();
+		java.util.List<String> exclude = java.util.Collections.emptyList();
+		java.util.List<String> algos = java.util.Arrays.asList("br", "zstd", "gzip");
+
+		if (exists) {
+			java.util.Map<String, java.util.Map<String, String>> sections = parseIni(configFile);
+			java.util.Map<String, String> comp = sections.get("compression");
+			if (comp != null) {
+				String enVal = comp.get("enabled");
+				if (enVal != null) {
+					enabled = Boolean.parseBoolean(enVal);
+				}
+				String incStr = comp.get("include");
+				if (incStr != null) {
+					include = parseCommaList(incStr);
+				}
+				String excStr = comp.get("exclude");
+				if (excStr != null) {
+					exclude = parseCommaList(excStr);
+				}
+				String algStr = comp.get("algorithms");
+				if (algStr != null) {
+					algos = parseCommaList(algStr);
+				}
+			}
+		}
+
+		FolderConfig newConfig = new FolderConfig(now, lastMod, exists, enabled, include, exclude, algos);
+		configCache.put(path, newConfig);
+		return newConfig;
+	}
+
+	private static boolean matchPattern(String filename, String pattern) {
+		String fnLower = filename.toLowerCase(java.util.Locale.ROOT);
+		String patLower = pattern.toLowerCase(java.util.Locale.ROOT);
+		if (patLower.equals("*")) return true;
+		if (patLower.startsWith("*") && !patLower.substring(1).contains("*")) {
+			return fnLower.endsWith(patLower.substring(1));
+		}
+		if (patLower.endsWith("*") && !patLower.substring(0, patLower.length() - 1).contains("*")) {
+			return fnLower.startsWith(patLower.substring(0, patLower.length() - 1));
+		}
+		String regex = patLower.replace(".", "\\.")
+							  .replace("?", ".")
+							  .replace("*", ".*");
+		return fnLower.matches(regex);
+	}
+
+	private static void compressFile(File src, File dest, String encoding) throws IOException {
+		File tempFile = new File(dest.getAbsolutePath() + ".tmp");
+		java.nio.file.Files.createDirectories(dest.getParentFile().toPath());
+		try {
+			try (java.io.InputStream in = new java.io.BufferedInputStream(new java.io.FileInputStream(src));
+				 java.io.OutputStream out = new java.io.BufferedOutputStream(new java.io.FileOutputStream(tempFile))) {
+				
+				java.io.OutputStream compressionOut;
+				if ("gzip".equals(encoding)) {
+					compressionOut = new java.util.zip.GZIPOutputStream(out);
+				} else if ("zstd".equals(encoding)) {
+					if (HttpUtil.isZstdSupported()) {
+						compressionOut = HttpUtil.createZstdOutputStream(out);
+					} else {
+						throw new IOException("Zstd not supported");
+					}
+				} else if ("br".equals(encoding)) {
+					if (HttpUtil.isBrotliSupported()) {
+						compressionOut = HttpUtil.createBrotliOutputStream(out);
+					} else {
+						throw new IOException("Brotli not supported");
+					}
+				} else {
+					throw new IllegalArgumentException("Unsupported encoding: " + encoding);
+				}
+				
+				try (java.io.OutputStream finalOut = compressionOut) {
+					byte[] buffer = new byte[8192];
+					int bytesRead;
+					while ((bytesRead = in.read(buffer)) != -1) {
+						finalOut.write(buffer, 0, bytesRead);
+					}
+				}
+			}
+			try {
+				java.nio.file.Files.move(
+					tempFile.toPath(), 
+					dest.toPath(), 
+					java.nio.file.StandardCopyOption.REPLACE_EXISTING, 
+					java.nio.file.StandardCopyOption.ATOMIC_MOVE
+				);
+			} catch (java.nio.file.AtomicMoveNotSupportedException amse) {
+				java.nio.file.Files.move(
+					tempFile.toPath(), 
+					dest.toPath(), 
+					java.nio.file.StandardCopyOption.REPLACE_EXISTING
+				);
+			}
+		} catch (IOException e) {
+			if (tempFile.exists()) {
+				tempFile.delete();
+			}
+			throw e;
 		}
 	}
 
@@ -173,10 +433,147 @@ public class StaticContentHandler extends RequestHandler {
 		}
 
 		logger.debug("file: {}", file);
-		if (!file.exists()) {
-			throw new HttpException(404, "Not found", "Requested resource: <tt>" + safePath +  "</tt> was not found.");
-		} else if (!file.isFile()) {
-			throw new HttpException(403, "Not a file", "Requested resource: <tt>" + safePath +  "</tt> is not a file.");
+		File serveFile = file;
+		String baseEtagSuffix = "";
+		String acceptEncoding = request.getHeader("Accept-Encoding");
+		String chosenEncoding = null;
+
+		if (acceptEncoding != null && cacheDir != null) {
+			File parentDir = file.getParentFile();
+			FolderConfig config = getFolderConfig(parentDir);
+			if (config.enabled) {
+				boolean matches = false;
+				String filename = file.getName();
+				if (!config.includePatterns.isEmpty()) {
+					for (String pat : config.includePatterns) {
+						if (matchPattern(filename, pat)) {
+							matches = true;
+							break;
+						}
+					}
+				} else {
+					String ext = "";
+					int dot = filename.lastIndexOf('.');
+					if (dot != -1) {
+						ext = filename.substring(dot + 1).toLowerCase(java.util.Locale.ROOT);
+					}
+					String mimeType = EXT_TO_MIME.get(ext);
+					if (mimeType != null && (
+						mimeType.contains("text") ||
+						mimeType.contains("json") ||
+						mimeType.contains("xml") ||
+						mimeType.contains("javascript") ||
+						mimeType.equals("application/wasm")
+					)) {
+						matches = true;
+					}
+				}
+
+				if (matches) {
+					for (String pat : config.excludePatterns) {
+						if (matchPattern(filename, pat)) {
+							matches = false;
+							break;
+						}
+					}
+				}
+
+				if (matches) {
+					double bestQ = 0.0;
+					String bestAlgo = null;
+					int bestPref = -1;
+					int len = acceptEncoding.length();
+					int idx = 0;
+					while (idx < len) {
+						int nextComma = acceptEncoding.indexOf(',', idx);
+						int endSegment = (nextComma == -1) ? len : nextComma;
+						
+						int firstSemi = acceptEncoding.indexOf(';', idx);
+						int endType = (firstSemi == -1 || firstSemi > endSegment) ? endSegment : firstSemi;
+						
+						String encoding = acceptEncoding.substring(idx, endType).trim().toLowerCase(java.util.Locale.ROOT);
+						if (!encoding.isEmpty() && config.algorithms.contains(encoding)) {
+							double q = 1.0;
+							if (firstSemi != -1 && firstSemi < endSegment) {
+								int pIdx = firstSemi + 1;
+								while (pIdx < endSegment) {
+									int nextSemi = acceptEncoding.indexOf(';', pIdx);
+									int endParam = (nextSemi == -1 || nextSemi > endSegment) ? endSegment : nextSemi;
+									String param = acceptEncoding.substring(pIdx, endParam).trim();
+									if (param.startsWith("q=")) {
+										try {
+											q = Double.parseDouble(param.substring(2).trim());
+										} catch (NumberFormatException e) {
+											q = 0.0;
+										}
+										if (Double.isNaN(q)) {
+											q = 0.0;
+										} else if (q > 1.0) {
+											q = 1.0;
+										} else if (q < 0.0) {
+											q = 0.0;
+										}
+									}
+									pIdx = endParam + 1;
+								}
+							}
+							if (q > 0.0) {
+								int pref = 0;
+								if (encoding.equals("br") && HttpUtil.isBrotliSupported()) {
+									pref = 3;
+								} else if (encoding.equals("zstd") && HttpUtil.isZstdSupported()) {
+									pref = 2;
+								} else if (encoding.equals("gzip")) {
+									pref = 1;
+								}
+								if (pref > 0) {
+									if (q > bestQ) {
+										bestQ = q;
+										bestAlgo = encoding;
+										bestPref = pref;
+									} else if (q == bestQ && pref > bestPref) {
+										bestAlgo = encoding;
+										bestPref = pref;
+									}
+								}
+							}
+						}
+						idx = endSegment + 1;
+					}
+					chosenEncoding = bestAlgo;
+				}
+			}
+		}
+
+		if (chosenEncoding != null) {
+			try {
+				Path fileReal = file.toPath().toRealPath();
+				Path rootReal = staticContentRoot.toRealPath();
+				Path relativePath = rootReal.relativize(fileReal);
+				File cachedFile = cacheDir.resolve(relativePath.toString() + "." + chosenEncoding).toFile();
+				
+				if (!cachedFile.exists() || cachedFile.lastModified() < file.lastModified()) {
+					String canonicalPath = cachedFile.getCanonicalPath();
+					Object lock = locks.computeIfAbsent(canonicalPath, k -> new Object());
+					synchronized (lock) {
+						try {
+							if (!cachedFile.exists() || cachedFile.lastModified() < file.lastModified()) {
+								compressFile(file, cachedFile, chosenEncoding);
+							}
+						} finally {
+							locks.remove(canonicalPath, lock);
+						}
+					}
+				}
+				serveFile = cachedFile;
+				baseEtagSuffix = "-" + chosenEncoding;
+				response.setHeader("Content-Encoding", chosenEncoding);
+				response.addVary("Accept-Encoding");
+			} catch (IOException e) {
+				logger.error("Failed to resolve or compress file: {}", file, e);
+				serveFile = file;
+				chosenEncoding = null;
+			}
 		}
 
 		final long lastModified = file.lastModified();
@@ -185,16 +582,18 @@ public class StaticContentHandler extends RequestHandler {
 		response.setHeader("Cache-Control", "public");
 		response.setHeader("Accept-Ranges", "bytes");
 
-		final String etag = org.deftserver.util.HttpUtil.getEtag(file);
+		String etag = org.deftserver.util.HttpUtil.getEtag(file);
 		if (!etag.isEmpty()) {
+			if (!baseEtagSuffix.isEmpty()) {
+				if (etag.endsWith("\"")) {
+					etag = etag.substring(0, etag.length() - 1) + baseEtagSuffix + "\"";
+				} else {
+					etag = etag + baseEtagSuffix;
+				}
+			}
 			response.setHeader("ETag", etag);
 		}
 
-		// Resolve the Content-Type from the file extension FIRST: it is fast (in-memory, no syscall),
-		// is the conventional behaviour for a static file server, and is safer than content sniffing —
-		// a magic-number probe could mis-classify e.g. a user-uploaded "notes.txt" that begins with
-		// "<html>" as text/html and serve it as active markup (a stored-XSS vector). Only fall back to
-		// a filesystem content probe (a per-request syscall) when the extension is unknown.
 		String ext = "";
 		String filenameLower = file.getName().toLowerCase(java.util.Locale.ROOT);
 		if (filenameLower.endsWith(".tar.gz")) {
@@ -215,7 +614,6 @@ public class StaticContentHandler extends RequestHandler {
 			try {
 				mimeType = java.nio.file.Files.probeContentType(file.toPath());
 			} catch (IOException e) {
-				// ignore and let the final fallback resolve
 			}
 		}
 		if (mimeType == null) {
@@ -231,68 +629,54 @@ public class StaticContentHandler extends RequestHandler {
 		}
 		response.setHeader("Content-Type", mimeType);
 
-		// Conditional requests, evaluated in the RFC 9110 §13.2.2 precedence order:
-		//   1. If-Match  2. If-Unmodified-Since (only if If-Match absent)
-		//   3. If-None-Match  4. If-Modified-Since (only if If-None-Match absent)
 		final String ifMatch = request.getHeader("If-Match");
 		final String ifNoneMatch = request.getHeader("If-None-Match");
 		final String ifUnmodifiedSince = request.getHeader("If-Unmodified-Since");
 		final String ifModifiedSince = request.getHeader("If-Modified-Since");
 
-		// 1. If-Match (RFC 9110 §13.1.1): "*" matches any existing representation; otherwise the
-		// current strong ETag must appear in the list. Failure → 412 Precondition Failed.
 		if (ifMatch != null && !etag.isEmpty()) {
 			String im = ifMatch.trim();
-			if (!im.equals("*") && !etagListContains(im, etag, true /* strong comparison */)) {
-				response.setStatusCode(412);	// Precondition Failed
+			if (!im.equals("*") && !etagListContains(im, etag, true)) {
+				response.setStatusCode(412);
 				logger.debug("if-match precondition failed");
 				return;
 			}
 		}
 
-		// 2. If-Unmodified-Since (RFC 9110 §13.1.4) — ignored when If-Match is present. If the
-		// representation was modified after the given date → 412.
 		if (ifUnmodifiedSince != null && ifMatch == null) {
 			long ius = parseHttpDateOrEpoch(ifUnmodifiedSince);
 			if (ius != -1 && lastModifiedSec > ius) {
-				response.setStatusCode(412);	// Precondition Failed
+				response.setStatusCode(412);
 				logger.debug("if-unmodified-since precondition failed");
 				return;
 			}
 		}
 
-		// 3. If-None-Match (ETag) cache validation → 304 Not Modified on match.
 		if (ifNoneMatch != null && !etag.isEmpty()) {
 			String clientEtag = ifNoneMatch.trim();
-			if (clientEtag.equals("*") || etagListContains(clientEtag, etag, false /* weak comparison */)) {
-				response.setStatusCode(304);	//Not Modified
+			if (clientEtag.equals("*") || etagListContains(clientEtag, etag, false)) {
+				response.setStatusCode(304);
 				logger.debug("not modified (etag matched)");
 				return;
 			}
 		}
 
-		// 4. Last-Modified Cache Validation. RFC 9110 §13.1.3: If-Modified-Since MUST be ignored when
-		// If-None-Match is present (the entity-tag is the stronger validator and takes precedence).
 		if (ifModifiedSince != null && ifNoneMatch == null) {
 			long ims = parseHttpDateOrEpoch(ifModifiedSince);
 			if (ims != -1 && lastModifiedSec <= ims) {
-				response.setStatusCode(304);	//Not Modified
+				response.setStatusCode(304);
 				logger.debug("not modified");
 				return;
 			}
 		}
 
-		// Handle Range requests. If-Range (RFC 9110 §13.1.5): only honour the Range when the
-		// client's validator still matches the current representation; otherwise serve the whole
-		// file (200) so the client re-syncs. ETag comparison for If-Range is strong-only, so a
-		// weak ("W/") tag never enables the range.
 		String rangeHeader = request.getHeader("Range");
 		boolean rangeApplicable = true;
 		String ifRange = request.getHeader("If-Range");
 		if (ifRange != null && rangeHeader != null) {
 			ifRange = ifRange.trim();
 			if (ifRange.startsWith("\"") || ifRange.startsWith("W/")) {
-				rangeApplicable = ifRange.equals(etag); // etag is a strong, quoted tag
+				rangeApplicable = ifRange.equals(etag);
 			} else {
 				long irTime = org.deftserver.util.DateUtil.parseRFC1123ToMillis(ifRange);
 				rangeApplicable = irTime != -1 && lastModifiedSec <= irTime;
@@ -300,8 +684,8 @@ public class StaticContentHandler extends RequestHandler {
 		}
 		if (rangeApplicable && rangeHeader != null && rangeHeader.startsWith("bytes=")) {
 			String rangeVal = rangeHeader.substring(6).trim();
-			if (!rangeVal.contains(",")) { // single range only
-				long fileLength = file.length();
+			if (!rangeVal.contains(",")) {
+				long fileLength = serveFile.length();
 				long start = -1;
 				long end = -1;
 				boolean valid = true;
@@ -346,7 +730,7 @@ public class StaticContentHandler extends RequestHandler {
 					response.setHeader("Content-Range", "bytes " + start + "-" + end + "/" + fileLength);
 					response.setHeader("Content-Length", String.valueOf(rangeLength));
 					if (hasBody) {
-						response.write(file, start, rangeLength);
+						response.write(serveFile, start, rangeLength);
 					}
 					return;
 				}
@@ -354,10 +738,9 @@ public class StaticContentHandler extends RequestHandler {
 		}
 
 		if (hasBody) {
-			response.write(file);
+			response.write(serveFile);
 		} else {
-			// HEAD: report the same Content-Length a GET would, without sending the body.
-			response.setHeader("Content-Length", String.valueOf(file.length()));
+			response.setHeader("Content-Length", String.valueOf(serveFile.length()));
 		}
 	}
 
@@ -368,19 +751,30 @@ public class StaticContentHandler extends RequestHandler {
 	 * (RFC 9110 §13.1.1/§13.1.2 / §8.8.3.2).
 	 */
 	private static boolean etagListContains(String headerValue, String currentStrongEtag, boolean strongComparison) {
-		for (String raw : headerValue.split(",")) {
-			String tag = raw.trim();
-			if (tag.isEmpty()) {
-				continue;
+		int len = headerValue.length();
+		int i = 0;
+		while (i < len) {
+			while (i < len && headerValue.charAt(i) == ' ') i++;
+			int start = i;
+			while (i < len && headerValue.charAt(i) != ',') i++;
+			int end = i;
+			while (end > start && headerValue.charAt(end - 1) == ' ') end--;
+			
+			if (end > start) {
+				boolean weak = false;
+				int candStart = start;
+				if (end - start >= 2 && headerValue.charAt(start) == 'W' && headerValue.charAt(start + 1) == '/') {
+					weak = true;
+					candStart += 2;
+				}
+				if (!(weak && strongComparison)) {
+					int candLen = end - candStart;
+					if (candLen == currentStrongEtag.length() && headerValue.regionMatches(candStart, currentStrongEtag, 0, candLen)) {
+						return true;
+					}
+				}
 			}
-			boolean weak = tag.startsWith("W/");
-			if (weak && strongComparison) {
-				continue; // strong comparison: a weak tag can never match
-			}
-			String bare = weak ? tag.substring(2) : tag;
-			if (bare.equals(currentStrongEtag)) {
-				return true;
-			}
+			i++;
 		}
 		return false;
 	}

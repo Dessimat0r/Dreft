@@ -93,6 +93,36 @@ public class AsynchronousHttpClient {
 		doFetch(cb, System.currentTimeMillis());
 	}
 
+	public java.util.concurrent.CompletableFuture<Response> fetch(String url) {
+		java.util.concurrent.CompletableFuture<Response> future = new java.util.concurrent.CompletableFuture<>();
+		fetch(url, new AsyncResult<Response>() {
+			@Override
+			public void onSuccess(Response result) {
+				future.complete(result);
+			}
+			@Override
+			public void onFailure(Throwable caught) {
+				future.completeExceptionally(caught);
+			}
+		});
+		return future;
+	}
+
+	public java.util.concurrent.CompletableFuture<Response> fetch(Request request) {
+		java.util.concurrent.CompletableFuture<Response> future = new java.util.concurrent.CompletableFuture<>();
+		fetch(request, new AsyncResult<Response>() {
+			@Override
+			public void onSuccess(Response result) {
+				future.complete(result);
+			}
+			@Override
+			public void onFailure(Throwable caught) {
+				future.completeExceptionally(caught);
+			}
+		});
+		return future;
+	}
+
 	/** Opens a socket, arms the request timeout, and connects — wiring the connect result to the
 	 *  {@code onConnect}/{@code onConnectFailure} steps of the request state machine. */
 	private void doFetch(AsyncResult<Response> cb, long requestStarted) {
@@ -217,16 +247,42 @@ public class AsynchronousHttpClient {
 		logger.debug("headers: {}", result);
 		cancelTimeout();
 		response = new Response(requestStarted);
-		String[] headers = result.split("\r\n");
-		response.setStatuLine(headers[0]);	// first entry contains status line (e.g. HTTP/1.1 200 OK)
-		for (int i = 1; i < headers.length; i++) {
-			String headerLine = headers[i];
-			int colonIndex = headerLine.indexOf(':');
+		int len = result.length();
+		int start = 0;
+		int end = result.indexOf("\r\n");
+		if (end == -1) {
+			response.setStatuLine(result);
+			start = len;
+		} else {
+			response.setStatuLine(result.substring(start, end));
+			start = end + 2;
+		}
+		while (start < len) {
+			end = result.indexOf("\r\n", start);
+			if (end == -1) {
+				end = len;
+			}
+			int colonIndex = -1;
+			for (int j = start; j < end; j++) {
+				if (result.charAt(j) == ':') {
+					colonIndex = j;
+					break;
+				}
+			}
 			if (colonIndex != -1) {
-				String key = headerLine.substring(0, colonIndex).trim();
-				String value = headerLine.substring(colonIndex + 1).trim();
+				int kStart = start;
+				while (kStart < colonIndex && result.charAt(kStart) == ' ') kStart++;
+				int kEnd = colonIndex;
+				while (kEnd > kStart && result.charAt(kEnd - 1) == ' ') kEnd--;
+				int vStart = colonIndex + 1;
+				while (vStart < end && result.charAt(vStart) == ' ') vStart++;
+				int vEnd = end;
+				while (vEnd > vStart && result.charAt(vEnd - 1) == ' ') vEnd--;
+				String key = result.substring(kStart, kEnd);
+				String value = result.substring(vStart, vEnd);
 				response.setHeader(key, value);
 			}
+			start = end + 2;
 		}
 		logger.debug("cl-ahttpc");
 		String contentLength = response.getHeader("Content-Length");
@@ -354,15 +410,22 @@ public class AsynchronousHttpClient {
 		// The chunk-size line may carry chunk-extensions after a ';' (RFC 9112 §7.1.1) — strip them
 		// before parsing the hex size. A malformed size must fail the request via onFailure rather
 		// than throw an uncaught NumberFormatException up the read-callback chain (silent hang).
-		String sizeText = octet;
-		int semi = sizeText.indexOf(';');
-		if (semi != -1) {
-			sizeText = sizeText.substring(0, semi);
+		int semi = octet.indexOf(';');
+		int limit = (semi == -1) ? octet.length() : semi;
+		int start = 0;
+		while (start < limit && octet.charAt(start) <= ' ') {
+			start++;
 		}
-		sizeText = sizeText.trim();
+		int end = limit;
+		while (end > start && octet.charAt(end - 1) <= ' ') {
+			end--;
+		}
 		final int readBytes;
 		try {
-			readBytes = Integer.parseInt(sizeText, 16);
+			if (start == end) {
+				throw new NumberFormatException("empty chunk size");
+			}
+			readBytes = Integer.parseInt(octet, start, end, 16);
 			if (readBytes < 0) {
 				throw new NumberFormatException("negative chunk size");
 			}

@@ -368,6 +368,37 @@ public class IOLoop implements IOLoopMXBean {
 			selector.wakeup();
 		}
 	}
+
+	public <T> java.util.concurrent.CompletableFuture<T> submit(java.util.concurrent.Callable<T> task) {
+		java.util.concurrent.CompletableFuture<T> future = new java.util.concurrent.CompletableFuture<>();
+		addCallback(new AsyncCallback() {
+			@Override
+			public void onCallback() {
+				try {
+					future.complete(task.call());
+				} catch (Throwable t) {
+					future.completeExceptionally(t);
+				}
+			}
+		});
+		return future;
+	}
+
+	public java.util.concurrent.CompletableFuture<Void> submit(Runnable task) {
+		java.util.concurrent.CompletableFuture<Void> future = new java.util.concurrent.CompletableFuture<>();
+		addCallback(new AsyncCallback() {
+			@Override
+			public void onCallback() {
+				try {
+					task.run();
+					future.complete(null);
+				} catch (Throwable t) {
+					future.completeExceptionally(t);
+				}
+			}
+		});
+		return future;
+	}
 	
 // implements IOLoopMXBean
 

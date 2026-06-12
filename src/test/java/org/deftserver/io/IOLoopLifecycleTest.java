@@ -131,4 +131,33 @@ public class IOLoopLifecycleTest {
 			loop.dispose();
 		}
 	}
+
+	@Test
+	public void submitCallableAndRunnableOnIOLoop() throws Exception {
+		IOLoop loop = new IOLoop();
+		Thread t = new Thread(loop::start, "test-submit-ioloop");
+		t.start();
+		try {
+			final String currentThreadName = Thread.currentThread().getName();
+			java.util.concurrent.CompletableFuture<String> callableFuture = loop.submit(() -> {
+				assertFalse(Thread.currentThread().getName().equals(currentThreadName));
+				assertTrue(Thread.currentThread().getName().startsWith("I/O-LOOP"));
+				return "hello from loop thread";
+			});
+			org.junit.Assert.assertEquals("hello from loop thread", callableFuture.get(2, TimeUnit.SECONDS));
+
+			final AtomicInteger runVal = new AtomicInteger();
+			java.util.concurrent.CompletableFuture<Void> runnableFuture = loop.submit(() -> {
+				assertFalse(Thread.currentThread().getName().equals(currentThreadName));
+				assertTrue(Thread.currentThread().getName().startsWith("I/O-LOOP"));
+				runVal.set(42);
+			});
+			runnableFuture.get(2, TimeUnit.SECONDS);
+			org.junit.Assert.assertEquals(42, runVal.get());
+		} finally {
+			loop.stop();
+			t.join(2000);
+			loop.dispose();
+		}
+	}
 }

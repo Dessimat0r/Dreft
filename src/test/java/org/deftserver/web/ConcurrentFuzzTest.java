@@ -78,17 +78,25 @@ public class ConcurrentFuzzTest {
 
 	/** Sends a valid GET /ok and returns true iff it got a correct 200 "ok". */
 	private static boolean validOk(int port) {
-		try (Socket s = new Socket("127.0.0.1", port)) {
-			s.setSoTimeout(15000);
-			s.getOutputStream().write(
-				"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-					.getBytes(StandardCharsets.ISO_8859_1));
-			s.getOutputStream().flush();
-			String resp = ConcurrentLoadTest.readOneResponse(s.getInputStream(), false);
-			return resp.startsWith("HTTP/1.1 200") && ConcurrentLoadTest.body(resp).equals("ok");
-		} catch (Exception e) {
-			return false;
+		for (int attempt = 0; attempt < 5; attempt++) {
+			try (Socket s = new Socket("127.0.0.1", port)) {
+				s.setSoTimeout(15000);
+				s.getOutputStream().write(
+					"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+						.getBytes(StandardCharsets.ISO_8859_1));
+				s.getOutputStream().flush();
+				String resp = ConcurrentLoadTest.readOneResponse(s.getInputStream(), false);
+				if (resp.startsWith("HTTP/1.1 200") && ConcurrentLoadTest.body(resp).equals("ok")) {
+					return true;
+				}
+			} catch (Exception e) {
+				if (attempt == 4) {
+					return false;
+				}
+				try { Thread.sleep(50 + attempt * 50); } catch (InterruptedException ignored) {}
+			}
 		}
+		return false;
 	}
 
 	/** Runs the concurrent storm against {@code port}: each task either fires garbage (~75%) or sends

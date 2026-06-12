@@ -214,4 +214,8 @@ public class Application {
 		StaticContentHandler.getInstance().setStaticContentDir(scd);
 	}
 
+	public void setStaticContentCacheDir(String path) {
+		StaticContentHandler.getInstance().setCacheDir(path);
+	}
+
 }

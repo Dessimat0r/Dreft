@@ -45,6 +45,7 @@ public class HttpProtocol implements IOHandler {
 
 	private javax.net.ssl.SSLContext sslContext;
 	private final Map<SocketChannel, SSLSessionHandler> sslSessionHandlers = new ConcurrentHashMap<>();
+	private final Map<SocketChannel, org.deftserver.web.http.http2.Http2Connection> http2Connections = new ConcurrentHashMap<>();
 
 	private final Map<SocketChannel, WebSocketHandler> websocketHandlers = new ConcurrentHashMap<>();
 	private final Map<SocketChannel, WebSocketConnection> websocketConnections = new ConcurrentHashMap<>();
@@ -183,6 +184,7 @@ public class HttpProtocol implements IOHandler {
 	public void closeChannel(SocketChannel channel) {
 		if (channel != null) {
 			sslSessionHandlers.remove(channel);
+			http2Connections.remove(channel);
 			// Notify a WebSocket app of the close exactly once, here, so onClose fires for EVERY
 			// teardown path (read EOF, close frame, write error, idle/limit close, IOLoop generic
 			// close) rather than only the few that called it explicitly. remove() returns the
@@ -305,15 +307,17 @@ public class HttpProtocol implements IOHandler {
 					return;
 				}
 			}
-			if (maxConnectionsPerIp > 0) {
+			if (maxConnectionsPerIp > 0 && !isUnixSocket(clientChannel)) {
 				java.net.InetAddress ip = clientChannel.socket().getInetAddress();
 				if (ip != null) {
 					activeChannels.removeIf(ch -> !ch.isOpen()); // self-heal stale entries first
 					int sameIp = 0;
 					for (SocketChannel ch : activeChannels) {
-						java.net.InetAddress chIp = ch.socket().getInetAddress();
-						if (ip.equals(chIp)) {
-							sameIp++;
+						if (!isUnixSocket(ch)) {
+							java.net.InetAddress chIp = ch.socket().getInetAddress();
+							if (ip.equals(chIp)) {
+								sameIp++;
+							}
 						}
 					}
 					if (sameIp >= maxConnectionsPerIp) {
@@ -325,7 +329,9 @@ public class HttpProtocol implements IOHandler {
 			}
 			// could be null in a multithreaded deft environment because another ioloop was "faster" to accept()
 			clientChannel.configureBlocking(false);
-			clientChannel.setOption(StandardSocketOptions.TCP_NODELAY, Boolean.TRUE);
+			if (clientChannel.supportedOptions().contains(StandardSocketOptions.TCP_NODELAY)) {
+				clientChannel.setOption(StandardSocketOptions.TCP_NODELAY, Boolean.TRUE);
+			}
 			ioLoop.addHandler(clientChannel, this, SelectionKey.OP_READ, ByteBuffer.allocate(READ_BUFFER_SIZE));
 			activeChannels.add(clientChannel);
 			
@@ -368,6 +374,12 @@ public class HttpProtocol implements IOHandler {
 		logger.debug("handle read... key: {}", key);
 		SocketChannel clientChannel = (SocketChannel) key.channel();
 		
+		org.deftserver.web.http.http2.Http2Connection http2Conn = http2Connections.get(clientChannel);
+		if (http2Conn != null) {
+			prolongKeepAliveTimeout(clientChannel);
+			http2Conn.onReadable();
+			return;
+		}
 		WebSocketHandler wsHandler = websocketHandlers.get(clientChannel);
 		if (wsHandler != null) {
 			handleWebSocketRead(key, clientChannel, wsHandler);
@@ -548,9 +560,15 @@ public class HttpProtocol implements IOHandler {
 	 *  {@link #closeChannel}. */
 	@Override
 	public void handleWrite(SelectionKey key) throws IOException {
+		SocketChannel channel = ((SocketChannel) key.channel());
+		org.deftserver.web.http.http2.Http2Connection http2Conn = http2Connections.get(channel);
+		if (http2Conn != null) {
+			prolongKeepAliveTimeout(channel);
+			http2Conn.onWritable();
+			return;
+		}
 		Object attachment = key.attachment();
 		logger.debug("handle write... attachment={}", attachment == null ? "null" : attachment.getClass().getSimpleName());
-		SocketChannel channel = ((SocketChannel) key.channel());
 
 		SSLSessionHandler sslHandler = sslSessionHandlers.get(channel);
 		if (sslHandler != null && sslHandler.hasPendingWrite()) {
@@ -1186,6 +1204,25 @@ public class HttpProtocol implements IOHandler {
 					"The request header section exceeds the maximum permitted size");
 			}
 		}
+		if (isHttp2PrefacePrefix(buffer)) {
+			if (buffer.position() >= HTTP2_PREFACE.length) {
+				buffer.flip();
+				byte[] initialBytes = new byte[buffer.remaining()];
+				buffer.get(initialBytes);
+				buffer.clear();
+				org.deftserver.web.http.http2.Http2Connection conn = new org.deftserver.web.http.http2.Http2Connection(this, key, clientChannel, initialBytes);
+				http2Connections.put(clientChannel, conn);
+				readBuffers.remove(clientChannel);
+				Timeout t = headerReadTimeouts.remove(clientChannel);
+				if (t != null) t.cancel();
+				prolongKeepAliveTimeout(clientChannel);
+				conn.onReadable();
+				return null;
+			} else {
+				key.interestOps(SelectionKey.OP_READ);
+				return null;
+			}
+		}
 		buffer.flip();
 		logger.debug("getHttpRequest buffer remaining: {}", buffer.remaining());
 		HttpRequest req = doGetHttpRequest(key, clientChannel, buffer);
@@ -1258,10 +1295,17 @@ public class HttpProtocol implements IOHandler {
 		}
 		if (request == null) return null;
 		//set extra request info
-		request.setRemoteHost(clientChannel.socket().getInetAddress());
-		request.setRemotePort(clientChannel.socket().getPort());
-		request.setServerHost(clientChannel.socket().getLocalAddress());
-		request.setServerPort(clientChannel.socket().getLocalPort());
+		if (isUnixSocket(clientChannel)) {
+			request.setRemoteHost(java.net.InetAddress.getLoopbackAddress());
+			request.setRemotePort(0);
+			request.setServerHost(java.net.InetAddress.getLoopbackAddress());
+			request.setServerPort(0);
+		} else {
+			request.setRemoteHost(clientChannel.socket().getInetAddress());
+			request.setRemotePort(clientChannel.socket().getPort());
+			request.setServerHost(clientChannel.socket().getLocalAddress());
+			request.setServerPort(clientChannel.socket().getLocalPort());
+		}
 		request.setSecure(sslSessionHandlers.containsKey(clientChannel));
 		return request;
 	}
@@ -1558,6 +1602,59 @@ public class HttpProtocol implements IOHandler {
 			return true;
 		} catch (java.nio.charset.CharacterCodingException e) {
 			return false;
+		}
+	}
+
+	public Application getApplication() {
+		return application;
+	}
+
+	private static final byte[] HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+
+	private boolean isHttp2PrefacePrefix(ByteBuffer buffer) {
+		int pos = buffer.position();
+		if (pos == 0) return false;
+		int len = Math.min(pos, HTTP2_PREFACE.length);
+		for (int i = 0; i < len; i++) {
+			if (buffer.get(i) != HTTP2_PREFACE[i]) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	public ByteBuffer readPlaintext(SocketChannel clientChannel) throws IOException {
+		SSLSessionHandler sslHandler = sslSessionHandlers.get(clientChannel);
+		if (sslHandler != null) {
+			int pktSize = sslHandler.getPacketBufferSize();
+			if (sslReadScratch == null || sslReadScratch.capacity() < pktSize) {
+				sslReadScratch = ByteBuffer.allocate(pktSize);
+			}
+			ByteBuffer encrypted = sslReadScratch;
+			encrypted.clear();
+			int read = clientChannel.read(encrypted);
+			if (read == -1) {
+				return null;
+			}
+			encrypted.flip();
+			return sslHandler.unwrap(encrypted);
+		} else {
+			ByteBuffer buf = ByteBuffer.allocate(65536);
+			int read = clientChannel.read(buf);
+			if (read == -1) {
+				return null;
+			}
+			buf.flip();
+			return buf;
+		}
+	}
+
+	private static boolean isUnixSocket(SocketChannel channel) {
+		try {
+			channel.socket();
+			return false;
+		} catch (UnsupportedOperationException e) {
+			return true;
 		}
 	}
 
