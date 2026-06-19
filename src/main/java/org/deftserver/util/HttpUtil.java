@@ -16,7 +16,29 @@ public class HttpUtil {
 
 	/* MessageDigest are not thread-safe and are expensive to create. 
 	 * Do it lazily for each thread that need access to one.*/
-	private static final ThreadLocal<MessageDigest> md = new ThreadLocal<MessageDigest>();
+
+	private static final char[] HEX_CHARS = "0123456789abcdef".toCharArray();
+
+	private static final java.util.concurrent.ConcurrentHashMap<String, java.nio.charset.Charset> charsets = new java.util.concurrent.ConcurrentHashMap<>();
+	static {
+		charsets.put("UTF-8", java.nio.charset.StandardCharsets.UTF_8);
+		charsets.put("ISO-8859-1", java.nio.charset.StandardCharsets.ISO_8859_1);
+		charsets.put("US-ASCII", java.nio.charset.StandardCharsets.US_ASCII);
+	}
+
+	public static java.nio.charset.Charset getCharset(String name) {
+		if (name == null) return java.nio.charset.StandardCharsets.UTF_8;
+		if (name.equalsIgnoreCase("UTF-8") || name.equalsIgnoreCase("UTF8")) {
+			return java.nio.charset.StandardCharsets.UTF_8;
+		}
+		if (name.equalsIgnoreCase("ISO-8859-1")) {
+			return java.nio.charset.StandardCharsets.ISO_8859_1;
+		}
+		if (name.equalsIgnoreCase("US-ASCII")) {
+			return java.nio.charset.StandardCharsets.US_ASCII;
+		}
+		return charsets.computeIfAbsent(name.toUpperCase(java.util.Locale.ROOT), java.nio.charset.Charset::forName);
+	}
 	private static final String _101_SWITCHING_PROTOCOLS 	= "HTTP/1.1 101 Switching Protocols\r\n";
 	private static final String _200_OK 		 			= "HTTP/1.1 200 OK\r\n"; 
 	private static final String _201_CREATED 		 		= "HTTP/1.1 201 Created\r\n"; 
@@ -231,39 +253,48 @@ public class HttpUtil {
 
 	/** A deterministic ETag (unquoted hex MD5) for the whole byte array. */
 	public static String getEtag(byte[] bytes) {
-		return getEtag(bytes, 0, bytes.length);
+		try {
+			return getEtag(MessageDigest.getInstance("MD5"), bytes, 0, bytes.length);
+		} catch (NoSuchAlgorithmException e) {
+			throw new RuntimeException(e);
+		}
 	}
 
-	/** A deterministic ETag (unquoted hex MD5) for the {@code [offset, offset+length)} sub-range,
-	 *  so a recycled buffer's stale trailing bytes don't affect the tag. Uses a thread-local digest. */
 	public static String getEtag(byte[] bytes, int offset, int length) {
-		if (md.get() == null) {
-			try {
-				md.set(MessageDigest.getInstance("MD5"));
-			} catch (NoSuchAlgorithmException e) {
-				throw new RuntimeException("MD5 cryptographic algorithm is not available.", e);
-			}
+		try {
+			return getEtag(MessageDigest.getInstance("MD5"), bytes, offset, length);
+		} catch (NoSuchAlgorithmException e) {
+			throw new RuntimeException(e);
 		}
-		md.get().reset();
-		md.get().update(bytes, offset, length);
-		byte[] digest = md.get().digest();
-		BigInteger number = new BigInteger(1, digest);
-		String hex = number.toString(16);
-		if (hex.length() < 32) {
-			hex = String.format("%1$" + 32 + "s", hex).replace(' ', '0');
-		}
-		return hex;
 	}
 
+	public static String getEtag(MessageDigest digestInstance, byte[] bytes, int offset, int length) {
+		digestInstance.reset();
+		digestInstance.update(bytes, offset, length);
+		byte[] digest = digestInstance.digest();
+		char[] result = new char[32];
+		for (int i = 0; i < 16; i++) {
+			int b = digest[i] & 0xFF;
+			result[i * 2] = HEX_CHARS[b >>> 4];
+			result[i * 2 + 1] = HEX_CHARS[b & 0x0F];
+		}
+		return new String(result);
+	}
 
-	/** A quoted, deterministic ETag for a file derived from its path, last-modified time and length
-	 *  (so it changes whenever the file changes); empty string if the file is missing. */
 	public static String getEtag(File file) {
+		try {
+			return getEtag(MessageDigest.getInstance("MD5"), file);
+		} catch (NoSuchAlgorithmException e) {
+			throw new RuntimeException(e);
+		}
+	}
+
+	public static String getEtag(MessageDigest digestInstance, File file) {
 		if (file == null || !file.exists()) {
 			return "";
 		}
 		String info = file.getAbsolutePath() + ":" + file.lastModified() + ":" + file.length();
-		return "\"" + getEtag(info.getBytes(java.nio.charset.StandardCharsets.UTF_8)) + "\"";
+		return "\"" + getEtag(digestInstance, info.getBytes(java.nio.charset.StandardCharsets.UTF_8), 0, info.length()) + "\"";
 	}
 
 	/**
@@ -276,28 +307,29 @@ public class HttpUtil {
 		int len = acceptEncoding.length();
 		int i = 0;
 		while (i < len) {
-			// skip whitespace
 			while (i < len && acceptEncoding.charAt(i) == ' ') i++;
-			// match token
 			int tokenStart = i;
 			while (i < len && acceptEncoding.charAt(i) != ',' && acceptEncoding.charAt(i) != ';') i++;
 			int tokenEnd = i;
-			// trim trailing spaces from token
 			while (tokenEnd > tokenStart && acceptEncoding.charAt(tokenEnd - 1) == ' ') tokenEnd--;
-			String token = acceptEncoding.substring(tokenStart, tokenEnd);
-			// check for wildcard or gzip
-			boolean isGzipOrWild = token.equals("*") || token.equalsIgnoreCase("gzip");
-			// now scan optional parameters for q=0
+			
+			int tokenLen = tokenEnd - tokenStart;
+			boolean isGzipOrWild = (tokenLen == 1 && acceptEncoding.charAt(tokenStart) == '*') ||
+				(tokenLen == 4 && acceptEncoding.regionMatches(true, tokenStart, "gzip", 0, 4));
+				
 			double q = 1.0;
 			while (i < len && acceptEncoding.charAt(i) == ';') {
-				i++; // skip ';'
+				i++;
 				while (i < len && acceptEncoding.charAt(i) == ' ') i++;
 				if (i + 2 < len && acceptEncoding.charAt(i) == 'q' && acceptEncoding.charAt(i + 1) == '=') {
 					i += 2;
+					while (i < len && acceptEncoding.charAt(i) == ' ') i++;
 					int qStart = i;
 					while (i < len && acceptEncoding.charAt(i) != ',' && acceptEncoding.charAt(i) != ';') i++;
+					int qEnd = i;
+					while (qEnd > qStart && acceptEncoding.charAt(qEnd - 1) == ' ') qEnd--;
 					try {
-						q = Double.parseDouble(acceptEncoding.substring(qStart, i).trim());
+						q = Double.parseDouble(acceptEncoding.substring(qStart, qEnd));
 					} catch (NumberFormatException e) {
 						q = 0.0;
 					}
@@ -306,7 +338,6 @@ public class HttpUtil {
 				}
 			}
 			if (isGzipOrWild && q > 0.0) return true;
-			// advance past ','
 			if (i < len && acceptEncoding.charAt(i) == ',') i++;
 		}
 		return false;
@@ -449,7 +480,7 @@ public class HttpUtil {
 	}
 
 	public static String getPreferredCompression(String acceptEncoding) {
-		if (acceptEncoding == null || acceptEncoding.trim().isEmpty()) {
+		if (acceptEncoding == null || acceptEncoding.isBlank()) {
 			return null;
 		}
 		double bestQ = 0.0;
@@ -464,18 +495,38 @@ public class HttpUtil {
 			int firstSemi = acceptEncoding.indexOf(';', idx);
 			int endType = (firstSemi == -1 || firstSemi > endSegment) ? endSegment : firstSemi;
 			
-			String encoding = acceptEncoding.substring(idx, endType).trim().toLowerCase(java.util.Locale.ROOT);
-			if (!encoding.isEmpty()) {
+			int tStart = idx;
+			while (tStart < endType && (acceptEncoding.charAt(tStart) == ' ' || acceptEncoding.charAt(tStart) == '\t')) {
+				tStart++;
+			}
+			int tEnd = endType;
+			while (tEnd > tStart && (acceptEncoding.charAt(tEnd - 1) == ' ' || acceptEncoding.charAt(tEnd - 1) == '\t')) {
+				tEnd--;
+			}
+			
+			int encLen = tEnd - tStart;
+			if (encLen > 0) {
 				double q = 1.0;
 				if (firstSemi != -1 && firstSemi < endSegment) {
 					int pIdx = firstSemi + 1;
 					while (pIdx < endSegment) {
 						int nextSemi = acceptEncoding.indexOf(';', pIdx);
 						int endParam = (nextSemi == -1 || nextSemi > endSegment) ? endSegment : nextSemi;
-						String param = acceptEncoding.substring(pIdx, endParam).trim();
-						if (param.startsWith("q=")) {
+						int pStart = pIdx;
+						while (pStart < endParam && (acceptEncoding.charAt(pStart) == ' ' || acceptEncoding.charAt(pStart) == '\t')) {
+							pStart++;
+						}
+						int pEnd = endParam;
+						while (pEnd > pStart && (acceptEncoding.charAt(pEnd - 1) == ' ' || acceptEncoding.charAt(pEnd - 1) == '\t')) {
+							pEnd--;
+						}
+						if (pEnd - pStart > 2 && acceptEncoding.charAt(pStart) == 'q' && acceptEncoding.charAt(pStart + 1) == '=') {
+							int qStart = pStart + 2;
+							while (qStart < pEnd && (acceptEncoding.charAt(qStart) == ' ' || acceptEncoding.charAt(qStart) == '\t')) {
+								qStart++;
+							}
 							try {
-								q = Double.parseDouble(param.substring(2).trim());
+								q = Double.parseDouble(acceptEncoding.substring(qStart, pEnd));
 							} catch (NumberFormatException e) {
 								q = 0.0;
 							}
@@ -492,20 +543,27 @@ public class HttpUtil {
 				}
 				if (q > 0.0) {
 					int pref = 0;
-					if (encoding.equals("br") && BROTLI_SUPPORTED) {
+					String type = null;
+					if (encLen == 2 && acceptEncoding.regionMatches(true, tStart, "br", 0, 2) && BROTLI_SUPPORTED) {
 						pref = 3;
-					} else if (encoding.equals("zstd") && ZSTD_SUPPORTED) {
+						type = "br";
+					} else if (encLen == 4 && acceptEncoding.regionMatches(true, tStart, "zstd", 0, 4) && ZSTD_SUPPORTED) {
 						pref = 2;
-					} else if (encoding.equals("gzip") || encoding.equals("*")) {
+						type = "zstd";
+					} else if (encLen == 4 && acceptEncoding.regionMatches(true, tStart, "gzip", 0, 4)) {
 						pref = 1;
+						type = "gzip";
+					} else if (encLen == 1 && acceptEncoding.charAt(tStart) == '*') {
+						pref = 1;
+						type = "gzip";
 					}
 					if (pref > 0) {
 						if (q > bestQ) {
 							bestQ = q;
-							bestType = encoding.equals("*") ? "gzip" : encoding;
+							bestType = type;
 							bestPref = pref;
 						} else if (q == bestQ && pref > bestPref) {
-							bestType = encoding.equals("*") ? "gzip" : encoding;
+							bestType = type;
 							bestPref = pref;
 						}
 					}

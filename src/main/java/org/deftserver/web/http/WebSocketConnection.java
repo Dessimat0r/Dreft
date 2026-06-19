@@ -25,17 +25,20 @@ public class WebSocketConnection {
 	 */
 	public void write(String message) {
 		final byte[] payload = message.getBytes(StandardCharsets.UTF_8);
-		protocol.getIOLoop().addCallback(() -> doWrite((byte) 0x81, payload)); // FIN + text opcode
+		if (Thread.currentThread() == protocol.getIOLoop().getThread()) {
+			doWrite((byte) 0x81, payload);
+		} else {
+			protocol.getIOLoop().addCallback(() -> doWrite((byte) 0x81, payload));
+		}
 	}
 
-	/**
-	 * Sends a binary message (opcode 0x2). Like {@link #write(String)} it may be called from any
-	 * thread; the frame write is marshalled onto the I/O-loop thread. The given array is the frame
-	 * payload (sent unmasked, server→client).
-	 */
 	public void write(byte[] data) {
-		final byte[] payload = data.clone(); // defensive copy: the write happens later, on the loop
-		protocol.getIOLoop().addCallback(() -> doWrite((byte) 0x82, payload)); // FIN + binary opcode
+		if (Thread.currentThread() == protocol.getIOLoop().getThread()) {
+			doWrite((byte) 0x82, data);
+		} else {
+			final byte[] payload = data.clone();
+			protocol.getIOLoop().addCallback(() -> doWrite((byte) 0x82, payload));
+		}
 	}
 
 	/** Builds and sends a single unmasked frame with the given first byte (FIN + opcode) for the
@@ -43,29 +46,27 @@ public class WebSocketConnection {
 	 *  RFC 6455 §5.2; a failed write tears the connection down. */
 	private void doWrite(byte firstByte, byte[] payload) {
 		int len = payload.length;
-		ByteBuffer frame;
+		ByteBuffer header;
 		if (len < 126) {
-			frame = ByteBuffer.allocate(2 + len);
-			frame.put(firstByte);
-			frame.put((byte) len);
+			header = ByteBuffer.allocate(2);
+			header.put(firstByte);
+			header.put((byte) len);
 		} else if (len <= 65535) {
-			frame = ByteBuffer.allocate(4 + len);
-			frame.put(firstByte);
-			frame.put((byte) 126);
-			frame.putShort((short) len);
+			header = ByteBuffer.allocate(4);
+			header.put(firstByte);
+			header.put((byte) 126);
+			header.putShort((short) len);
 		} else {
-			frame = ByteBuffer.allocate(10 + len);
-			frame.put(firstByte);
-			frame.put((byte) 127);
-			frame.putLong(len);
+			header = ByteBuffer.allocate(10);
+			header.put(firstByte);
+			header.put((byte) 127);
+			header.putLong(len);
 		}
-		frame.put(payload);
-		frame.flip();
+		header.flip();
+		ByteBuffer body = ByteBuffer.wrap(payload);
 
 		try {
-			// Write frame fully; writeBlocking bounds the wait so a stalled peer cannot
-			// peg the I/O-loop thread in an infinite spin.
-			protocol.writeBlocking(channel, frame);
+			protocol.writeBlocking(channel, new ByteBuffer[]{header, body});
 		} catch (IOException e) {
 			protocol.closeChannel(channel);
 		}

@@ -165,6 +165,9 @@ public class Http2Response extends HttpResponse {
 			}
 			headerFields.add(new Hpack.HeaderField(name, entry.getValue()));
 		}
+		if (contentLength != -1) {
+			headerFields.add(new Hpack.HeaderField("content-length", String.valueOf(contentLength)));
+		}
 		for (Cookie cookie : cookies) {
 			headerFields.add(new Hpack.HeaderField("set-cookie", cookie.toString()));
 		}

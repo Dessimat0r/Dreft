@@ -16,6 +16,8 @@ import org.slf4j.LoggerFactory;
 public class SSLSessionHandler {
 	private static final Logger logger = LoggerFactory.getLogger(SSLSessionHandler.class);
 
+	private static final java.util.concurrent.ExecutorService sslExecutor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
+
 	private final SocketChannel socketChannel;
 	private final SSLEngine engine;
 	private final IOLoop ioLoop;
@@ -134,7 +136,7 @@ public class SSLSessionHandler {
 				}
 				while (task != null) {
 					final Runnable t = task;
-					Thread.startVirtualThread(() -> {
+					sslExecutor.submit(() -> {
 						try {
 							t.run();
 						} catch (Throwable taskError) {
@@ -256,7 +258,7 @@ public class SSLSessionHandler {
 				}
 				while (task != null) {
 					final Runnable t = task;
-					Thread.startVirtualThread(() -> {
+					sslExecutor.submit(() -> {
 						t.run();
 						ioLoop.addCallback(() -> {
 							try {

@@ -125,8 +125,15 @@ public class HttpRequest {
 			return rawData == null ? null : Arrays.copyOf(rawData, rawData.length);
 		}
 
+		public byte[] getRawDataDirect() {
+			return rawData;
+		}
+
 		/** This part's body decoded as an ISO-8859-1 string (convenient for text fields). */
 		public String getData() {
+			if (data == null && rawData != null) {
+				data = new String(rawData, StandardCharsets.ISO_8859_1);
+			}
 			return data;
 		}
 
@@ -140,7 +147,6 @@ public class HttpRequest {
 	public static final Pattern REQUEST_LINE_PATTERN = Pattern.compile(" ") ;
 	/** Regex to parse out QueryString from HttpRequest */
 	public static final Pattern QUERY_STRING_PATTERN = Pattern.compile("\\?") ;
-	private static final Pattern DOUBLE_SLASHES = Pattern.compile("/{2,}");
 	// NOTE: the old HEADERS_BODY_PATTERN / HEADER_VALUE_PATTERN / HEADER_VAL_SPLIT_PATTERN regexes
 	// were removed — header parsing is now a bounded position-based indexOf scan (see of()), so the
 	// split-based patterns were dead code.
@@ -174,6 +180,7 @@ public class HttpRequest {
 	protected byte[]     mpBoundaryBStart   = null;
 	protected byte[]     mpBoundaryBPre     = null;
 	protected boolean    complete           = false;
+	protected boolean    isHttp11           = false;
 	
 	protected Map<String, Part> mpParts     = null;
 	protected Map<String, Part> um_mpParts  = null;
@@ -233,7 +240,8 @@ public class HttpRequest {
 			}
 
 			version = elem2;
-			if (!version.equals("HTTP/1.1") && !version.equals("HTTP/1.0")) {
+			isHttp11 = "HTTP/1.1".equals(version);
+			if (!isHttp11 && !"HTTP/1.0".equals(version)) {
 				throw new HttpException(505, "HTTP Version Not Supported", "The requested HTTP version is not supported");
 			}
 			this.headers = new HashMap<String, String>(headers);
@@ -249,7 +257,7 @@ public class HttpRequest {
 		}
 		
 		String connection = getHeader("Connection");
-		if ("HTTP/1.1".equals(version)) {
+		if (isHttp11) {
 			// HTTP/1.1 defaults to keep-alive unless the Connection header lists "close". The
 			// header is a comma-separated token list (e.g. "close, TE"), so check membership
 			// rather than equality of the whole value.
@@ -309,15 +317,16 @@ public class HttpRequest {
 			}
 
 			version = elem2;
+			isHttp11 = "HTTP/1.1".equals(version);
 			logger.debug("request line: [{}], version: [{}]", requestLine, version);
-			if (!version.equals("HTTP/1.1") && !version.equals("HTTP/1.0")) {
+			if (!isHttp11 && !"HTTP/1.0".equals(version)) {
 				logger.debug("unsupported HTTP version [{}], returning 505", version);
 				throw new HttpException(505, "HTTP Version Not Supported", "The requested HTTP version is not supported");
 			}
 			this.headers = new HashMap<String, String>(headers);
 			this.um_headers = Collections.unmodifiableMap(this.headers);
 
-			if ("HTTP/1.1".equals(version) && (headers.get("host") == null || headers.get("host").isEmpty())) {
+			if (isHttp11 && isBlank(headers.get("host"))) {
 				throw new HttpException(400, "Bad Request", "HTTP/1.1 request is missing the required Host header");
 			}
 
@@ -411,7 +420,7 @@ public class HttpRequest {
 			chunked = false;
 		}
 		String connection = getHeader("Connection");
-		if ("HTTP/1.1".equals(version)) {
+		if (isHttp11) {
 			// HTTP/1.1 defaults to keep-alive unless the Connection header lists "close". The
 			// header is a comma-separated token list (e.g. "close, TE"), so check membership
 			// rather than equality of the whole value.
@@ -487,7 +496,7 @@ public class HttpRequest {
 			}
 			int rlEnd = headerStr.indexOf("\r\n", scan);
 			String requestLineRaw = (rlEnd == -1) ? headerStr.substring(scan) : headerStr.substring(scan, rlEnd);
-			if (requestLineRaw.trim().isEmpty()) {
+			if (isBlank(requestLineRaw)) {
 				throw new ProtocolException("Request line is empty/missing!");
 			}
 			requestLine = requestLineRaw.trim();
@@ -503,12 +512,12 @@ public class HttpRequest {
 				if (lineStop == scan) {
 					break; // blank line → end of the header section
 				}
-				String line = headerStr.substring(scan, lineStop);
+				int scanStart = scan;
 				scan = (lineEnd == -1) ? hlen : lineEnd + 2;
 				// RFC 7230 §3.2.4: reject obsolete line folding (a header line starting with
 				// SP/HT is an obs-fold continuation). Accepting it risks parser disagreement
 				// with upstream proxies (request smuggling), so we reject with 400.
-				char first = line.charAt(0);
+				char first = headerStr.charAt(scanStart);
 				if (first == ' ' || first == '\t') {
 					throw new ProtocolException("Obsolete header line folding is not allowed");
 				}
@@ -516,25 +525,24 @@ public class HttpRequest {
 					// Too many header fields is 431, not a generic 400 (RFC 9110 §15.5.18).
 					throw new HttpException(431, "Request Header Fields Too Large", "Too many request header fields");
 				}
-				int colon = line.indexOf(':');
-				if (colon <= 0) {
+				int colon = headerStr.indexOf(':', scanStart);
+				if (colon <= scanStart || colon >= lineStop) {
 					throw new ProtocolException("Invalid header line");
 				}
-				String rawKey = line.substring(0, colon);
-				if (rawKey.endsWith(" ") || rawKey.endsWith("\t")) {
+				if (headerStr.charAt(colon - 1) == ' ' || headerStr.charAt(colon - 1) == '\t') {
 					throw new ProtocolException("Whitespace before header colon is forbidden");
 				}
+				String rawKey = headerStr.substring(scanStart, colon);
 				String key = normalizeHeaderName(rawKey);
 				int valStart = colon + 1;
-				int lineLen = line.length();
-				while (valStart < lineLen && (line.charAt(valStart) == ' ' || line.charAt(valStart) == '\t')) {
+				while (valStart < lineStop && (headerStr.charAt(valStart) == ' ' || headerStr.charAt(valStart) == '\t')) {
 					valStart++;
 				}
-				int valEnd = lineLen;
-				while (valEnd > valStart && (line.charAt(valEnd - 1) == ' ' || line.charAt(valEnd - 1) == '\t')) {
+				int valEnd = lineStop;
+				while (valEnd > valStart && (headerStr.charAt(valEnd - 1) == ' ' || headerStr.charAt(valEnd - 1) == '\t')) {
 					valEnd--;
 				}
-				String val = line.substring(valStart, valEnd);
+				String val = headerStr.substring(valStart, valEnd);
 				if (!isHeaderName(key)) {
 					throw new ProtocolException("Invalid header name");
 				}
@@ -618,7 +626,7 @@ public class HttpRequest {
 				grown.put(rawBody);
 				rawBody = grown;
 			}
-			rawBody.put(readAvailableBodyBytes(buffer, rawBody.remaining()));
+			readAvailableBodyBytes(buffer, rawBody, rawBody.remaining());
 			rawBody.flip();
 			if (tryDecodeChunkedBody()) {
 				complete = true;
@@ -638,7 +646,7 @@ public class HttpRequest {
 				logger.debug("buffer remaining: {}, rawbody new pos: {}", buffer.remaining(), rawBody.position() + buffer.remaining());
 			}
 			int remainingBefore = buffer.remaining();
-			rawBody.put(readAvailableBodyBytes(buffer, rawBody.remaining()));
+			readAvailableBodyBytes(buffer, rawBody, rawBody.remaining());
 			flipRemain = remainingBefore - (buffer.remaining());
 			logger.debug("rawbody pos (post buffer dump): {}, limit: {}", rawBody.position(), rawBody.limit());
 			if (!rawBody.hasRemaining()) {
@@ -658,7 +666,7 @@ public class HttpRequest {
 			System.arraycopy(rawBody.array(), 0, rawBytes, 0, rawBody.limit());
 		}
 		String contentEncoding = headers.get("content-encoding");
-		if (contentEncoding != null && !contentEncoding.trim().isEmpty()) {
+		if (contentEncoding != null && !isBlank(contentEncoding)) {
 			rawBytes = org.deftserver.util.HttpUtil.decompress(rawBytes, contentEncoding);
 		}
 		if (!multipart) {
@@ -720,7 +728,6 @@ public class HttpRequest {
 					if (currPart != null) {
 						currPart.rawBufEndPos = rbpos;
 						currPart.rawData = Arrays.copyOfRange(rawBody.array(), currPart.rawBufStartPos, currPart.rawBufEndPos);
-						currPart.data    = new String(currPart.rawData, StandardCharsets.ISO_8859_1);
 						currPart.complete = true;
 						mpParts.put(currPart.mapName, currPart);
 						mpPartsAll.add(currPart);
@@ -770,9 +777,11 @@ public class HttpRequest {
 					int partHeaderCount = 0;
 					int pos = rawBody.position();
 					int limit = rawBody.limit();
+					byte[] arr = rawBody.array();
+					int arrOffset = rawBody.arrayOffset();
 					while (pos < limit) {
 						int lineStart = pos;
-						while (pos < limit && rawBody.get(pos) != '\n') {
+						while (pos < limit && arr[arrOffset + pos] != '\n') {
 							pos++;
 						}
 						if (pos >= limit) {
@@ -781,25 +790,87 @@ public class HttpRequest {
 						pos++; // skip '\n'
 						int lineEnd = pos;
 						int lineLen = lineEnd - lineStart;
-						if (lineLen == 1 || (lineLen == 2 && rawBody.get(lineStart) == '\r')) {
+						if (lineLen == 1 || (lineLen == 2 && arr[arrOffset + lineStart] == '\r')) {
 							gotSep = true;
 							break;
 						}
 						int strLen = lineLen;
-						if (rawBody.get(lineStart + strLen - 1) == '\n') strLen--;
-						if (strLen > 0 && rawBody.get(lineStart + strLen - 1) == '\r') strLen--;
-						byte[] lineBytes = new byte[strLen];
-						for (int j = 0; j < strLen; j++) {
-							lineBytes[j] = rawBody.get(lineStart + j);
-						}
-						String currMpLine = new String(lineBytes, StandardCharsets.ISO_8859_1);
+						if (arr[arrOffset + lineStart + strLen - 1] == '\n') strLen--;
+						if (strLen > 0 && arr[arrOffset + lineStart + strLen - 1] == '\r') strLen--;
 						
-						logger.debug("mp req line: {}", currMpLine.isEmpty() ? "(empty)" : currMpLine);
 						if (++partHeaderCount > MAX_HEADER_COUNT) {
 							throw new HttpException(431, "Request Header Fields Too Large",
 								"Too many headers in a multipart part");
 						}
-						HeadKeyVals hkv = parseHeadKeyVals(currMpLine);
+
+						int colonIdx = -1;
+						for (int j = 0; j < strLen; j++) {
+							if (arr[arrOffset + lineStart + j] == ':') {
+								colonIdx = lineStart + j;
+								break;
+							}
+						}
+						if (colonIdx == -1) {
+							throw new IllegalArgumentException("Expecting id and val for header line");
+						}
+
+						int kStart = lineStart;
+						while (kStart < colonIdx && (arr[arrOffset + kStart] == ' ' || arr[arrOffset + kStart] == '\t')) {
+							kStart++;
+						}
+						int kEnd = colonIdx;
+						while (kEnd > kStart && (arr[arrOffset + kEnd - 1] == ' ' || arr[arrOffset + kEnd - 1] == '\t')) {
+							kEnd--;
+						}
+
+						String key = new String(arr, arrOffset + kStart, kEnd - kStart, StandardCharsets.ISO_8859_1);
+
+						int valStart = colonIdx + 1;
+						int valEnd = lineStart + strLen;
+						while (valStart < valEnd && (arr[arrOffset + valStart] == ' ' || arr[arrOffset + valStart] == '\t')) {
+							valStart++;
+						}
+						while (valEnd > valStart && (arr[arrOffset + valEnd - 1] == ' ' || arr[arrOffset + valEnd - 1] == '\t')) {
+							valEnd--;
+						}
+
+						HeadKeyVals hkv = new HeadKeyVals();
+						hkv.key = key;
+
+						int segStart = valStart;
+						List<String> segments = new ArrayList<>();
+						boolean inQuotes = false;
+						for (int j = valStart; j < valEnd; j++) {
+							byte b = arr[arrOffset + j];
+							if (b == '"') {
+								inQuotes = !inQuotes;
+							} else if (b == ';' && !inQuotes) {
+								segments.add(new String(arr, arrOffset + segStart, j - segStart, StandardCharsets.ISO_8859_1));
+								segStart = j + 1;
+							}
+						}
+						if (segStart < valEnd) {
+							segments.add(new String(arr, arrOffset + segStart, valEnd - segStart, StandardCharsets.ISO_8859_1));
+						}
+
+						hkv.val = segments.isEmpty() ? "" : segments.get(0).trim();
+						for (int i = 1; i < segments.size(); i++) {
+							String seg = segments.get(i).trim();
+							if (seg.isEmpty()) {
+								continue;
+							}
+							int eq = seg.indexOf('=');
+							if (eq < 0) {
+								throw new IllegalArgumentException("Expecting id and val in header line (for sub-val)");
+							}
+							String pName = seg.substring(0, eq).trim();
+							String pVal = seg.substring(eq + 1).trim();
+							if (pVal.length() >= 2 && pVal.charAt(0) == '"' && pVal.charAt(pVal.length() - 1) == '"') {
+								pVal = pVal.substring(1, pVal.length() - 1);
+							}
+							hkv.vals.put(pName, pVal);
+						}
+
 						currPart.headKeyVals.put(hkv.key, hkv);
 					}
 					
@@ -857,9 +928,81 @@ public class HttpRequest {
 
 	/** Case-insensitive lookup of a single header value, or null if absent. */
 	public String getHeader(String name) {
-		if (headers == null) return null;
-		// Headers are stored lowercased with Locale.ROOT; look up with the same locale to
-		// avoid the Turkish-locale dotted/dotless-I mismatch (e.g. "Content-Length").
+		if (name == null) return null;
+		switch (name.length()) {
+			case 4:
+				if (name.equalsIgnoreCase("host")) return headers.get("host");
+				if (name.equalsIgnoreCase("vary")) return headers.get("vary");
+				if (name.equalsIgnoreCase("date")) return headers.get("date");
+				if (name.equalsIgnoreCase("etag")) return headers.get("etag");
+				break;
+			case 5:
+				if (name.equalsIgnoreCase("range")) return headers.get("range");
+				break;
+			case 6:
+				if (name.equalsIgnoreCase("accept")) return headers.get("accept");
+				if (name.equalsIgnoreCase("cookie")) return headers.get("cookie");
+				if (name.equalsIgnoreCase("expect")) return headers.get("expect");
+				if (name.equalsIgnoreCase("server")) return headers.get("server");
+				if (name.equalsIgnoreCase("origin")) return headers.get("origin");
+				break;
+			case 7:
+				if (name.equalsIgnoreCase("upgrade")) return headers.get("upgrade");
+				if (name.equalsIgnoreCase("referer")) return headers.get("referer");
+				break;
+			case 8:
+				if (name.equalsIgnoreCase("if-range")) return headers.get("if-range");
+				break;
+			case 9:
+				if (name.equalsIgnoreCase("x-real-ip")) return headers.get("x-real-ip");
+				break;
+			case 10:
+				if (name.equalsIgnoreCase("connection")) return headers.get("connection");
+				break;
+			case 12:
+				if (name.equalsIgnoreCase("content-type")) return headers.get("content-type");
+				if (name.equalsIgnoreCase("user-agent")) return headers.get("user-agent");
+				break;
+			case 13:
+				if (name.equalsIgnoreCase("if-none-match")) return headers.get("if-none-match");
+				if (name.equalsIgnoreCase("last-modified")) return headers.get("last-modified");
+				if (name.equalsIgnoreCase("authorization")) return headers.get("authorization");
+				break;
+			case 14:
+				if (name.equalsIgnoreCase("content-length")) return headers.get("content-length");
+				break;
+			case 15:
+				if (name.equalsIgnoreCase("accept-encoding")) return headers.get("accept-encoding");
+				if (name.equalsIgnoreCase("accept-language")) return headers.get("accept-language");
+				if (name.equalsIgnoreCase("x-forwarded-for")) return headers.get("x-forwarded-for");
+				break;
+			case 16:
+				if (name.equalsIgnoreCase("x-forwarded-host")) return headers.get("x-forwarded-host");
+				break;
+			case 17:
+				if (name.equalsIgnoreCase("if-modified-since")) return headers.get("if-modified-since");
+				if (name.equalsIgnoreCase("sec-websocket-key")) return headers.get("sec-websocket-key");
+				if (name.equalsIgnoreCase("x-forwarded-proto")) return headers.get("x-forwarded-proto");
+				break;
+			case 20:
+				if (name.equalsIgnoreCase("sec-websocket-accept")) return headers.get("sec-websocket-accept");
+				break;
+			case 21:
+				if (name.equalsIgnoreCase("sec-websocket-version")) return headers.get("sec-websocket-version");
+				break;
+			case 22:
+				if (name.equalsIgnoreCase("sec-websocket-protocol")) return headers.get("sec-websocket-protocol");
+				break;
+			case 24:
+				if (name.equalsIgnoreCase("sec-websocket-extensions")) return headers.get("sec-websocket-extensions");
+				break;
+			case 29:
+				if (name.equalsIgnoreCase("access-control-request-method")) return headers.get("access-control-request-method");
+				break;
+			case 30:
+				if (name.equalsIgnoreCase("access-control-request-headers")) return headers.get("access-control-request-headers");
+				break;
+		}
 		return headers.get(name.toLowerCase(Locale.ROOT));
 	}
 
@@ -1123,8 +1266,8 @@ public class HttpRequest {
 						throw new HttpException(413, "Payload Too Large",
 							"The request has too many parameters");
 					}
-					String key = urlDecode(line.substring(start, eqPos));
-					String value = urlDecode(line.substring(eqPos + 1, i));
+					String key = urlDecode(line, start, eqPos);
+					String value = urlDecode(line, eqPos + 1, i);
 					result.computeIfAbsent(key, k -> new ArrayList<>()).add(value);
 				}
 				start = i + 1;
@@ -1134,11 +1277,8 @@ public class HttpRequest {
 			}
 		}
 		// Make it fully unmodifiable for safety
-		Map<String, List<String>> unmodifiableResult = new LinkedHashMap<>();
-		for (Map.Entry<String, List<String>> entry : result.entrySet()) {
-			unmodifiableResult.put(entry.getKey(), Collections.unmodifiableList(entry.getValue()));
-		}
-		return Collections.unmodifiableMap(unmodifiableResult);
+		result.replaceAll((k, v) -> Collections.unmodifiableList(v));
+		return Collections.unmodifiableMap(result);
 	}	
 
 	/** Validates the method token and maps it to an {@link HttpVerb} ({@code UNKNOWN} for a valid but
@@ -1279,7 +1419,7 @@ public class HttpRequest {
 	 *  match. */
 	public String getPreferredLanguage(List<String> supportedLanguages) {
 		String acceptLanguage = getHeader("Accept-Language");
-		if (acceptLanguage == null || acceptLanguage.trim().isEmpty()) {
+		if (acceptLanguage == null || isBlank(acceptLanguage)) {
 			return supportedLanguages.isEmpty() ? null : supportedLanguages.get(0);
 		}
 		List<String> parsed = org.deftserver.util.HttpUtil.parseAcceptHeader(acceptLanguage);
@@ -1287,13 +1427,15 @@ public class HttpRequest {
 			if (accepted.equals("*")) {
 				return supportedLanguages.isEmpty() ? null : supportedLanguages.get(0);
 			}
-			String match = supportedLanguages.stream()
-					.filter(supported -> accepted.equalsIgnoreCase(supported) ||
-							supported.toLowerCase(Locale.ROOT).startsWith(accepted.toLowerCase(Locale.ROOT) + "-"))
-					.findFirst()
-					.orElse(null);
-			if (match != null) {
-				return match;
+			String acceptedLower = accepted.toLowerCase(Locale.ROOT);
+			for (String supported : supportedLanguages) {
+				if (accepted.equalsIgnoreCase(supported)) {
+					return supported;
+				}
+				String supportedLower = supported.toLowerCase(Locale.ROOT);
+				if (supportedLower.startsWith(acceptedLower + "-")) {
+					return supported;
+				}
 			}
 		}
 		return null;
@@ -1303,7 +1445,7 @@ public class HttpRequest {
 	 *  {@code Accept-Charset} (q-order, {@code *}); first supported if absent, null if none match. */
 	public String getPreferredCharset(List<String> supportedCharsets) {
 		String acceptCharset = getHeader("Accept-Charset");
-		if (acceptCharset == null || acceptCharset.trim().isEmpty()) {
+		if (acceptCharset == null || isBlank(acceptCharset)) {
 			return supportedCharsets.isEmpty() ? null : supportedCharsets.get(0);
 		}
 		List<String> parsed = org.deftserver.util.HttpUtil.parseAcceptHeader(acceptCharset);
@@ -1311,12 +1453,10 @@ public class HttpRequest {
 			if (accepted.equals("*")) {
 				return supportedCharsets.isEmpty() ? null : supportedCharsets.get(0);
 			}
-			String match = supportedCharsets.stream()
-					.filter(accepted::equalsIgnoreCase)
-					.findFirst()
-					.orElse(null);
-			if (match != null) {
-				return match;
+			for (String supported : supportedCharsets) {
+				if (accepted.equalsIgnoreCase(supported)) {
+					return supported;
+				}
 			}
 		}
 		return null;
@@ -1327,7 +1467,7 @@ public class HttpRequest {
 	 *  default unless explicitly excluded; null if nothing acceptable matches. */
 	public String getPreferredEncoding(List<String> supportedEncodings) {
 		String acceptEncoding = getHeader("Accept-Encoding");
-		if (acceptEncoding == null || acceptEncoding.trim().isEmpty()) {
+		if (acceptEncoding == null || isBlank(acceptEncoding)) {
 			return supportedEncodings.isEmpty() ? null : supportedEncodings.get(0);
 		}
 		List<String> parsed = org.deftserver.util.HttpUtil.parseAcceptHeader(acceptEncoding);
@@ -1335,12 +1475,10 @@ public class HttpRequest {
 			if (accepted.equals("*")) {
 				return supportedEncodings.isEmpty() ? null : supportedEncodings.get(0);
 			}
-			String match = supportedEncodings.stream()
-					.filter(accepted::equalsIgnoreCase)
-					.findFirst()
-					.orElse(null);
-			if (match != null) {
-				return match;
+			for (String supported : supportedEncodings) {
+				if (accepted.equalsIgnoreCase(supported)) {
+					return supported;
+				}
 			}
 		}
 		if (supportedEncodings.contains("identity") && identityAcceptable(acceptEncoding)) {
@@ -1400,14 +1538,29 @@ public class HttpRequest {
 		switch (rawKey.length()) {
 			case 4:
 				if (rawKey.equalsIgnoreCase("host")) return "host";
+				if (rawKey.equalsIgnoreCase("vary")) return "vary";
+				if (rawKey.equalsIgnoreCase("date")) return "date";
+				if (rawKey.equalsIgnoreCase("etag")) return "etag";
+				break;
+			case 5:
+				if (rawKey.equalsIgnoreCase("range")) return "range";
 				break;
 			case 6:
 				if (rawKey.equalsIgnoreCase("accept")) return "accept";
 				if (rawKey.equalsIgnoreCase("cookie")) return "cookie";
 				if (rawKey.equalsIgnoreCase("expect")) return "expect";
+				if (rawKey.equalsIgnoreCase("server")) return "server";
+				if (rawKey.equalsIgnoreCase("origin")) return "origin";
 				break;
 			case 7:
 				if (rawKey.equalsIgnoreCase("upgrade")) return "upgrade";
+				if (rawKey.equalsIgnoreCase("referer")) return "referer";
+				break;
+			case 8:
+				if (rawKey.equalsIgnoreCase("if-range")) return "if-range";
+				break;
+			case 9:
+				if (rawKey.equalsIgnoreCase("x-real-ip")) return "x-real-ip";
 				break;
 			case 10:
 				if (rawKey.equalsIgnoreCase("connection")) return "connection";
@@ -1416,12 +1569,44 @@ public class HttpRequest {
 				if (rawKey.equalsIgnoreCase("content-type")) return "content-type";
 				if (rawKey.equalsIgnoreCase("user-agent")) return "user-agent";
 				break;
+			case 13:
+				if (rawKey.equalsIgnoreCase("if-none-match")) return "if-none-match";
+				if (rawKey.equalsIgnoreCase("last-modified")) return "last-modified";
+				if (rawKey.equalsIgnoreCase("authorization")) return "authorization";
+				break;
 			case 14:
 				if (rawKey.equalsIgnoreCase("content-length")) return "content-length";
 				break;
 			case 15:
 				if (rawKey.equalsIgnoreCase("accept-encoding")) return "accept-encoding";
 				if (rawKey.equalsIgnoreCase("accept-language")) return "accept-language";
+				if (rawKey.equalsIgnoreCase("x-forwarded-for")) return "x-forwarded-for";
+				break;
+			case 16:
+				if (rawKey.equalsIgnoreCase("x-forwarded-host")) return "x-forwarded-host";
+				break;
+			case 17:
+				if (rawKey.equalsIgnoreCase("if-modified-since")) return "if-modified-since";
+				if (rawKey.equalsIgnoreCase("sec-websocket-key")) return "sec-websocket-key";
+				if (rawKey.equalsIgnoreCase("x-forwarded-proto")) return "x-forwarded-proto";
+				break;
+			case 20:
+				if (rawKey.equalsIgnoreCase("sec-websocket-accept")) return "sec-websocket-accept";
+				break;
+			case 21:
+				if (rawKey.equalsIgnoreCase("sec-websocket-version")) return "sec-websocket-version";
+				break;
+			case 22:
+				if (rawKey.equalsIgnoreCase("sec-websocket-protocol")) return "sec-websocket-protocol";
+				break;
+			case 24:
+				if (rawKey.equalsIgnoreCase("sec-websocket-extensions")) return "sec-websocket-extensions";
+				break;
+			case 29:
+				if (rawKey.equalsIgnoreCase("access-control-request-method")) return "access-control-request-method";
+				break;
+			case 30:
+				if (rawKey.equalsIgnoreCase("access-control-request-headers")) return "access-control-request-headers";
 				break;
 		}
 		return rawKey.toLowerCase(Locale.ROOT);
@@ -1495,7 +1680,7 @@ public class HttpRequest {
 	 * "chunked" appearing more than once is likewise rejected.
 	 */
 	private static boolean parseTransferEncoding(String transferEncoding) throws ProtocolException {
-		if (transferEncoding == null || transferEncoding.trim().isEmpty()) {
+		if (transferEncoding == null || isBlank(transferEncoding)) {
 			return false;
 		}
 		java.util.List<String> codings = new ArrayList<>();
@@ -1542,15 +1727,15 @@ public class HttpRequest {
 
 	/** Slices up to {@code maxBytes} of the available body bytes from {@code source} (advancing it);
 	 *  a non-positive {@code maxBytes} means the body has exceeded its cap → 413. */
-	private static ByteBuffer readAvailableBodyBytes(ByteBuffer source, int maxBytes) throws ProtocolException {
+	private static void readAvailableBodyBytes(ByteBuffer source, ByteBuffer dest, int maxBytes) throws ProtocolException {
 		if (maxBytes <= 0) {
 			throw new HttpException(413, "Payload Too Large", "The request body exceeds the maximum permitted size");
 		}
 		int bytes = Math.min(source.remaining(), maxBytes);
-		ByteBuffer slice = source.slice();
-		slice.limit(bytes);
-		source.position(source.position() + bytes);
-		return slice;
+		int oldLimit = source.limit();
+		source.limit(source.position() + bytes);
+		dest.put(source);
+		source.limit(oldLimit);
 	}
 
 	/** Decodes as many complete chunks as are currently buffered into {@code chunkedBody}, enforcing
@@ -1757,7 +1942,7 @@ public class HttpRequest {
 			}
 			
 			if (normalized.contains("//")) {
-				normalized = DOUBLE_SLASHES.matcher(normalized).replaceAll("/");
+				normalized = deduplicateSlashes(normalized);
 			}
 			
 			// 4. Defend against directory traversal attacks (resolving outside root)
@@ -1793,8 +1978,20 @@ public class HttpRequest {
 	
 	/** Percent-decodes a query/form parameter value using form semantics ({@code +} → space, UTF-8);
 	 *  a malformed escape throws {@link IllegalArgumentException} (surfaced as a 400). */
-	private static String urlDecode(String value) {
-		return URLDecoder.decode(value, StandardCharsets.UTF_8);
+	private static String urlDecode(String line, int start, int end) {
+		boolean needsDecode = false;
+		for (int i = start; i < end; i++) {
+			char c = line.charAt(i);
+			if (c == '%' || c == '+') {
+				needsDecode = true;
+				break;
+			}
+		}
+		String substring = line.substring(start, end);
+		if (!needsDecode) {
+			return substring;
+		}
+		return URLDecoder.decode(substring, StandardCharsets.UTF_8);
 	}
 
 	/**
@@ -1816,7 +2013,8 @@ public class HttpRequest {
 		if (!needsDecode) {
 			return path;
 		}
-		java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(len);
+		byte[] decoded = new byte[len];
+		int dLen = 0;
 		for (int i = 0; i < len; i++) {
 			char c = path.charAt(i);
 			if (c == '%') {
@@ -1828,13 +2026,13 @@ public class HttpRequest {
 				if (hi < 0 || lo < 0) {
 					throw new HttpException(400, "Bad Request", "Invalid percent-encoding in path");
 				}
-				out.write((hi << 4) | lo);
+				decoded[dLen++] = (byte) ((hi << 4) | lo);
 				i += 2;
 			} else {
-				out.write(c & 0xFF);
+				decoded[dLen++] = (byte) (c & 0xFF);
 			}
 		}
-		return new String(out.toByteArray(), StandardCharsets.UTF_8);
+		return new String(decoded, 0, dLen, StandardCharsets.UTF_8);
 	}
 	
 	/** Searches the buffer from its current position for the byte sequence {@code bytes}; on a match
@@ -1919,7 +2117,7 @@ public class HttpRequest {
 	public Map<String, String> getCookies() {
 		if (parsedCookies == null) {
 			String cookieHeader = getHeader("Cookie");
-			if (cookieHeader == null || cookieHeader.trim().isEmpty()) {
+			if (cookieHeader == null || isBlank(cookieHeader)) {
 				parsedCookies = Collections.emptyMap();
 			} else {
 				Map<String, String> cookies = new LinkedHashMap<>();
@@ -1978,7 +2176,7 @@ public class HttpRequest {
 	 *  header (honouring q-order and {@code type/*} / {@code *​/*} wildcards), or null if none match. */
 	public String getPreferredContentType(List<String> supportedTypes) {
 		String accept = getHeader("Accept");
-		if (accept == null || accept.trim().isEmpty()) {
+		if (accept == null || isBlank(accept)) {
 			return supportedTypes.isEmpty() ? null : supportedTypes.get(0);
 		}
 		List<String> parsed = org.deftserver.util.HttpUtil.parseAcceptHeader(accept);
@@ -1986,13 +2184,18 @@ public class HttpRequest {
 			if (accepted.equals("*/*")) {
 				return supportedTypes.isEmpty() ? null : supportedTypes.get(0);
 			}
-			String match = supportedTypes.stream()
-					.filter(supported -> accepted.equalsIgnoreCase(supported) ||
-							(accepted.endsWith("/*") && supported.toLowerCase(Locale.ROOT).startsWith(accepted.substring(0, accepted.length() - 1).toLowerCase(Locale.ROOT))))
-					.findFirst()
-					.orElse(null);
-			if (match != null) {
-				return match;
+			boolean endsWithSlashStar = accepted.endsWith("/*");
+			String acceptedPrefix = endsWithSlashStar ? accepted.substring(0, accepted.length() - 1).toLowerCase(Locale.ROOT) : null;
+			for (String supported : supportedTypes) {
+				if (accepted.equalsIgnoreCase(supported)) {
+					return supported;
+				}
+				if (endsWithSlashStar) {
+					String supportedLower = supported.toLowerCase(Locale.ROOT);
+					if (supportedLower.startsWith(acceptedPrefix)) {
+						return supported;
+					}
+				}
 			}
 		}
 		return null;
@@ -2194,5 +2397,43 @@ public class HttpRequest {
 		} catch (NumberFormatException e) {
 			return -1;
 		}
+	}
+
+	private static boolean isBlank(String s) {
+		if (s == null) return true;
+		int len = s.length();
+		for (int i = 0; i < len; i++) {
+			char c = s.charAt(i);
+			if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private static String deduplicateSlashes(String path) {
+		if (path == null) return null;
+		int len = path.length();
+		if (len < 2) return path;
+		StringBuilder sb = null;
+		int lastSlash = -1;
+		for (int i = 0; i < len; i++) {
+			char c = path.charAt(i);
+			if (c == '/') {
+				if (lastSlash == i - 1) {
+					if (sb == null) {
+						sb = new StringBuilder(len);
+						sb.append(path, 0, i);
+					}
+					lastSlash = i;
+					continue;
+				}
+				lastSlash = i;
+			}
+			if (sb != null) {
+				sb.append(c);
+			}
+		}
+		return sb == null ? path : sb.toString();
 	}
 }

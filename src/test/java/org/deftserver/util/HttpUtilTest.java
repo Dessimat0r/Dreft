@@ -66,4 +66,11 @@ public class HttpUtilTest {
 		java.util.List<String> r = HttpUtil.parseAcceptHeader("x/x;q=-1, y/y;q=0.3");
 		assertEquals(java.util.Arrays.asList("y/y"), r);
 	}
+
+	@Test
+	public void getEtagCorrectness() {
+		byte[] data = "Hello World".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+		assertEquals("b10a8db164e0754105b7a99be72e3fe5", HttpUtil.getEtag(data));
+		assertEquals("f5a7924e621e84c9280a9a27e1bcb7f6", HttpUtil.getEtag(data, 6, 5));
+	}
 }

@@ -4,7 +4,6 @@ import java.nio.channels.SelectableChannel;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.PriorityQueue;
-import java.util.concurrent.atomic.AtomicLong;
 
 import org.deftserver.util.MXBeanUtil;
 import org.slf4j.Logger;
@@ -14,10 +13,8 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 
 	private final Logger logger = LoggerFactory.getLogger(JMXDebuggableTimeoutManager.class);
 
-	private final PriorityQueue<DecoratedTimeout> timeouts = new PriorityQueue<>();
-	private final Map<SelectableChannel, DecoratedTimeout> index = new HashMap<>();
-
-	private static final AtomicLong seqGenerator = new AtomicLong(0);
+	private java.util.PriorityQueue<Timeout> timeouts = new java.util.PriorityQueue<>();
+	private final Map<SelectableChannel, Timeout> index = new HashMap<>();
 
 	{ 	// instance initialization block
 		MXBeanUtil.registerMXBean(this, "TimeoutManager"); 
@@ -29,14 +26,14 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 	@Override
 	public void addKeepAliveTimeout(SelectableChannel channel, Timeout timeout) {
 		logger.debug("added keep-alive timeout: {}", timeout);
-		DecoratedTimeout oldTimeout = index.get(channel);
+		Timeout oldTimeout = index.get(channel);
 		if (oldTimeout != null) {
-			oldTimeout.timeout.cancel(); // O(1) cancel instead of O(N) timeouts.remove(oldTimeout)
+			oldTimeout.cancel(); // O(1) cancel instead of O(N) timeouts.remove(oldTimeout)
 			cancelledCount++;
 		}
-		DecoratedTimeout decorated = new DecoratedTimeout(channel, timeout);
-		timeouts.add(decorated);
-		index.put(channel, decorated);
+		timeout.setChannel(channel);
+		timeouts.add(timeout);
+		index.put(channel, timeout);
 		purgeCancelledIfNeeded();
 	}
 
@@ -49,14 +46,13 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 	 */
 	private void purgeCancelledIfNeeded() {
 		if (cancelledCount > 64 && cancelledCount * 2 > timeouts.size()) {
-			java.util.List<DecoratedTimeout> live = new java.util.ArrayList<>(timeouts.size());
-			for (DecoratedTimeout d : timeouts) {
-				if (!d.timeout.isCancelled()) {
-					live.add(d);
+			java.util.List<Timeout> live = new java.util.ArrayList<>(timeouts.size());
+			for (Timeout t : timeouts) {
+				if (!t.isCancelled()) {
+					live.add(t);
 				}
 			}
-			timeouts.clear();
-			timeouts.addAll(live);
+			timeouts = new java.util.PriorityQueue<>(live);
 			cancelledCount = 0;
 		}
 	}
@@ -65,7 +61,7 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 	@Override
 	public void addTimeout(Timeout timeout) {
 		logger.debug("added generic timeout: {}", timeout);
-		timeouts.add(new DecoratedTimeout(timeout));
+		timeouts.add(timeout);
 	}
 
 	/** True if a keep-alive timeout is currently registered for the given channel. */
@@ -89,16 +85,16 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 	 */
 	public long execute(long now) {
 		while (!timeouts.isEmpty()) {
-			DecoratedTimeout candidate = timeouts.peek();
-			if (candidate.timeout.getTimeout() > now) { 
+			Timeout candidate = timeouts.peek();
+			if (candidate.getTimeout() > now) { 
 				break; 
 			}
 			timeouts.poll();
-			if (candidate.timeout.isCancelled() && cancelledCount > 0) {
+			if (candidate.isCancelled() && cancelledCount > 0) {
 				cancelledCount--;
 			}
 			try {
-				candidate.timeout.getCallback().onCallback();
+				candidate.getCallback().onCallback();
 			} catch (RuntimeException | StackOverflowError | LinkageError e) {
 				// A bad callback must not abort the rest of the timeout queue nor escape into the
 				// I/O loop (where an Error would be re-thrown and kill the loop thread). Per-task
@@ -106,15 +102,15 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 				logger.error("{} in timeout callback — skipping and continuing",
 					e.getClass().getSimpleName(), e);
 			}
-			if (candidate.channel != null) {
-				DecoratedTimeout current = index.get(candidate.channel);
+			if (candidate.getChannel() != null) {
+				Timeout current = index.get(candidate.getChannel());
 				if (current == candidate) {
-					index.remove(candidate.channel);
+					index.remove(candidate.getChannel());
 				}
 			}
-			logger.debug("Timeout triggered: {}", candidate.timeout);
+			logger.debug("Timeout triggered: {}", candidate);
 		}
-		return timeouts.isEmpty() ? Long.MAX_VALUE : Math.max(1, timeouts.peek().timeout.getTimeout() - now);
+		return timeouts.isEmpty() ? Long.MAX_VALUE : Math.max(1, timeouts.peek().getTimeout() - now);
 	}
 
 	// implements TimeoutMXBean
@@ -129,40 +125,6 @@ public class JMXDebuggableTimeoutManager implements TimeoutManager, TimeoutManag
 	@Override
 	public int getNumberOfTimeouts() {
 		return timeouts.size();
-	}
-
-	/** A heap entry wrapping a {@link Timeout} with its optional owning channel and a monotonic
-	 *  sequence number that breaks ties so the ordering is stable (FIFO among equal deadlines). */
-	private class DecoratedTimeout implements Comparable<DecoratedTimeout> {
-
-		public final SelectableChannel channel;
-		public final Timeout timeout;
-		private final long sequenceNumber = seqGenerator.getAndIncrement();
-
-		/** Wraps a channel-keyed (keep-alive) timeout. */
-		public DecoratedTimeout(SelectableChannel channel, Timeout timeout) {
-			this.channel = channel;
-			this.timeout = timeout;
-		}
-
-		/** Wraps a generic (non-channel-keyed) timeout. */
-		public DecoratedTimeout(Timeout timeout) {
-			this(null, timeout);
-		}
-
-		/** Orders by deadline ascending, breaking ties by insertion sequence (stable FIFO). */
-		@Override
-		public int compareTo(DecoratedTimeout that) {
-			if (this == that) {
-				return 0;
-			}
-			int diff = Long.compare(this.timeout.getTimeout(), that.timeout.getTimeout());
-			if (diff != 0) {
-				return diff;
-			}
-			return Long.compare(this.sequenceNumber, that.sequenceNumber);
-		}
-		
 	}
 
 }

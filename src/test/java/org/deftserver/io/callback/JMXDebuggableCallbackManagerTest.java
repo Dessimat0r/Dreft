@@ -98,4 +98,28 @@ public class JMXDebuggableCallbackManagerTest {
 		workerThreads.shutdownNow();
 	}
 
+	@Test
+	public void doubleBufferedCapacityAndClearTest() {
+		final int[] runCount = {0};
+		AsyncCallback cb = new AsyncCallback() {
+			@Override
+			public void onCallback() {
+				runCount[0]++;
+			}
+		};
+		cm.addCallback(cb);
+		assertEquals(1, cm.getNumberOfCallbacks());
+		cm.execute();
+		assertEquals(0, cm.getNumberOfCallbacks());
+		assertEquals(1, runCount[0]);
+		
+		// The outbox is cleared, let's add again and execute
+		cm.addCallback(cb);
+		cm.addCallback(cb);
+		assertEquals(2, cm.getNumberOfCallbacks());
+		cm.execute();
+		assertEquals(0, cm.getNumberOfCallbacks());
+		assertEquals(3, runCount[0]);
+	}
+
 }

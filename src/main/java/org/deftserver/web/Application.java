@@ -152,18 +152,58 @@ public class Application {
 		return containsGroup;
 	}
 
+	private static final ThreadLocal<Map<Pattern, java.util.regex.Matcher>> threadLocalMatchers =
+		ThreadLocal.withInitial(java.util.HashMap::new);
+
 	/** Resolves a path against the capturing-group handlers: matches the path's final segment against
 	 *  the regex registered for its prefix. Returns the handler on a full match, else null. */
+	private static class SubCharSequence implements CharSequence {
+		private final String str;
+		private final int start;
+		private final int end;
+
+		SubCharSequence(String str, int start, int end) {
+			this.str = str;
+			this.start = start;
+			this.end = end;
+		}
+
+		@Override
+		public int length() {
+			return end - start;
+		}
+
+		@Override
+		public char charAt(int index) {
+			return str.charAt(start + index);
+		}
+
+		@Override
+		public CharSequence subSequence(int start, int end) {
+			return new SubCharSequence(str, this.start + start, this.start + end);
+		}
+
+		@Override
+		public String toString() {
+			return str.substring(start, end);
+		}
+	}
+
 	private RequestHandler getCapturingHandler(String path) {
 		int index = path.lastIndexOf("/");
 		if (index != -1) {
-			String init = path.substring(0, index+1);	// path without its last segment
-			String group = path.substring(index+1, path.length()); 
-			RequestHandler handler = capturingHandlers.get(init);
-			if (handler != null) {
-				Pattern regex = patterns.get(handler);
-				if (regex.matcher(group).matches()) {
-					return handler;
+			for (Map.Entry<String, RequestHandler> entry : capturingHandlers.entrySet()) {
+				String key = entry.getKey();
+				if (key.length() == index + 1 && path.regionMatches(0, key, 0, key.length())) {
+					RequestHandler handler = entry.getValue();
+					Pattern regex = patterns.get(handler);
+					if (regex != null) {
+						java.util.regex.Matcher m = threadLocalMatchers.get().computeIfAbsent(regex, r -> r.matcher(""));
+						SubCharSequence group = new SubCharSequence(path, index + 1, path.length());
+						if (m.reset(group).matches()) {
+							return handler;
+						}
+					}
 				}
 			}
 		}
@@ -183,18 +223,16 @@ public class Application {
 			return null;	// quick reject (no static dir or simple contradiction)
 		}
 		
-		java.nio.file.Path requested;
-		if (staticContentDirIsAbsolute) {
-			requested = java.nio.file.Path.of(path).toAbsolutePath().normalize();
-		} else {
-			requested = java.nio.file.Path.of(path.substring(1)).toAbsolutePath().normalize();
-		}
-		
-		if (requested.startsWith(staticContentRoot)) {
-			return StaticContentHandler.getInstance();
-		} else {
+		String prefix = staticContentDirIsAbsolute ? staticContentDir : "/" + staticContentDir;
+		if (!path.equals(prefix) && !path.startsWith(prefix + "/")) {
 			return null;
 		}
+		
+		if (path.contains("..") || path.contains("\0")) {
+			return null;
+		}
+		
+		return StaticContentHandler.getInstance();
 	}
 	
 	/** Enables (or with null, disables) static file serving from the given directory, resolving and

@@ -14,6 +14,7 @@ import java.nio.channels.SocketChannel;
 import java.util.HashMap;
 import java.util.Map;
 
+import org.deftserver.io.IOLoop;
 import org.deftserver.io.buffer.DynamicByteBuffer;
 import org.deftserver.util.DateUtil;
 import org.deftserver.util.HttpUtil;
@@ -23,6 +24,9 @@ import org.slf4j.LoggerFactory;
 import java.nio.charset.StandardCharsets;
 
 public class HttpResponse {
+	
+	private static final byte[] CRLF = { '\r', '\n' };
+	private static final byte[] ZERO_CRLF_CRLF = { '0', '\r', '\n', '\r', '\n' };
 	
 	private final static Logger logger = LoggerFactory.getLogger(HttpResponse.class);
 	
@@ -41,6 +45,7 @@ public class HttpResponse {
 	private String compressionEncoding = null;
 	protected boolean finished = false;
 	private boolean suppressContentLength = false;
+	protected long contentLength = -1;
 	protected final java.util.List<Cookie> cookies = new java.util.ArrayList<>();
 
 	/** Queues a cookie to be emitted as its own {@code Set-Cookie} response header line. */
@@ -104,31 +109,52 @@ public class HttpResponse {
 		statusCode = sc;
 	}
 
-	/** Sets a response header, first validating that neither name nor value can break out of the
-	 *  header stream (HTTP response-splitting defence — see {@link #validateHeaderField}). */
 	public void setHeader(String header, String value) {
 		validateHeaderField(header, value);
+		if (header.equalsIgnoreCase("Content-Length")) {
+			try {
+				contentLength = Long.parseLong(value);
+			} catch (NumberFormatException ignored) {}
+			return;
+		}
 		removeHeader(header);
 		headers.put(header, value);
 	}
 
 	private boolean hasHeader(String name) {
-		return headers.keySet().stream().anyMatch(name::equalsIgnoreCase);
+		if (name.equalsIgnoreCase("Content-Length")) {
+			return contentLength != -1;
+		}
+		for (String key : headers.keySet()) {
+			if (key.equalsIgnoreCase(name)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private String getHeaderValue(String name) {
-		return headers.entrySet().stream()
-				.filter(entry -> entry.getKey().equalsIgnoreCase(name))
-				.map(Map.Entry::getValue)
-				.findFirst()
-				.orElse(null);
+		if (name.equalsIgnoreCase("Content-Length")) {
+			return contentLength == -1 ? null : String.valueOf(contentLength);
+		}
+		for (Map.Entry<String, String> entry : headers.entrySet()) {
+			if (entry.getKey().equalsIgnoreCase(name)) {
+				return entry.getValue();
+			}
+		}
+		return null;
 	}
 
 	private void removeHeader(String name) {
-		headers.keySet().stream()
-				.filter(name::equalsIgnoreCase)
-				.findFirst()
-				.ifPresent(headers::remove);
+		if (name.equalsIgnoreCase("Content-Length")) {
+			contentLength = -1;
+		}
+		for (String key : headers.keySet()) {
+			if (key.equalsIgnoreCase(name)) {
+				headers.remove(key);
+				break;
+			}
+		}
 	}
 
 	/**
@@ -213,33 +239,59 @@ public class HttpResponse {
 	public long flush() {
 		long bytesWritten = 0;
 		try {
+			SocketChannel channel = (SocketChannel) key.channel();
 			if (!headersCreated) {
 				if (!useChunked && !hasHeader("Content-Length") && !suppressBody) {
 					setHeader("Connection", "Close");
 				}
 				if (useChunked && responseData.position() > 0) {
 					int len = responseData.position();
-					String hex = Integer.toHexString(len);
-					byte[] prefix = (hex + "\r\n").getBytes(StandardCharsets.ISO_8859_1);
+					byte[] prefix = getChunkHeaderBytes(len);
 					responseData.prepend(prefix);
-					responseData.put("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+					responseData.put(CRLF);
 				}
-				String initial = createInitalLineAndHeaders();
 				if (suppressBody) {
 					responseData.clear();
 				}
-				bytesWritten += responseData.prepend(initial);
+				int headerLen = calculateHeadersLength();
+				ByteBuffer headerBuf = ByteBuffer.allocate(headerLen);
+				writeHeadersToBuffer(headerBuf.array(), 0);
+				headerBuf.limit(headerLen);
 				headersCreated = true;
-			}
-			responseData.flip();
-	
-			SocketChannel channel = (SocketChannel) key.channel();
-			if (responseData.hasRemaining()) {
-				int written = 0;
+
+				responseData.flip();
+				ByteBuffer bodyBuf = responseData.getByteBuffer();
+				ByteBuffer[] srcs = { headerBuf, bodyBuf };
+
+				long written = 0;
 				do {
-					written = protocol.write(channel, responseData.getByteBuffer());
-					bytesWritten += written;
-				} while (channel.isConnected() && written > 0 && responseData.hasRemaining());
+					long n = protocol.write(channel, srcs);
+					if (n <= 0) break;
+					written += n;
+				} while (channel.isConnected() && (headerBuf.hasRemaining() || bodyBuf.hasRemaining()));
+
+				bytesWritten += written;
+
+				if (headerBuf.hasRemaining()) {
+					int remHeaders = headerBuf.remaining();
+					responseData.compact();
+					byte[] arr = responseData.prependSpace(remHeaders);
+					headerBuf.get(arr, 0, remHeaders);
+				} else {
+					responseData.compact();
+				}
+			} else {
+				responseData.flip();
+				if (responseData.hasRemaining()) {
+					int written = 0;
+					do {
+						written = protocol.write(channel, responseData.getByteBuffer());
+						bytesWritten += written;
+					} while (channel.isConnected() && written > 0 && responseData.hasRemaining());
+				}
+				if (responseData.hasRemaining()) {
+					responseData.compact();
+				}
 			}
 			if (protocol.getIOLoop().hasKeepAliveTimeout(channel)) {
 				protocol.prolongKeepAliveTimeout(channel);
@@ -247,19 +299,13 @@ public class HttpResponse {
 			SSLSessionHandler sslHandler = protocol.getSslSessionHandler(channel);
 			boolean sslPending = (sslHandler != null && sslHandler.hasPendingWrite());
 			if (responseData.hasRemaining() || sslPending) {
-				responseData.compact();	// make room for more data be 'read' in
 				key.channel().register(key.selector(), SelectionKey.OP_WRITE, responseData);
 			}
 			if (sslPending) {
-				// The encrypted bytes are deferred to OP_WRITE (non-blocking); arm the idle write
-				// timeout so a peer that stops reading the response is reaped rather than holding the
-				// pending buffer + connection forever.
 				protocol.armWriteTimeout(channel);
 			}
 		} catch (IOException e) {
 			logger.debug("Client disconnected during flush (broken pipe): {}", e.getMessage());
-			// Route through closeChannel so the protocol's channel set / per-channel maps are
-			// cleaned (a bare channel.close() would leak the active-connection accounting).
 			protocol.closeChannel((SocketChannel) key.channel());
 			return 0;
 		} finally {
@@ -287,8 +333,9 @@ public class HttpResponse {
 			long bytesWritten = 0;
 			SocketChannel clientChannel = (SocketChannel) key.channel();
 	
-			if (key.attachment() instanceof MappedByteBuffer) {
-				MappedByteBuffer mbb = (MappedByteBuffer) key.attachment();
+			Object rawAtt = IOLoop.getAttachment(key);
+			if (rawAtt instanceof MappedByteBuffer) {
+				MappedByteBuffer mbb = (MappedByteBuffer) rawAtt;
 				if (mbb.hasRemaining()) {
 					int written = 0;
 					do {
@@ -321,18 +368,18 @@ public class HttpResponse {
 					if (useChunked) {
 						if (responseData.position() > 0) {
 							int len = responseData.position();
-							String hex = Integer.toHexString(len);
-							byte[] prefix = (hex + "\r\n").getBytes(StandardCharsets.ISO_8859_1);
+							byte[] prefix = getChunkHeaderBytes(len);
 							responseData.prepend(prefix);
-							responseData.put("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+							responseData.put(CRLF);
 						}
-						responseData.put("0\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+						responseData.put(ZERO_CRLF_CRLF);
 						if (!headersCreated) {
-							String initial = createInitalLineAndHeaders();
 							if (suppressBody) {
 								responseData.clear();
 							}
-							responseData.prepend(initial);
+							int headerLen = calculateHeadersLength();
+							byte[] arr = responseData.prependSpace(headerLen);
+							writeHeadersToBuffer(arr, 0);
 							headersCreated = true;
 						}
 						bytesWritten = flush();
@@ -351,15 +398,16 @@ public class HttpResponse {
 				} else {
 					boolean isWriting = key.isValid() && (key.interestOps() & SelectionKey.OP_WRITE) != 0;
 					if (isWriting) {
-						if (key.attachment() instanceof DynamicByteBuffer) {
-							DynamicByteBuffer dbb = (DynamicByteBuffer) key.attachment();
+						rawAtt = IOLoop.getAttachment(key);
+						if (rawAtt instanceof DynamicByteBuffer) {
+							DynamicByteBuffer dbb = (DynamicByteBuffer) rawAtt;
 							if (!dbb.hasRemaining()) {
 								finishConnection(closeConnection);
 							} else if (closeConnection) {
 								protocol.markCloseAfterWrite(clientChannel);
 							}
-						} else if (key.attachment() instanceof ByteBuffer) {
-							ByteBuffer bb = (ByteBuffer) key.attachment();
+						} else if (rawAtt instanceof ByteBuffer) {
+							ByteBuffer bb = (ByteBuffer) rawAtt;
 							if (!bb.hasRemaining()) {
 								finishConnection(closeConnection);
 							} else if (closeConnection) {
@@ -447,7 +495,7 @@ public class HttpResponse {
 		if (responseData.position() > 0) {
 			// RFC 9110 §8.8.3: an ETag is a quoted-string. Quoting is also required for
 			// If-None-Match / If-Match to match, since clients echo the quoted value back.
-			etag = "\"" + HttpUtil.getEtag(responseData.array(), 0, responseData.position()) + "\"";
+			etag = "\"" + HttpUtil.getEtag(protocol.getIOLoop().getMd5(), responseData.array(), 0, responseData.position()) + "\"";
 			// Use the RFC 9110 §8.8.3 canonical spelling "ETag" (matches the static handler and what
 			// case-sensitive clients/caches expect), even though header names are case-insensitive.
 			setHeader("ETag", etag);
@@ -552,30 +600,111 @@ public class HttpResponse {
 		suppressContentLength = true;
 	}
 
-	/** Serializes the status line, all headers, and one {@code Set-Cookie} line per queued cookie,
-	 *  terminated by the blank line that separates headers from the body. */
-	private String createInitalLineAndHeaders() {
-		StringBuilder sb = new StringBuilder(32 + headers.size() * 45 + cookies.size() * 60);
-		sb.append(HttpUtil.createInitialLine(statusCode));
+	private static int stringSize(long x) {
+		if (x == 0) return 1;
+		int len = 0;
+		long temp = x;
+		if (temp < 0) {
+			len++;
+			temp = -temp;
+		}
+		while (temp > 0) {
+			len++;
+			temp /= 10;
+		}
+		return len;
+	}
+
+	private static int writeLongToBuffer(byte[] arr, int cur, long value) {
+		if (value == 0) {
+			arr[cur++] = '0';
+			return cur;
+		}
+		int size = stringSize(value);
+		int nextPos = cur + size;
+		long temp = value;
+		while (temp > 0) {
+			long digit = temp % 10;
+			arr[--nextPos] = (byte) ('0' + digit);
+			temp /= 10;
+		}
+		return cur + size;
+	}
+
+	private int calculateHeadersLength() {
+		int len = 0;
+		String initialLine = HttpUtil.createInitialLine(statusCode);
+		len += initialLine.length();
 		for (Map.Entry<String, String> header : headers.entrySet()) {
-			// RFC 9110 §8.6: MUST NOT send Content-Length on 1xx (except 101), 204, or 304.
-			// The 101 exception is required by the JDK java.net.http WebSocket client.
-			if (suppressContentLength && statusCode != 101 && "Content-Length".equals(header.getKey())) {
-				continue;
-			}
-			// A header field is always "name ':' OWS value"; emitting the name alone (when the
-			// value is empty) produces a malformed, colon-less line.
-			sb.append(header.getKey()).append(": ");
-			if (!header.getValue().isEmpty()) {
-				sb.append(header.getValue());
-			}
-			sb.append("\r\n");
+			len += header.getKey().length();
+			len += 2; // ": "
+			len += header.getValue().length();
+			len += 2; // "\r\n"
+		}
+		boolean writeCl = (contentLength != -1) && (!suppressContentLength || statusCode == 101);
+		if (writeCl) {
+			len += 16; // "Content-Length: "
+			len += stringSize(contentLength);
+			len += 2; // "\r\n"
 		}
 		for (Cookie cookie : cookies) {
-			sb.append("Set-Cookie: ").append(cookie.toString()).append("\r\n");
+			len += 12; // "Set-Cookie: "
+			len += cookie.toString().length();
+			len += 2; // "\r\n"
 		}
-		sb.append("\r\n");
-		return sb.toString();
+		len += 2; // "\r\n"
+		return len;
+	}
+
+	private int writeHeadersToBuffer(byte[] arr, int offset) {
+		int cur = offset;
+		String initialLine = HttpUtil.createInitialLine(statusCode);
+		int initialLen = initialLine.length();
+		for (int i = 0; i < initialLen; i++) {
+			arr[cur++] = (byte) initialLine.charAt(i);
+		}
+		for (Map.Entry<String, String> header : headers.entrySet()) {
+			String key = header.getKey();
+			int keyLen = key.length();
+			for (int i = 0; i < keyLen; i++) {
+				arr[cur++] = (byte) key.charAt(i);
+			}
+			arr[cur++] = ':';
+			arr[cur++] = ' ';
+			String val = header.getValue();
+			int valLen = val.length();
+			for (int i = 0; i < valLen; i++) {
+				arr[cur++] = (byte) val.charAt(i);
+			}
+			arr[cur++] = '\r';
+			arr[cur++] = '\n';
+		}
+		boolean writeCl = (contentLength != -1) && (!suppressContentLength || statusCode == 101);
+		if (writeCl) {
+			String prefix = "Content-Length: ";
+			for (int i = 0; i < prefix.length(); i++) {
+				arr[cur++] = (byte) prefix.charAt(i);
+			}
+			cur = writeLongToBuffer(arr, cur, contentLength);
+			arr[cur++] = '\r';
+			arr[cur++] = '\n';
+		}
+		for (Cookie cookie : cookies) {
+			String cookieStr = cookie.toString();
+			String prefix = "Set-Cookie: ";
+			for (int i = 0; i < prefix.length(); i++) {
+				arr[cur++] = (byte) prefix.charAt(i);
+			}
+			int cookieLen = cookieStr.length();
+			for (int i = 0; i < cookieLen; i++) {
+				arr[cur++] = (byte) cookieStr.charAt(i);
+			}
+			arr[cur++] = '\r';
+			arr[cur++] = '\n';
+		}
+		arr[cur++] = '\r';
+		arr[cur++] = '\n';
+		return cur - offset;
 	}
 	
 	/**
@@ -607,9 +736,9 @@ public class HttpResponse {
 
 		if (data.hasRemaining()) {
 			if (useChunked) {
-				responseData.put((Integer.toHexString(data.remaining()) + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
+				responseData.put(getChunkHeaderBytes(data.remaining()));
 				responseData.put(data);
-				responseData.put("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+				responseData.put(CRLF);
 			} else {
 				responseData.put(data);
 			}
@@ -624,37 +753,105 @@ public class HttpResponse {
 	 */
 	public long write(File file) {
 		try {
-			//setHeader("Etag", HttpUtil.getEtag(file));
 			logger.debug("cl-httpresp3");
 			setHeader("Content-Length", String.valueOf(file.length()));
 			long bytesWritten = 0;
-			flush(); // write initial line + headers
+
 			if (isBodySuppressed()) {
-				return bytesWritten;
+				flush();
+				return 0;
 			}
 
 			// Files larger than a single mmap window are served in chunks (avoids the 2 GiB
 			// FileChannel.map limit). The protocol layer owns the windowing + cleanup.
 			if (file.length() > HttpProtocol.FILE_WINDOW_SIZE) {
+				flush(); // write initial line + headers only
 				protocol.streamLargeFile(key, file, 0L, file.length());
+				return bytesWritten;
+			}
+
+			java.nio.ByteBuffer cachedMbb = org.deftserver.web.handler.StaticContentHandler.getMappedBuffer(file);
+			if (cachedMbb != null) {
+				if (!headersCreated) {
+					int headerLen = calculateHeadersLength();
+					ByteBuffer headerBuf = ByteBuffer.allocate(headerLen);
+					writeHeadersToBuffer(headerBuf.array(), 0);
+					headerBuf.limit(headerLen);
+					headersCreated = true;
+					ByteBuffer[] srcs = { headerBuf, cachedMbb };
+					long written = 0;
+					do {
+						long n = protocol.write(((SocketChannel) key.channel()), srcs);
+						if (n <= 0) break;
+						written += n;
+					} while (headerBuf.hasRemaining() || cachedMbb.hasRemaining());
+					bytesWritten += written;
+					if (headerBuf.hasRemaining() || cachedMbb.hasRemaining()) {
+						DynamicByteBuffer pending = DynamicByteBuffer.allocate(
+							headerBuf.remaining() + cachedMbb.remaining());
+						pending.put(headerBuf);
+						pending.put(cachedMbb);
+						pending.flip();
+						org.deftserver.io.IOLoop.setAttachment(key, pending.getByteBuffer());
+						key.interestOps(SelectionKey.OP_WRITE);
+					}
+				} else {
+					if (cachedMbb.hasRemaining()) {
+						int written = 0;
+						do {
+							written = protocol.write(((SocketChannel) key.channel()), cachedMbb);
+							bytesWritten += written;
+						} while (written > 0 && cachedMbb.hasRemaining());
+					}
+					if (cachedMbb.hasRemaining()) {
+						org.deftserver.io.IOLoop.setAttachment(key, cachedMbb);
+						key.interestOps(SelectionKey.OP_WRITE);
+					}
+				}
+				logger.debug("sent file data, bytes sent: {}, remaining: {}", bytesWritten, cachedMbb.remaining());
 				return bytesWritten;
 			}
 
 			try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
 				FileChannel fc = raf.getChannel();
-				MappedByteBuffer mbb = raf.getChannel().map(MapMode.READ_ONLY, 0L, fc.size());
-				if (mbb.hasRemaining()) {
-					int written = 0;
+				MappedByteBuffer mbb = fc.map(MapMode.READ_ONLY, 0L, fc.size());
+				if (!headersCreated) {
+					int headerLen = calculateHeadersLength();
+					ByteBuffer headerBuf = ByteBuffer.allocate(headerLen);
+					writeHeadersToBuffer(headerBuf.array(), 0);
+					headerBuf.limit(headerLen);
+					headersCreated = true;
+					ByteBuffer[] srcs = { headerBuf, mbb };
+					long written = 0;
 					do {
-						written = protocol.write(((SocketChannel) key.channel()), mbb);
-						bytesWritten += written;
-					} while (written > 0 && mbb.hasRemaining());
-					logger.debug("sent file data, bytes sent: {}, remaining: {}", bytesWritten, mbb.remaining());
+						long n = protocol.write(((SocketChannel) key.channel()), srcs);
+						if (n <= 0) break;
+						written += n;
+					} while (headerBuf.hasRemaining() || mbb.hasRemaining());
+					bytesWritten += written;
+					if (headerBuf.hasRemaining() || mbb.hasRemaining()) {
+						DynamicByteBuffer pending = DynamicByteBuffer.allocate(
+							headerBuf.remaining() + mbb.remaining());
+						pending.put(headerBuf);
+						pending.put(mbb);
+						pending.flip();
+						org.deftserver.io.IOLoop.setAttachment(key, pending.getByteBuffer());
+						key.interestOps(SelectionKey.OP_WRITE);
+					}
+				} else {
+					if (mbb.hasRemaining()) {
+						int written = 0;
+						do {
+							written = protocol.write(((SocketChannel) key.channel()), mbb);
+							bytesWritten += written;
+						} while (written > 0 && mbb.hasRemaining());
+					}
+					if (mbb.hasRemaining()) {
+						org.deftserver.io.IOLoop.setAttachment(key, mbb);
+						key.interestOps(SelectionKey.OP_WRITE);
+					}
 				}
-				if (mbb.hasRemaining()) {
-					logger.debug("unable to send complete file, attaching to key for later send");
-					key.channel().register(key.selector(), SelectionKey.OP_WRITE, mbb);
-				}
+				logger.debug("sent file data, bytes sent: {}, remaining: {}", bytesWritten, mbb.remaining());
 			}
 			return bytesWritten;
 		} catch (IOException e) {
@@ -672,32 +869,104 @@ public class HttpResponse {
 	public long write(File file, long start, long length) {
 		try {
 			long bytesWritten = 0;
-			flush(); // write initial line + headers
+
 			if (isBodySuppressed()) {
-				return bytesWritten;
+				flush();
+				return 0;
 			}
 
 			// A range larger than a single mmap window is served in chunks too.
 			if (length > HttpProtocol.FILE_WINDOW_SIZE) {
+				flush(); // write initial line + headers only
 				protocol.streamLargeFile(key, file, start, length);
+				return bytesWritten;
+			}
+
+			java.nio.ByteBuffer cachedMbb = org.deftserver.web.handler.StaticContentHandler.getMappedBuffer(file);
+			if (cachedMbb != null) {
+				java.nio.ByteBuffer sliced = cachedMbb.duplicate();
+				sliced.position((int) start);
+				sliced.limit((int) (start + length));
+				if (!headersCreated) {
+					int headerLen = calculateHeadersLength();
+					ByteBuffer headerBuf = ByteBuffer.allocate(headerLen);
+					writeHeadersToBuffer(headerBuf.array(), 0);
+					headerBuf.limit(headerLen);
+					headersCreated = true;
+					ByteBuffer[] srcs = { headerBuf, sliced };
+					long written = 0;
+					do {
+						long n = protocol.write(((SocketChannel) key.channel()), srcs);
+						if (n <= 0) break;
+						written += n;
+					} while (headerBuf.hasRemaining() || sliced.hasRemaining());
+					bytesWritten += written;
+					if (headerBuf.hasRemaining() || sliced.hasRemaining()) {
+						DynamicByteBuffer pending = DynamicByteBuffer.allocate(
+							headerBuf.remaining() + sliced.remaining());
+						pending.put(headerBuf);
+						pending.put(sliced);
+						pending.flip();
+						org.deftserver.io.IOLoop.setAttachment(key, pending.getByteBuffer());
+						key.interestOps(SelectionKey.OP_WRITE);
+					}
+				} else {
+					if (sliced.hasRemaining()) {
+						int written = 0;
+						do {
+							written = protocol.write(((SocketChannel) key.channel()), sliced);
+							bytesWritten += written;
+						} while (written > 0 && sliced.hasRemaining());
+					}
+					if (sliced.hasRemaining()) {
+						org.deftserver.io.IOLoop.setAttachment(key, sliced);
+						key.interestOps(SelectionKey.OP_WRITE);
+					}
+				}
+				logger.debug("sent partial file data, bytes sent: {}, remaining: {}", bytesWritten, sliced.remaining());
 				return bytesWritten;
 			}
 
 			try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
 				FileChannel fc = raf.getChannel();
 				MappedByteBuffer mbb = fc.map(MapMode.READ_ONLY, start, length);
-				if (mbb.hasRemaining()) {
-					int written = 0;
+				if (!headersCreated) {
+					int headerLen = calculateHeadersLength();
+					ByteBuffer headerBuf = ByteBuffer.allocate(headerLen);
+					writeHeadersToBuffer(headerBuf.array(), 0);
+					headerBuf.limit(headerLen);
+					headersCreated = true;
+					ByteBuffer[] srcs = { headerBuf, mbb };
+					long written = 0;
 					do {
-						written = protocol.write(((SocketChannel) key.channel()), mbb);
-						bytesWritten += written;
-					} while (written > 0 && mbb.hasRemaining());
-					logger.debug("sent partial file data, bytes sent: {}, remaining: {}", bytesWritten, mbb.remaining());
+						long n = protocol.write(((SocketChannel) key.channel()), srcs);
+						if (n <= 0) break;
+						written += n;
+					} while (headerBuf.hasRemaining() || mbb.hasRemaining());
+					bytesWritten += written;
+					if (headerBuf.hasRemaining() || mbb.hasRemaining()) {
+						DynamicByteBuffer pending = DynamicByteBuffer.allocate(
+							headerBuf.remaining() + mbb.remaining());
+						pending.put(headerBuf);
+						pending.put(mbb);
+						pending.flip();
+						org.deftserver.io.IOLoop.setAttachment(key, pending.getByteBuffer());
+						key.interestOps(SelectionKey.OP_WRITE);
+					}
+				} else {
+					if (mbb.hasRemaining()) {
+						int written = 0;
+						do {
+							written = protocol.write(((SocketChannel) key.channel()), mbb);
+							bytesWritten += written;
+						} while (written > 0 && mbb.hasRemaining());
+					}
+					if (mbb.hasRemaining()) {
+						org.deftserver.io.IOLoop.setAttachment(key, mbb);
+						key.interestOps(SelectionKey.OP_WRITE);
+					}
 				}
-				if (mbb.hasRemaining()) {
-					logger.debug("unable to send complete partial file, attaching to key for later send");
-					key.channel().register(key.selector(), SelectionKey.OP_WRITE, mbb);
-				}
+				logger.debug("sent partial file data, bytes sent: {}, remaining: {}", bytesWritten, mbb.remaining());
 			}
 			return bytesWritten;
 		} catch (IOException e) {
@@ -746,5 +1015,17 @@ public class HttpResponse {
 	 *  same tag compare equal (the weak comparison used for If-None-Match). */
 	private static String stripWeak(String etag) {
 		return etag.startsWith("W/") ? etag.substring(2) : etag;
+	}
+
+	private static byte[] getChunkHeaderBytes(int len) {
+		String hex = Integer.toHexString(len);
+		int hexLen = hex.length();
+		byte[] bytes = new byte[hexLen + 2];
+		for (int i = 0; i < hexLen; i++) {
+			bytes[i] = (byte) hex.charAt(i);
+		}
+		bytes[hexLen] = '\r';
+		bytes[hexLen + 1] = '\n';
+		return bytes;
 	}
 }

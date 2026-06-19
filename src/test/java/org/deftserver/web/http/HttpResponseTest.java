@@ -1,5 +1,11 @@
 package org.deftserver.web.http;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertArrayEquals;
+
+import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
+
 import org.junit.Test;
 
 public class HttpResponseTest {
@@ -44,5 +50,33 @@ public class HttpResponseTest {
 		r.setHeader("Date", "Sun, 06 Nov 1994 08:49:37 GMT");
 		r.setHeader("X-Tabbed", "a\tb"); // HT is the one permitted control char in a value
 		r.setHeader("Allow", "GET, HEAD, POST");
+	}
+
+	@Test
+	public void getChunkHeaderBytesCorrectness() throws Exception {
+		Method method = HttpResponse.class.getDeclaredMethod("getChunkHeaderBytes", int.class);
+		method.setAccessible(true);
+
+		byte[] b1 = (byte[]) method.invoke(null, 0);
+		assertEquals("0\r\n", new String(b1, StandardCharsets.ISO_8859_1));
+
+		byte[] b2 = (byte[]) method.invoke(null, 255);
+		assertEquals("ff\r\n", new String(b2, StandardCharsets.ISO_8859_1));
+
+		byte[] b3 = (byte[]) method.invoke(null, 4096);
+		assertEquals("1000\r\n", new String(b3, StandardCharsets.ISO_8859_1));
+	}
+
+	@Test
+	public void protocolConstantsAreCorrect() throws Exception {
+		java.lang.reflect.Field crlfField = HttpResponse.class.getDeclaredField("CRLF");
+		crlfField.setAccessible(true);
+		byte[] crlf = (byte[]) crlfField.get(null);
+		assertArrayEquals(new byte[] { '\r', '\n' }, crlf);
+
+		java.lang.reflect.Field zeroField = HttpResponse.class.getDeclaredField("ZERO_CRLF_CRLF");
+		zeroField.setAccessible(true);
+		byte[] zero = (byte[]) zeroField.get(null);
+		assertArrayEquals(new byte[] { '0', '\r', '\n', '\r', '\n' }, zero);
 	}
 }

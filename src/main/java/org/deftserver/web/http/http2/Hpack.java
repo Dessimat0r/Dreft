@@ -18,8 +18,19 @@ public final class Hpack {
 		public final String value;
 		public final int size;
 
+		private static String toLowerCaseIfNecessary(String s) {
+			int len = s.length();
+			for (int i = 0; i < len; i++) {
+				char c = s.charAt(i);
+				if (c >= 'A' && c <= 'Z') {
+					return s.toLowerCase(Locale.ROOT);
+				}
+			}
+			return s;
+		}
+
 		public HeaderField(String name, String value) {
-			this.name = name.toLowerCase(Locale.ROOT);
+			this.name = toLowerCaseIfNecessary(name);
 			this.value = value;
 			this.size = name.length() + value.length() + 32;
 		}
@@ -245,6 +256,31 @@ public final class Hpack {
 			return result;
 		}
 
+		private static String getCachedString(byte[] raw) {
+			int len = raw.length;
+			if (len == 3) {
+				if (raw[0] == 'G' && raw[1] == 'E' && raw[2] == 'T') return "GET";
+				if (raw[0] == 'P' && raw[1] == 'U' && raw[2] == 'T') return "PUT";
+				if (raw[0] == '2' && raw[1] == '0' && raw[2] == '0') return "200";
+				if (raw[0] == '3' && raw[1] == '0' && raw[2] == '2') return "302";
+				if (raw[0] == '4' && raw[1] == '0' && raw[2] == '4') return "404";
+				if (raw[0] == '5' && raw[1] == '0' && raw[2] == '0') return "500";
+			} else if (len == 4) {
+				if (raw[0] == 'P' && raw[1] == 'O' && raw[2] == 'S' && raw[3] == 'T') return "POST";
+				if (raw[0] == 'h' && raw[1] == 't' && raw[2] == 't' && raw[3] == 'p') return "http";
+			} else if (len == 5) {
+				if (raw[0] == 'h' && raw[1] == 't' && raw[2] == 't' && raw[3] == 'p' && raw[4] == 's') return "https";
+				if (raw[0] == ':' && raw[1] == 'p' && raw[2] == 'a' && raw[3] == 't' && raw[4] == 'h') return ":path";
+			} else if (len == 7) {
+				if (raw[0] == ':' && raw[1] == 'm' && raw[2] == 'e' && raw[3] == 't' && raw[4] == 'h' && raw[5] == 'o' && raw[6] == 'd') return ":method";
+				if (raw[0] == ':' && raw[1] == 's' && raw[2] == 'c' && raw[3] == 'h' && raw[4] == 'e' && raw[5] == 'm' && raw[6] == 'e') return ":scheme";
+				if (raw[0] == ':' && raw[1] == 's' && raw[2] == 't' && raw[3] == 'a' && raw[4] == 't' && raw[5] == 'u' && raw[6] == 's') return ":status";
+			} else if (len == 10) {
+				if (raw[0] == ':' && raw[1] == 'a' && raw[2] == 'u' && raw[3] == 't' && raw[4] == 'h' && raw[5] == 'o' && raw[6] == 'r' && raw[7] == 'i' && raw[8] == 't' && raw[9] == 'y') return ":authority";
+			}
+			return null;
+		}
+
 		private String readString(ByteBuffer buffer) throws IOException {
 			if (!buffer.hasRemaining()) {
 				throw new IOException("Truncated string in HPACK");
@@ -262,6 +298,10 @@ public final class Hpack {
 			buffer.get(raw);
 			if (huffman) {
 				raw = Huffman.get().decode(raw);
+			}
+			String cached = getCachedString(raw);
+			if (cached != null) {
+				return cached;
 			}
 			return new String(raw, StandardCharsets.UTF_8);
 		}
@@ -356,9 +396,24 @@ public final class Hpack {
 		}
 
 		private void writeString(ByteArrayOutputStream out, String str) throws IOException {
-			byte[] bytes = str.getBytes(StandardCharsets.UTF_8);
-			writeInt(out, bytes.length, 0x7F, 0x00); // No Huffman encoding for outputs (simpler & compatible)
-			out.write(bytes);
+			boolean isAscii = true;
+			int len = str.length();
+			for (int i = 0; i < len; i++) {
+				if (str.charAt(i) >= 128) {
+					isAscii = false;
+					break;
+				}
+			}
+			if (isAscii) {
+				writeInt(out, len, 0x7F, 0x00);
+				for (int i = 0; i < len; i++) {
+					out.write((byte) str.charAt(i));
+				}
+			} else {
+				byte[] bytes = str.getBytes(StandardCharsets.UTF_8);
+				writeInt(out, bytes.length, 0x7F, 0x00); // No Huffman encoding for outputs (simpler & compatible)
+				out.write(bytes);
+			}
 		}
 	}
 
@@ -444,8 +499,11 @@ public final class Hpack {
 			current.symbol = symbol;
 		}
 
+		private static final ThreadLocal<byte[]> decodeBuffer = ThreadLocal.withInitial(() -> new byte[65536]);
+
 		public byte[] decode(byte[] data) throws IOException {
-			ByteArrayOutputStream out = new ByteArrayOutputStream();
+			byte[] out = decodeBuffer.get();
+			int outPos = 0;
 			Node current = root;
 			for (byte b : data) {
 				for (int i = 7; i >= 0; i--) {
@@ -456,17 +514,21 @@ public final class Hpack {
 					}
 					if (current.symbol != -1) {
 						if (current.symbol == 256) {
-							return out.toByteArray();
+							byte[] result = new byte[outPos];
+							System.arraycopy(out, 0, result, 0, outPos);
+							return result;
 						}
-						out.write(current.symbol);
-						if (out.size() > 65536) {
+						if (outPos >= 65536) {
 							throw new IOException("Huffman decoded output too large");
 						}
+						out[outPos++] = (byte) current.symbol;
 						current = root;
 					}
 				}
 			}
-			return out.toByteArray();
+			byte[] result = new byte[outPos];
+			System.arraycopy(out, 0, result, 0, outPos);
+			return result;
 		}
 	}
 }

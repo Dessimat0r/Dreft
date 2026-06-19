@@ -36,71 +36,419 @@ public class HttpProtocol implements IOHandler {
 	private final Application application;
 
 	
-	// a queue of half-baked (pending/unfinished) HTTP post request
-	private final Map<SelectableChannel, HttpRequest> partials = new ConcurrentHashMap<>();
-	private final Map<SocketChannel, ByteBuffer> readBuffers = new ConcurrentHashMap<>();
-	// Reusable scratch buffer for reading TLS ciphertext off the socket — avoids allocating ~16 KiB on
-	// every HTTPS read. Loop-thread-only (this HttpProtocol's reactor); grown if a session needs more.
+	private static final class ChannelState {
+		HttpRequest partial;
+		ByteBuffer readBuffer;
+		SSLSessionHandler sslSessionHandler;
+		org.deftserver.web.http.http2.Http2Connection http2Connection;
+		WebSocketHandler websocketHandler;
+		WebSocketConnection websocketConnection;
+		java.io.ByteArrayOutputStream websocketFragment;
+		Boolean websocketTextMessage;
+		Timeout headerReadTimeout;
+		Timeout bodyReadTimeout;
+		Timeout processingTimeout;
+		Timeout writeTimeout;
+		boolean closeAfterWrite;
+		int keepAliveRequestCount;
+		FileStreamState fileStream;
+		java.net.InetAddress ip;
+	}
+
+	private final Map<SocketChannel, ChannelState> connectionStates = new ConcurrentHashMap<>();
+
+	private ChannelState getState(SelectableChannel channel) {
+		if (channel == null) return null;
+		return connectionStates.get(channel);
+	}
+
+	private ChannelState getOrNewState(SelectableChannel channel) {
+		return connectionStates.computeIfAbsent((SocketChannel) channel, c -> new ChannelState());
+	}
+
+	private void cleanIfEmpty(SelectableChannel channel, ChannelState state) {
+		if (state.partial == null &&
+			state.readBuffer == null &&
+			state.sslSessionHandler == null &&
+			state.http2Connection == null &&
+			state.websocketHandler == null &&
+			state.websocketConnection == null &&
+			state.websocketFragment == null &&
+			state.websocketTextMessage == null &&
+			state.headerReadTimeout == null &&
+			state.bodyReadTimeout == null &&
+			state.processingTimeout == null &&
+			state.writeTimeout == null &&
+			!state.closeAfterWrite &&
+			state.keepAliveRequestCount == 0 &&
+			state.fileStream == null &&
+			state.ip == null) {
+			connectionStates.remove(channel);
+		}
+	}
+
+	private HttpRequest getPartial(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state == null ? null : state.partial;
+	}
+
+	private void putPartial(SelectableChannel channel, HttpRequest req) {
+		getOrNewState(channel).partial = req;
+	}
+
+	private HttpRequest removePartial(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			HttpRequest old = state.partial;
+			state.partial = null;
+			cleanIfEmpty(channel, state);
+			return old;
+		}
+		return null;
+	}
+
+	private boolean hasPartial(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state != null && state.partial != null;
+	}
+
+	private ByteBuffer getReadBuffer(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state == null ? null : state.readBuffer;
+	}
+
+	private void putReadBuffer(SelectableChannel channel, ByteBuffer buf) {
+		getOrNewState(channel).readBuffer = buf;
+	}
+
+	private ByteBuffer removeReadBuffer(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			ByteBuffer old = state.readBuffer;
+			state.readBuffer = null;
+			cleanIfEmpty(channel, state);
+			return old;
+		}
+		return null;
+	}
+
+	public SSLSessionHandler getSslSessionHandler(SocketChannel channel) {
+		ChannelState state = getState(channel);
+		return state == null ? null : state.sslSessionHandler;
+	}
+
+	private void putSslSessionHandler(SocketChannel channel, SSLSessionHandler h) {
+		getOrNewState(channel).sslSessionHandler = h;
+	}
+
+	private SSLSessionHandler removeSslSessionHandler(SocketChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			SSLSessionHandler old = state.sslSessionHandler;
+			state.sslSessionHandler = null;
+			cleanIfEmpty(channel, state);
+			return old;
+		}
+		return null;
+	}
+
+	private org.deftserver.web.http.http2.Http2Connection getHttp2Connection(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state == null ? null : state.http2Connection;
+	}
+
+	private void putHttp2Connection(SelectableChannel channel, org.deftserver.web.http.http2.Http2Connection conn) {
+		getOrNewState(channel).http2Connection = conn;
+	}
+
+	private org.deftserver.web.http.http2.Http2Connection removeHttp2Connection(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			org.deftserver.web.http.http2.Http2Connection old = state.http2Connection;
+			state.http2Connection = null;
+			cleanIfEmpty(channel, state);
+			return old;
+		}
+		return null;
+	}
+
+	private WebSocketHandler getWebsocketHandler(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state == null ? null : state.websocketHandler;
+	}
+
+	private void putWebsocketHandler(SelectableChannel channel, WebSocketHandler h) {
+		getOrNewState(channel).websocketHandler = h;
+	}
+
+	private WebSocketHandler removeWebsocketHandler(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			WebSocketHandler old = state.websocketHandler;
+			state.websocketHandler = null;
+			cleanIfEmpty(channel, state);
+			return old;
+		}
+		return null;
+	}
+
+	private boolean hasWebsocketHandler(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state != null && state.websocketHandler != null;
+	}
+
+	private WebSocketConnection getWebsocketConnection(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state == null ? null : state.websocketConnection;
+	}
+
+	private void putWebsocketConnection(SelectableChannel channel, WebSocketConnection conn) {
+		getOrNewState(channel).websocketConnection = conn;
+	}
+
+	private WebSocketConnection removeWebsocketConnection(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			WebSocketConnection old = state.websocketConnection;
+			state.websocketConnection = null;
+			cleanIfEmpty(channel, state);
+			return old;
+		}
+		return null;
+	}
+
+	private java.io.ByteArrayOutputStream getWebsocketFragment(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state == null ? null : state.websocketFragment;
+	}
+
+	private void putWebsocketFragment(SelectableChannel channel, java.io.ByteArrayOutputStream os) {
+		getOrNewState(channel).websocketFragment = os;
+	}
+
+	private java.io.ByteArrayOutputStream removeWebsocketFragment(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			java.io.ByteArrayOutputStream old = state.websocketFragment;
+			state.websocketFragment = null;
+			cleanIfEmpty(channel, state);
+			return old;
+		}
+		return null;
+	}
+
+	private Boolean getWebsocketTextMessage(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state == null ? null : state.websocketTextMessage;
+	}
+
+	private void putWebsocketTextMessage(SelectableChannel channel, Boolean b) {
+		getOrNewState(channel).websocketTextMessage = b;
+	}
+
+	private Boolean removeWebsocketTextMessage(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			Boolean old = state.websocketTextMessage;
+			state.websocketTextMessage = null;
+			cleanIfEmpty(channel, state);
+			return old;
+		}
+		return null;
+	}
+
+	private Timeout getHeaderReadTimeout(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state == null ? null : state.headerReadTimeout;
+	}
+
+	private void putHeaderReadTimeout(SelectableChannel channel, Timeout t) {
+		getOrNewState(channel).headerReadTimeout = t;
+	}
+
+	private Timeout removeHeaderReadTimeout(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			Timeout old = state.headerReadTimeout;
+			state.headerReadTimeout = null;
+			cleanIfEmpty(channel, state);
+			return old;
+		}
+		return null;
+	}
+
+	private Timeout getBodyReadTimeout(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state == null ? null : state.bodyReadTimeout;
+	}
+
+	private void putBodyReadTimeout(SelectableChannel channel, Timeout t) {
+		getOrNewState(channel).bodyReadTimeout = t;
+	}
+
+	private Timeout removeBodyReadTimeout(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			Timeout old = state.bodyReadTimeout;
+			state.bodyReadTimeout = null;
+			cleanIfEmpty(channel, state);
+			return old;
+		}
+		return null;
+	}
+
+	private boolean hasBodyReadTimeout(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state != null && state.bodyReadTimeout != null;
+	}
+
+	private Timeout getProcessingTimeout(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state == null ? null : state.processingTimeout;
+	}
+
+	private void putProcessingTimeout(SelectableChannel channel, Timeout t) {
+		getOrNewState(channel).processingTimeout = t;
+	}
+
+	private Timeout removeProcessingTimeout(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			Timeout old = state.processingTimeout;
+			state.processingTimeout = null;
+			cleanIfEmpty(channel, state);
+			return old;
+		}
+		return null;
+	}
+
+	private Timeout getWriteTimeout(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state == null ? null : state.writeTimeout;
+	}
+
+	private void putWriteTimeout(SelectableChannel channel, Timeout t) {
+		getOrNewState(channel).writeTimeout = t;
+	}
+
+	private Timeout removeWriteTimeout(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			Timeout old = state.writeTimeout;
+			state.writeTimeout = null;
+			cleanIfEmpty(channel, state);
+			return old;
+		}
+		return null;
+	}
+
+	private boolean hasWriteTimeout(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state != null && state.writeTimeout != null;
+	}
+
+	private boolean isCloseAfterWrite(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state != null && state.closeAfterWrite;
+	}
+
+	private void addCloseAfterWrite(SelectableChannel channel) {
+		getOrNewState(channel).closeAfterWrite = true;
+	}
+
+	private boolean removeCloseAfterWrite(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			boolean old = state.closeAfterWrite;
+			state.closeAfterWrite = false;
+			cleanIfEmpty(channel, state);
+			return old;
+		}
+		return false;
+	}
+
+	private int getKeepAliveRequestCount(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state == null ? 0 : state.keepAliveRequestCount;
+	}
+
+	private void putKeepAliveRequestCount(SelectableChannel channel, int count) {
+		getOrNewState(channel).keepAliveRequestCount = count;
+	}
+
+	private int incrementKeepAliveRequestCount(SelectableChannel channel) {
+		ChannelState state = getOrNewState(channel);
+		state.keepAliveRequestCount++;
+		return state.keepAliveRequestCount;
+	}
+
+	private void removeKeepAliveRequestCount(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			state.keepAliveRequestCount = 0;
+			cleanIfEmpty(channel, state);
+		}
+	}
+
+	private FileStreamState getFileStream(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state == null ? null : state.fileStream;
+	}
+
+	private void putFileStream(SelectableChannel channel, FileStreamState fs) {
+		getOrNewState(channel).fileStream = fs;
+	}
+
+	private FileStreamState removeFileStream(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			FileStreamState old = state.fileStream;
+			state.fileStream = null;
+			cleanIfEmpty(channel, state);
+			return old;
+		}
+		return null;
+	}
+
+	private java.net.InetAddress getChannelIp(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		return state == null ? null : state.ip;
+	}
+
+	private void putChannelIp(SelectableChannel channel, java.net.InetAddress ip) {
+		getOrNewState(channel).ip = ip;
+	}
+
+	private java.net.InetAddress removeChannelIp(SelectableChannel channel) {
+		ChannelState state = getState(channel);
+		if (state != null) {
+			java.net.InetAddress old = state.ip;
+			state.ip = null;
+			cleanIfEmpty(channel, state);
+			return old;
+		}
+		return null;
+	}
+
 	private ByteBuffer sslReadScratch;
 
 	private javax.net.ssl.SSLContext sslContext;
-	private final Map<SocketChannel, SSLSessionHandler> sslSessionHandlers = new ConcurrentHashMap<>();
-	private final Map<SocketChannel, org.deftserver.web.http.http2.Http2Connection> http2Connections = new ConcurrentHashMap<>();
 
-	private final Map<SocketChannel, WebSocketHandler> websocketHandlers = new ConcurrentHashMap<>();
-	private final Map<SocketChannel, WebSocketConnection> websocketConnections = new ConcurrentHashMap<>();
-	// Accumulates the payload of a fragmented WebSocket message (data frame with FIN=0 followed
-	// by continuation frames) until the final fragment arrives.
-	private final Map<SocketChannel, java.io.ByteArrayOutputStream> websocketFragments = new ConcurrentHashMap<>();
-	// Whether the in-progress WebSocket data message is text (opcode 0x1) — text messages are
-	// validated as UTF-8 at completion (RFC 6455 §8.1).
-	private final Map<SocketChannel, Boolean> websocketTextMessage = new ConcurrentHashMap<>();
-
-	private final Map<SocketChannel, Timeout> headerReadTimeouts = new ConcurrentHashMap<>();
-	private final Map<SocketChannel, Timeout> bodyReadTimeouts = new ConcurrentHashMap<>();
-	// Bounds the time an ASYNC/offloaded handler may take to finish its response (it runs off the
-	// loop, so the loop can't otherwise notice it hanging). Armed when dispatch reports async,
-	// cancelled when the response finishes. Distinct from the keep-alive (idle) timeout so a long
-	// async handler isn't cut off by the idle timer, and a hung async handler on a Connection: close
-	// connection (which has no keep-alive timeout) is still bounded rather than leaking forever.
-	private final Map<SocketChannel, Timeout> processingTimeouts = new ConcurrentHashMap<>();
-	// Idle response-write timeout for a DEFERRED (non-blocking TLS) write: a client that stops reading
-	// the response keeps the encrypted pendingWriteBuffer (and the connection) alive indefinitely.
-	// Since the write no longer blocks the loop (it's deferred to OP_WRITE), nothing else reaps it —
-	// so without this a slow/stalled response-reader is a memory/connection DoS (esp. with no
-	// max-connections cap). Reset on each OP_WRITE (= the peer drained some bytes = progress); fires
-	// (closes the channel) after RESPONSE_WRITE_TIMEOUT_MS of NO progress. Cancelled when the write
-	// completes or the channel closes.
-	private final Map<SocketChannel, Timeout> writeTimeouts = new ConcurrentHashMap<>();
-	/** How long an async/offloaded handler may take to finish its response before the connection is
-	 *  closed (anti-hang). Non-final so it can be tuned (raise it for legitimately long requests). */
 	public static volatile long REQUEST_PROCESSING_TIMEOUT_MS = 60_000;
-	/** Idle timeout for an established WebSocket connection — longer than the HTTP keep-alive idle
-	 *  timeout because WebSockets are long-lived and may legitimately sit quiet between messages.
-	 *  Reset on every frame; on expiry the (presumed dead) connection is closed. Tunable. */
 	public static volatile long WEBSOCKET_IDLE_TIMEOUT_MS = 300_000; // 5 min
-	// Channels whose current response declared Connection: close but whose body write was deferred
-	// to OP_WRITE (didn't fit the socket buffer). When that deferred write finally completes, the
-	// channel must be closed — NOT re-registered for read — so the server honours its own header.
-	private final java.util.Set<SocketChannel> closeAfterWrite = ConcurrentHashMap.newKeySet();
-
-	/** Maximum number of requests served on a single keep-alive connection before the server
-	 *  gracefully closes it (forces a fresh connection). Bounds per-connection resource use and
-	 *  connection monopolisation (cf. nginx keepalive_requests / Apache MaxKeepAliveRequests).
-	 *  Non-final so tests can lower it. */
 	public static volatile int MAX_KEEP_ALIVE_REQUESTS = 1000;
-	private final Map<SocketChannel, Integer> keepAliveRequestCount = new ConcurrentHashMap<>();
-	private int maxConnections = -1;
 	// Set of live client channels (not an int counter): channels can be closed via several paths
 	// that don't all funnel through closeChannel (IOLoop exception handlers, generic Closeables,
 	// flush/finish I/O errors). A bare counter would leak upward on those paths and eventually
 	// throttle the server forever. A set lets us self-heal by pruning closed channels before the
 	// limit check. Accessed only from this protocol's I/O-loop thread.
 	private final java.util.Set<SocketChannel> activeChannels = new java.util.HashSet<>();
+	private final java.util.Map<java.net.InetAddress, java.lang.Integer> ipConnectionCounts = new java.util.HashMap<>();
 
 	/** Upper bound on a single inbound WebSocket frame payload (16 MiB), mirroring the HTTP
 	 *  body cap. Guards against OOM / NegativeArraySizeException from a hostile length field. */
 	private static final long MAX_WS_FRAME_PAYLOAD = 16L * 1024 * 1024;
+	private static final byte[] CONTINUE_BYTES = "HTTP/1.1 100 Continue\r\n\r\n".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
 
 	/** Absolute cap on how long a request body may take to arrive after its headers. Bounds
 	 *  the resources a slow/stalled body upload can hold (Slowloris-on-body). Non-final so tests
@@ -117,7 +465,6 @@ public class HttpProtocol implements IOHandler {
 	private static final int MAX_HEADER_BUFFER_SIZE = 64 * 1024;
 
 	/** Per-channel state for serving a file larger than a single mmap window. */
-	private final Map<SocketChannel, FileStreamState> fileStreams = new ConcurrentHashMap<>();
 	/** Window size for chunked serving of large files. A single {@code FileChannel.map()} is capped
 	 *  at {@code Integer.MAX_VALUE}, so files/ranges larger than this are served window-by-window.
 	 *  Tunable (and lowerable by tests to exercise the chunked path with a small file). */
@@ -133,6 +480,7 @@ public class HttpProtocol implements IOHandler {
 		}
 	}
 
+	private int maxConnections = -1;
 	private int maxConnectionsPerIp = -1;
 
 	/** Caps the total simultaneous connections this protocol instance will accept ({@code <= 0} disables). */
@@ -161,7 +509,7 @@ public class HttpProtocol implements IOHandler {
 	 */
 	private void sendRequestTimeoutAndClose(SocketChannel channel) {
 		try {
-			if (channel != null && channel.isOpen() && !sslSessionHandlers.containsKey(channel)) {
+			if (channel != null && channel.isOpen() && getSslSessionHandler(channel) == null) {
 				ByteBuffer resp = ByteBuffer.wrap(
 					("HTTP/1.1 408 Request Timeout\r\n"
 						+ "Date: " + org.deftserver.util.DateUtil.getCurrentAsString() + "\r\n"
@@ -183,41 +531,33 @@ public class HttpProtocol implements IOHandler {
 	 *  nothing leaks. */
 	public void closeChannel(SocketChannel channel) {
 		if (channel != null) {
-			sslSessionHandlers.remove(channel);
-			http2Connections.remove(channel);
-			// Notify a WebSocket app of the close exactly once, here, so onClose fires for EVERY
-			// teardown path (read EOF, close frame, write error, idle/limit close, IOLoop generic
-			// close) rather than only the few that called it explicitly. remove() returns the
-			// handler iff this is the first close for the channel, so there's no double-delivery.
-			WebSocketHandler wsHandler = websocketHandlers.remove(channel);
-			WebSocketConnection wsConn = websocketConnections.remove(channel);
-			if (wsHandler != null) {
-				try {
-					wsHandler.onClose(wsConn);
-				} catch (RuntimeException e) {
-					logger.error("Uncaught exception in WebSocket onClose handler", e);
+			ChannelState state = connectionStates.remove(channel);
+			if (state != null) {
+				if (state.websocketHandler != null) {
+					try {
+						state.websocketHandler.onClose(state.websocketConnection);
+					} catch (RuntimeException e) {
+						logger.error("Uncaught exception in WebSocket onClose handler", e);
+					}
+				}
+				if (state.processingTimeout != null) state.processingTimeout.cancel();
+				if (state.writeTimeout != null) state.writeTimeout.cancel();
+				if (state.headerReadTimeout != null) state.headerReadTimeout.cancel();
+				if (state.bodyReadTimeout != null) state.bodyReadTimeout.cancel();
+				if (state.fileStream != null) {
+					try { state.fileStream.raf.close(); } catch (IOException ignore) { }
+				}
+				if (activeChannels.remove(channel)) {
+					if (maxConnectionsPerIp > 0 && state.ip != null) {
+						int count = ipConnectionCounts.getOrDefault(state.ip, 0);
+						if (count <= 1) {
+							ipConnectionCounts.remove(state.ip);
+						} else {
+							ipConnectionCounts.put(state.ip, count - 1);
+						}
+					}
 				}
 			}
-			websocketFragments.remove(channel);
-			websocketTextMessage.remove(channel);
-			closeAfterWrite.remove(channel);
-			keepAliveRequestCount.remove(channel);
-			Timeout pt = processingTimeouts.remove(channel);
-			if (pt != null) pt.cancel();
-			Timeout wt = writeTimeouts.remove(channel);
-			if (wt != null) wt.cancel();
-			closeFileStream(channel); // release any in-progress large-file handle
-			partials.remove(channel);
-			readBuffers.remove(channel);
-			Timeout t = headerReadTimeouts.remove(channel);
-			if (t != null) {
-				t.cancel();
-			}
-			Timeout bt = bodyReadTimeouts.remove(channel);
-			if (bt != null) {
-				bt.cancel();
-			}
-			activeChannels.remove(channel);
 			if (channel.isOpen()) {
 				org.deftserver.util.Closeables.closeQuietly(ioLoop, channel);
 			}
@@ -239,8 +579,8 @@ public class HttpProtocol implements IOHandler {
 	/** Marks a channel as an established WebSocket connection (registers its handler/connection so
 	 *  subsequent reads are treated as WS frames). */
 	public void upgradeToWebSocket(SocketChannel channel, WebSocketHandler handler, WebSocketConnection connection) {
-		websocketHandlers.put(channel, handler);
-		websocketConnections.put(channel, connection);
+		putWebsocketHandler(channel, handler);
+		putWebsocketConnection(channel, connection);
 		// Switch from the short HTTP keep-alive idle timeout to the longer WebSocket idle timeout, so a
 		// quiet-but-alive WebSocket isn't reaped after ~30 s.
 		prolongWebSocketIdleTimeout(channel);
@@ -283,7 +623,7 @@ public class HttpProtocol implements IOHandler {
 		// ServerSocketChannel. A single hostile connection would otherwise close the listening socket
 		// and stop the whole server from accepting (a trivial remote DoS). Close only this client.
 		try {
-			boolean isSsl = Boolean.TRUE.equals(key.attachment());
+			boolean isSsl = Boolean.TRUE.equals(IOLoop.getAttachment(key));
 			setUpAcceptedConnection(clientChannel, isSsl);
 		} catch (IOException | RuntimeException e) {
 			logger.debug("Failed to set up accepted connection {} — closing it (not the listener): {}",
@@ -298,9 +638,8 @@ public class HttpProtocol implements IOHandler {
 	private void setUpAcceptedConnection(SocketChannel clientChannel, boolean isSslConnection) throws IOException {
 		{
 			if (maxConnections > 0 && activeChannels.size() >= maxConnections) {
-				// Self-heal: prune any channels that were closed via a path that didn't run
-				// through closeChannel before deciding we're really at the limit.
 				activeChannels.removeIf(ch -> !ch.isOpen());
+				rebuildIpConnectionCounts();
 				if (activeChannels.size() >= maxConnections) {
 					logger.warn("Anti-DoS: Connection count limit reached ({}), rejecting new connection", maxConnections);
 					clientChannel.close();
@@ -310,15 +649,11 @@ public class HttpProtocol implements IOHandler {
 			if (maxConnectionsPerIp > 0 && !isUnixSocket(clientChannel)) {
 				java.net.InetAddress ip = clientChannel.socket().getInetAddress();
 				if (ip != null) {
-					activeChannels.removeIf(ch -> !ch.isOpen()); // self-heal stale entries first
-					int sameIp = 0;
-					for (SocketChannel ch : activeChannels) {
-						if (!isUnixSocket(ch)) {
-							java.net.InetAddress chIp = ch.socket().getInetAddress();
-							if (ip.equals(chIp)) {
-								sameIp++;
-							}
-						}
+					int sameIp = ipConnectionCounts.getOrDefault(ip, 0);
+					if (sameIp >= maxConnectionsPerIp) {
+						activeChannels.removeIf(ch -> !ch.isOpen());
+						rebuildIpConnectionCounts();
+						sameIp = ipConnectionCounts.getOrDefault(ip, 0);
 					}
 					if (sameIp >= maxConnectionsPerIp) {
 						logger.warn("Anti-DoS: per-IP connection limit ({}) reached for {}, rejecting", maxConnectionsPerIp, ip);
@@ -327,13 +662,19 @@ public class HttpProtocol implements IOHandler {
 					}
 				}
 			}
-			// could be null in a multithreaded deft environment because another ioloop was "faster" to accept()
 			clientChannel.configureBlocking(false);
 			if (clientChannel.supportedOptions().contains(StandardSocketOptions.TCP_NODELAY)) {
 				clientChannel.setOption(StandardSocketOptions.TCP_NODELAY, Boolean.TRUE);
 			}
 			ioLoop.addHandler(clientChannel, this, SelectionKey.OP_READ, ByteBuffer.allocate(READ_BUFFER_SIZE));
 			activeChannels.add(clientChannel);
+			if (maxConnectionsPerIp > 0 && !isUnixSocket(clientChannel)) {
+				java.net.InetAddress ip = clientChannel.socket().getInetAddress();
+				if (ip != null) {
+					putChannelIp(clientChannel, ip);
+					ipConnectionCounts.put(ip, ipConnectionCounts.getOrDefault(ip, 0) + 1);
+				}
+			}
 			
 			// Anti-DoS Header Timeout
 			Timeout headerTimeout = new Timeout(
@@ -346,12 +687,12 @@ public class HttpProtocol implements IOHandler {
 					}
 				}
 			);
-			headerReadTimeouts.put(clientChannel, headerTimeout);
+			putHeaderReadTimeout(clientChannel, headerTimeout);
 			ioLoop.addTimeout(headerTimeout);
 			if (isSslConnection) {
 				logger.debug("SSL enabled: instantiating SSLSessionHandler");
 				SSLSessionHandler handler = new SSLSessionHandler(clientChannel, sslContext, ioLoop);
-				sslSessionHandlers.put(clientChannel, handler);
+				putSslSessionHandler(clientChannel, handler);
 				handler.handshake();
 			}
 		}
@@ -371,24 +712,30 @@ public class HttpProtocol implements IOHandler {
 	 */
 	@Override
 	public void handleRead(SelectionKey key) throws IOException {
-		logger.debug("handle read... key: {}", key);
+		if (logger.isDebugEnabled()) {
+			logger.debug("handle read... key: {}", key);
+		}
 		SocketChannel clientChannel = (SocketChannel) key.channel();
 		
-		org.deftserver.web.http.http2.Http2Connection http2Conn = http2Connections.get(clientChannel);
+		org.deftserver.web.http.http2.Http2Connection http2Conn = getHttp2Connection(clientChannel);
 		if (http2Conn != null) {
 			prolongKeepAliveTimeout(clientChannel);
 			http2Conn.onReadable();
 			return;
 		}
-		WebSocketHandler wsHandler = websocketHandlers.get(clientChannel);
+		WebSocketHandler wsHandler = getWebsocketHandler(clientChannel);
 		if (wsHandler != null) {
 			handleWebSocketRead(key, clientChannel, wsHandler);
 			return;
 		}
 
-		logger.debug("handle read 2...");
-		SSLSessionHandler sslHandler = sslSessionHandlers.get(clientChannel);
-		logger.debug("handle read: sslHandler={}, handshakeComplete={}", sslHandler, sslHandler == null ? "N/A" : sslHandler.isHandshakeComplete());
+		if (logger.isDebugEnabled()) {
+			logger.debug("handle read 2...");
+		}
+		SSLSessionHandler sslHandler = getSslSessionHandler(clientChannel);
+		if (logger.isDebugEnabled()) {
+			logger.debug("handle read: sslHandler={}, handshakeComplete={}", sslHandler, sslHandler == null ? "N/A" : sslHandler.isHandshakeComplete());
+		}
 		if (sslHandler != null && !sslHandler.isHandshakeComplete()) {
 			try {
 				sslHandler.handshake();
@@ -411,7 +758,7 @@ public class HttpProtocol implements IOHandler {
 			request = getHttpRequest(key, clientChannel);
 		} catch (HttpException he) {
 			logger.warn("HTTP exception during request parsing: {}", he.getMessage());
-			Timeout t = headerReadTimeouts.remove(clientChannel);
+			Timeout t = removeHeaderReadTimeout(clientChannel);
 			if (t != null) t.cancel();
 			try {
 				HttpResponse response = new HttpResponse(this, key, false);
@@ -429,15 +776,15 @@ public class HttpProtocol implements IOHandler {
 		} catch (SSLConnectionClosedException e) {
 			// Peer sent TLS close_notify — graceful shutdown, not an error
 			logger.debug("TLS close_notify during request parsing, closing channel");
-			Timeout t = headerReadTimeouts.remove(clientChannel);
+			Timeout t = removeHeaderReadTimeout(clientChannel);
 			if (t != null) t.cancel();
-			SSLSessionHandler closedSslHandler = sslSessionHandlers.remove(clientChannel);
+			SSLSessionHandler closedSslHandler = removeSslSessionHandler(clientChannel);
 			if (closedSslHandler != null) closedSslHandler.closeQuietly();
 			closeChannel(clientChannel);
 			return;
 		} catch (Exception e) {
 			logger.warn("Unexpected exception during request parsing", e);
-			Timeout t = headerReadTimeouts.remove(clientChannel);
+			Timeout t = removeHeaderReadTimeout(clientChannel);
 			if (t != null) t.cancel();
 			try {
 				HttpResponse response = new HttpResponse(this, key, false);
@@ -460,7 +807,7 @@ public class HttpProtocol implements IOHandler {
 		}
 		
 		// Headers are parsed; the header-read timeout no longer applies.
-		Timeout t = headerReadTimeouts.remove(clientChannel);
+		Timeout t = removeHeaderReadTimeout(clientChannel);
 		if (t != null) {
 			t.cancel();
 		}
@@ -468,7 +815,7 @@ public class HttpProtocol implements IOHandler {
 			// Body still arriving. Arm a single body-read timeout (absolute cap) so a client
 			// that stalls or dribbles its body cannot hold the connection open indefinitely
 			// (Slowloris on the body). Armed once per request, not refreshed.
-			if (!bodyReadTimeouts.containsKey(clientChannel)) {
+			if (!hasBodyReadTimeout(clientChannel)) {
 				final SocketChannel bodyChannel = clientChannel;
 				Timeout bodyTimeout = new Timeout(
 					System.currentTimeMillis() + BODY_READ_TIMEOUT_MS,
@@ -480,14 +827,14 @@ public class HttpProtocol implements IOHandler {
 						}
 					}
 				);
-				bodyReadTimeouts.put(clientChannel, bodyTimeout);
+				putBodyReadTimeout(clientChannel, bodyTimeout);
 				ioLoop.addTimeout(bodyTimeout);
 			}
 			logger.debug("HttpRequest is incomplete. Waiting for more data.");
 			return;
 		}
 		// Request fully received — clear any body-read timeout.
-		Timeout bt = bodyReadTimeouts.remove(clientChannel);
+		Timeout bt = removeBodyReadTimeout(clientChannel);
 		if (bt != null) {
 			bt.cancel();
 		}
@@ -502,7 +849,7 @@ public class HttpProtocol implements IOHandler {
 			// Cap the number of requests per keep-alive connection: once the limit is reached, serve
 			// this request but signal close (Connection: Close, set by HttpResponse for !keepAlive)
 			// so the client reconnects — bounding per-connection resource use / monopolisation.
-			int count = keepAliveRequestCount.merge(clientChannel, 1, Integer::sum);
+			int count = incrementKeepAliveRequestCount(clientChannel);
 			if (count >= MAX_KEEP_ALIVE_REQUESTS) {
 				keepAlive = false;
 			} else {
@@ -513,12 +860,18 @@ public class HttpProtocol implements IOHandler {
 		
 		HttpResponse response = new HttpResponse(this, key, keepAlive, request.getMethod() == org.deftserver.web.HttpVerb.HEAD);
 		response.setRequest(request);
-		logger.debug("handle read 5...");
+		if (logger.isDebugEnabled()) {
+			logger.debug("handle read 5...");
+		}
 		try {
 			RequestHandler rh = application.getHandler(request);
-			logger.debug("handle read 6...");
+			if (logger.isDebugEnabled()) {
+				logger.debug("handle read 6...");
+			}
 			boolean isAsyncOrOffloaded = HttpRequestDispatcher.dispatch(rh, request, response);
-			logger.debug("handle read 7...");
+			if (logger.isDebugEnabled()) {
+				logger.debug("handle read 7...");
+			}
 
 			//Only close if not async or offloaded. In that case its up to RH or Virtual Thread to close it (+ don't close if it's a partial request).
 			if (request instanceof MalFormedHttpRequest || (!isAsyncOrOffloaded && request.isComplete())) {
@@ -561,16 +914,18 @@ public class HttpProtocol implements IOHandler {
 	@Override
 	public void handleWrite(SelectionKey key) throws IOException {
 		SocketChannel channel = ((SocketChannel) key.channel());
-		org.deftserver.web.http.http2.Http2Connection http2Conn = http2Connections.get(channel);
+		org.deftserver.web.http.http2.Http2Connection http2Conn = getHttp2Connection(channel);
 		if (http2Conn != null) {
 			prolongKeepAliveTimeout(channel);
 			http2Conn.onWritable();
 			return;
 		}
-		Object attachment = key.attachment();
-		logger.debug("handle write... attachment={}", attachment == null ? "null" : attachment.getClass().getSimpleName());
+		Object attachment = IOLoop.getAttachment(key);
+		if (logger.isDebugEnabled()) {
+			logger.debug("handle write... attachment={}", attachment == null ? "null" : attachment.getClass().getSimpleName());
+		}
 
-		SSLSessionHandler sslHandler = sslSessionHandlers.get(channel);
+		SSLSessionHandler sslHandler = getSslSessionHandler(channel);
 		if (sslHandler != null && sslHandler.hasPendingWrite()) {
 			// OP_WRITE fired ⇒ the socket made room ⇒ the peer drained some bytes ⇒ progress: reset
 			// the idle response-write timeout so a steadily-reading client isn't reaped (only a
@@ -593,18 +948,19 @@ public class HttpProtocol implements IOHandler {
 		}
 
 		try {
-			if (key.attachment() instanceof MappedByteBuffer) {
-				logger.debug("mbb write #1");
+			Object rawAtt = IOLoop.getAttachment(key);
+			if (rawAtt instanceof MappedByteBuffer) {
+				if (logger.isDebugEnabled()) logger.debug("mbb write #1");
 				writeMappedByteBuffer(key, channel);
-				logger.debug("mbb write #2");
-			} else if (key.attachment() instanceof DynamicByteBuffer) {
-				logger.debug("dbb write #1");
+				if (logger.isDebugEnabled()) logger.debug("mbb write #2");
+			} else if (rawAtt instanceof DynamicByteBuffer) {
+				if (logger.isDebugEnabled()) logger.debug("dbb write #1");
 				writeDynamicByteBuffer(key, channel);
-				logger.debug("dbb write #2");
-			} else if (key.attachment() instanceof ByteBuffer) {
-				logger.debug("bb write #1");
+				if (logger.isDebugEnabled()) logger.debug("dbb write #2");
+			} else if (rawAtt instanceof ByteBuffer) {
+				if (logger.isDebugEnabled()) logger.debug("bb write #1");
 				writeByteBuffer(key, channel);
-				logger.debug("bb write #2");
+				if (logger.isDebugEnabled()) logger.debug("bb write #2");
 			}
 		} catch (RuntimeException | IOException e) {
 			// Failure in a write helper (broken pipe, or unexpected runtime error) — close via
@@ -615,23 +971,39 @@ public class HttpProtocol implements IOHandler {
 			closeChannel(channel);
 			return;
 		}
-		if (ioLoop.hasKeepAliveTimeout(channel)) {
+		if (hasWebsocketHandler(channel)) {
+			prolongWebSocketIdleTimeout(channel);
+		} else if (ioLoop.hasKeepAliveTimeout(channel)) {
 			prolongKeepAliveTimeout(channel);
 		}
-	}
-
-	public SSLSessionHandler getSslSessionHandler(SocketChannel channel) {
-		return sslSessionHandlers.get(channel);
 	}
 
 	/** Writes from {@code src} to the channel, transparently encrypting via the TLS engine if this is
 	 *  an HTTPS connection; otherwise a direct non-blocking socket write. Returns the byte count. */
 	public int write(SocketChannel channel, ByteBuffer src) throws IOException {
-		SSLSessionHandler sslHandler = sslSessionHandlers.get(channel);
+		SSLSessionHandler sslHandler = getSslSessionHandler(channel);
 		if (sslHandler != null) {
 			return writeSecurely(channel, src, sslHandler);
 		} else {
 			return channel.write(src);
+		}
+	}
+
+	public long write(SocketChannel channel, ByteBuffer[] srcs) throws IOException {
+		SSLSessionHandler sslHandler = getSslSessionHandler(channel);
+		if (sslHandler != null) {
+			long written = 0;
+			for (ByteBuffer src : srcs) {
+				if (src.hasRemaining()) {
+					written += writeSecurely(channel, src, sslHandler);
+					if (src.hasRemaining()) {
+						break;
+					}
+				}
+			}
+			return written;
+		} else {
+			return channel.write(srcs);
 		}
 	}
 
@@ -687,16 +1059,65 @@ public class HttpProtocol implements IOHandler {
 		return total;
 	}
 
-	/**
-	 * SSL-aware, fully-blocking write for control messages that must be flushed immediately
-	 * (100-Continue, WebSocket frames). Routes through the TLS layer when enabled.
-	 */
+	private static long writeFully(SocketChannel channel, ByteBuffer[] srcs) throws IOException {
+		long total = 0;
+		long stallDeadline = 0;
+		final long absoluteDeadline = System.nanoTime()
+			+ HttpServerDescriptor.RESPONSE_WRITE_TIMEOUT_MS * 1_000_000L;
+		boolean hasRemaining = true;
+		while (hasRemaining) {
+			hasRemaining = false;
+			for (ByteBuffer buf : srcs) {
+				if (buf.hasRemaining()) {
+					hasRemaining = true;
+					break;
+				}
+			}
+			if (!hasRemaining) {
+				break;
+			}
+			long n = channel.write(srcs);
+			if (n > 0) {
+				total += n;
+				stallDeadline = 0;
+				if (System.nanoTime() - absoluteDeadline > 0) {
+					throw new IOException("Response write exceeded the write-timeout (slow reader); aborting connection");
+				}
+			} else {
+				long now = System.nanoTime();
+				if (now - absoluteDeadline > 0) {
+					throw new IOException("Response write exceeded the write-timeout (slow reader); aborting connection");
+				}
+				if (stallDeadline == 0) {
+					stallDeadline = now + WRITE_STALL_TIMEOUT_NS;
+				} else if (now - stallDeadline > 0) {
+					throw new IOException("Socket write stalled (peer not reading); aborting connection");
+				}
+				java.util.concurrent.locks.LockSupport.parkNanos(200_000L);
+			}
+		}
+		return total;
+	}
+
 	public void writeBlocking(SocketChannel channel, ByteBuffer src) throws IOException {
-		SSLSessionHandler sslHandler = sslSessionHandlers.get(channel);
+		SSLSessionHandler sslHandler = getSslSessionHandler(channel);
 		if (sslHandler != null) {
 			writeFully(channel, sslHandler.wrap(src));
 		} else {
 			writeFully(channel, src);
+		}
+	}
+
+	public void writeBlocking(SocketChannel channel, ByteBuffer[] srcs) throws IOException {
+		SSLSessionHandler sslHandler = getSslSessionHandler(channel);
+		if (sslHandler != null) {
+			for (ByteBuffer src : srcs) {
+				if (src.hasRemaining()) {
+					writeFully(channel, sslHandler.wrap(src));
+				}
+			}
+		} else {
+			writeFully(channel, srcs);
 		}
 	}
 
@@ -723,7 +1144,7 @@ public class HttpProtocol implements IOHandler {
 		// the stack). For a normal single-mapping response there is no FileStreamState, so this
 		// behaves exactly as before (write window → registerForRead).
 		while (true) {
-			MappedByteBuffer mbb = (MappedByteBuffer) key.attachment();
+			MappedByteBuffer mbb = (MappedByteBuffer) IOLoop.getAttachment(key);
 			if (mbb.hasRemaining()) {
 				int written = 0;
 				do {
@@ -737,15 +1158,15 @@ public class HttpProtocol implements IOHandler {
 				key.interestOps(SelectionKey.OP_WRITE); // send buffer full — resume on next OP_WRITE
 				return bytesWritten;
 			}
-			FileStreamState fs = fileStreams.get(channel);
+			FileStreamState fs = getFileStream(channel);
 			if (fs != null && fs.pos < fs.end) {
 				long windowLen = Math.min((long) FILE_WINDOW_SIZE, fs.end - fs.pos);
 				MappedByteBuffer next = fs.fc.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, fs.pos, windowLen);
 				fs.pos += windowLen;
-				key.attach(next);
+				IOLoop.setAttachment(key, next);
 				// loop to write the next window
 			} else {
-				SSLSessionHandler sslHandler = sslSessionHandlers.get(channel);
+				SSLSessionHandler sslHandler = getSslSessionHandler(channel);
 				if (sslHandler != null && sslHandler.hasPendingWrite()) {
 					key.interestOps(SelectionKey.OP_WRITE);
 					return bytesWritten;
@@ -774,18 +1195,18 @@ public class HttpProtocol implements IOHandler {
 		boolean handedOff = false;
 		try {
 			FileStreamState state = new FileStreamState(raf, raf.getChannel(), start, start + length);
-			fileStreams.put(channel, state);
+			putFileStream(channel, state);
 			long windowLen = Math.min((long) FILE_WINDOW_SIZE, state.end - state.pos);
 			MappedByteBuffer mbb = state.fc.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, state.pos, windowLen);
 			state.pos += windowLen;
-			key.attach(mbb);
+			IOLoop.setAttachment(key, mbb);
 			writeMappedByteBuffer(key, channel);
 			handedOff = true;
 		} finally {
 			if (!handedOff) {
 				// closeFileStream both drops the (possibly-registered) state and closes the handle;
 				// fall back to a direct close if the state never made it into the map.
-				if (fileStreams.containsKey(channel)) {
+				if (getFileStream(channel) != null) {
 					closeFileStream(channel);
 				} else {
 					try { raf.close(); } catch (IOException ignore) { }
@@ -796,7 +1217,7 @@ public class HttpProtocol implements IOHandler {
 
 	/** Releases the open file handle for an in-progress large-file stream on the channel, if any. */
 	private void closeFileStream(SocketChannel channel) {
-		FileStreamState state = fileStreams.remove(channel);
+		FileStreamState state = removeFileStream(channel);
 		if (state != null) {
 			try { state.raf.close(); } catch (IOException ignore) { }
 		}
@@ -805,8 +1226,10 @@ public class HttpProtocol implements IOHandler {
 	/** Writes the dynamic response buffer attached to the key; on completion honours a deferred
 	 *  Connection: close or re-registers for the next request, else defers the remainder to OP_WRITE. */
 	private long writeDynamicByteBuffer(SelectionKey key, SocketChannel channel) throws IOException {
-		DynamicByteBuffer dbb = (DynamicByteBuffer) key.attachment();
-		logger.debug("pending data about to be written");
+		DynamicByteBuffer dbb = (DynamicByteBuffer) IOLoop.getAttachment(key);
+		if (logger.isDebugEnabled()) {
+			logger.debug("pending data about to be written");
+		}
 		ByteBuffer toSend = dbb.getByteBuffer();
 		if (!toSend.isReadOnly()) toSend.flip(); // prepare for write
 		long bytesWritten = 0;
@@ -819,14 +1242,18 @@ public class HttpProtocol implements IOHandler {
 				}
 			} while (written > 0 && toSend.hasRemaining());
 		}
-		logger.debug("sent {} bytes to wire", bytesWritten);
+		if (logger.isDebugEnabled()) {
+			logger.debug("sent {} bytes to wire", bytesWritten);
+		}
 		if (!toSend.hasRemaining()) {
-			SSLSessionHandler sslHandler = sslSessionHandlers.get(channel);
+			SSLSessionHandler sslHandler = getSslSessionHandler(channel);
 			if (sslHandler != null && sslHandler.hasPendingWrite()) {
 				if (!toSend.isReadOnly()) toSend.compact();
 				key.interestOps(SelectionKey.OP_WRITE);
 			} else {
-				logger.debug("sent all data in toSend buffer");
+				if (logger.isDebugEnabled()) {
+					logger.debug("sent all data in toSend buffer");
+				}
 				// Honour a deferred Connection: close, otherwise re-register for the next request.
 				finishDeferredWrite(key, channel);
 			}
@@ -840,8 +1267,10 @@ public class HttpProtocol implements IOHandler {
 	/** Writes a plain {@link ByteBuffer} attached to the key (same completion semantics as
 	 *  {@link #writeDynamicByteBuffer}). */
 	private long writeByteBuffer(SelectionKey key, SocketChannel channel) throws IOException {
-		ByteBuffer toSend = (ByteBuffer) key.attachment();
-		logger.debug("pending data about to be written");
+		ByteBuffer toSend = (ByteBuffer) IOLoop.getAttachment(key);
+		if (logger.isDebugEnabled()) {
+			logger.debug("pending data about to be written");
+		}
 		if (!toSend.isReadOnly()) toSend.flip(); // prepare for write
 		long bytesWritten = 0;
 		if (toSend.hasRemaining()) {
@@ -852,15 +1281,19 @@ public class HttpProtocol implements IOHandler {
 					bytesWritten += written;
 				}
 			} while (written > 0 && toSend.hasRemaining());
-			logger.debug("sent {} bytes to wire", bytesWritten);
+			if (logger.isDebugEnabled()) {
+				logger.debug("sent {} bytes to wire", bytesWritten);
+			}
 		}
 		if (!toSend.hasRemaining()) {
-			SSLSessionHandler sslHandler = sslSessionHandlers.get(channel);
+			SSLSessionHandler sslHandler = getSslSessionHandler(channel);
 			if (sslHandler != null && sslHandler.hasPendingWrite()) {
 				if (!toSend.isReadOnly()) toSend.compact();
 				key.interestOps(SelectionKey.OP_WRITE);
 			} else {
-				logger.debug("sent all data in toSend buffer");
+				if (logger.isDebugEnabled()) {
+					logger.debug("sent all data in toSend buffer");
+				}
 				// Honour a deferred Connection: close, otherwise re-register for the next request.
 				finishDeferredWrite(key, channel);
 			}
@@ -875,7 +1308,7 @@ public class HttpProtocol implements IOHandler {
 	 *  deferred response write completes — used when a Connection: close response didn't fit the
 	 *  socket buffer in one flush. */
 	public void markCloseAfterWrite(SocketChannel channel) {
-		closeAfterWrite.add(channel);
+		addCloseAfterWrite(channel);
 	}
 
 	/**
@@ -904,20 +1337,20 @@ public class HttpProtocol implements IOHandler {
 			ioLoop.addKeepAliveTimeout(channel, pt);
 		} else {
 			// Connection: close — no keep-alive timer; track this one separately (cleaned by closeChannel).
-			Timeout existing = processingTimeouts.remove(channel);
+			Timeout existing = removeProcessingTimeout(channel);
 			if (existing != null) existing.cancel();
-			processingTimeouts.put(channel, pt);
+			putProcessingTimeout(channel, pt);
 			ioLoop.addTimeout(pt);
 		}
 	}
 
 	public void handleConnectionIdle(SelectionKey key, SocketChannel channel) throws IOException {
 		if (key.isValid()) {
-			ByteBuffer buf = readBuffers.get(channel);
+			ByteBuffer buf = getReadBuffer(channel);
 			if (buf != null && buf.position() > 0) {
 				prolongKeepAliveTimeout(channel);
 				key.interestOps(0);
-				key.attach(buf);
+				IOLoop.setAttachment(key, buf);
 				ioLoop.addCallback(new AsyncCallback() {
 					@Override
 					public void onCallback() {
@@ -939,7 +1372,7 @@ public class HttpProtocol implements IOHandler {
 
 	private void finishDeferredWrite(SelectionKey key, SocketChannel channel) throws IOException {
 		cancelWriteTimeout(channel); // the deferred write completed — no longer a slow-reader risk
-		if (closeAfterWrite.remove(channel)) {
+		if (removeCloseAfterWrite(channel)) {
 			closeChannel(channel);
 		} else {
 			handleConnectionIdle(key, channel);
@@ -948,7 +1381,7 @@ public class HttpProtocol implements IOHandler {
 
 	/** Arms (once) the idle response-write timeout for a deferred (non-blocking TLS) write. Idempotent. */
 	public void armWriteTimeout(SocketChannel channel) {
-		if (channel == null || writeTimeouts.containsKey(channel)) {
+		if (channel == null || getWriteTimeout(channel) != null) {
 			return;
 		}
 		Timeout t = new Timeout(
@@ -959,14 +1392,14 @@ public class HttpProtocol implements IOHandler {
 					closeChannel(channel);
 				}
 			});
-		writeTimeouts.put(channel, t);
+		putWriteTimeout(channel, t);
 		ioLoop.addTimeout(t);
 	}
 
 	/** Resets the idle response-write timeout on write progress (the peer drained some bytes). No-op
 	 *  if no write timeout is currently armed. */
 	public void prolongWriteTimeout(SocketChannel channel) {
-		Timeout old = writeTimeouts.remove(channel);
+		Timeout old = removeWriteTimeout(channel);
 		if (old == null) {
 			return;
 		}
@@ -976,7 +1409,7 @@ public class HttpProtocol implements IOHandler {
 
 	/** Cancels the response-write timeout (the deferred write completed or the channel is closing). */
 	public void cancelWriteTimeout(SocketChannel channel) {
-		Timeout t = writeTimeouts.remove(channel);
+		Timeout t = removeWriteTimeout(channel);
 		if (t != null) {
 			t.cancel();
 		}
@@ -986,7 +1419,10 @@ public class HttpProtocol implements IOHandler {
 	 *  the connection is keep-alive (refreshing the idle timeout), otherwise closes it. */
 	public void registerForRead(SelectionKey key) throws IOException {
 		if (key.isValid()) {
-			if (ioLoop.hasKeepAliveTimeout(key.channel())) {
+			if (hasWebsocketHandler(key.channel())) {
+				key.channel().register(key.selector(), SelectionKey.OP_READ, reuseAttachment(key));
+				logger.debug("websocket connection. registering for read.");
+			} else if (ioLoop.hasKeepAliveTimeout(key.channel())) {
 				key.channel().register(key.selector(), SelectionKey.OP_READ, reuseAttachment(key));
 				prolongKeepAliveTimeout(key.channel());
 				logger.debug("keep-alive connection. registrating for read.");
@@ -1047,12 +1483,12 @@ public class HttpProtocol implements IOHandler {
 	 */
 	private ByteBuffer reuseAttachment(SelectionKey key) {
 		SocketChannel channel = (SocketChannel) key.channel();
-		ByteBuffer buf = readBuffers.get(channel);
+		ByteBuffer buf = getReadBuffer(channel);
 		if (buf != null) {
 			buf.clear();
 			return buf;
 		}
-		Object o = key.attachment();
+		Object o = IOLoop.getAttachment(key);
 		ByteBuffer attachment = null;
 		if (o instanceof MappedByteBuffer) {
 			attachment = ByteBuffer.allocate(READ_BUFFER_SIZE);
@@ -1070,9 +1506,13 @@ public class HttpProtocol implements IOHandler {
 
 	//TODO: change this to work with the entire stream rather than individual calls (no guarantee the client sends their data wholly in discrete packets)
 	private HttpRequest getHttpRequest(SelectionKey key, SocketChannel clientChannel) throws IOException {
-		ByteBuffer buffer = readBuffers.computeIfAbsent(clientChannel, c -> ByteBuffer.allocate(READ_BUFFER_SIZE));
+		ByteBuffer buffer = getReadBuffer(clientChannel);
+		if (buffer == null) {
+			buffer = ByteBuffer.allocate(READ_BUFFER_SIZE);
+			putReadBuffer(clientChannel, buffer);
+		}
 		if (!buffer.hasRemaining()) throw new IllegalStateException("Cleared channel buffer has no remaining space.");
-		SSLSessionHandler sslHandler = sslSessionHandlers.get(clientChannel);
+		SSLSessionHandler sslHandler = getSslSessionHandler(clientChannel);
 		if (sslHandler != null) {
 			// Use the actual TLS packet buffer size (up to ~16 KB) — not the tiny READ_BUFFER_SIZE.
 			// Reuse a per-protocol scratch buffer rather than allocating ~16 KB on EVERY HTTPS read:
@@ -1104,7 +1544,7 @@ public class HttpProtocol implements IOHandler {
 			} catch (SSLConnectionClosedException e) {
 				logger.debug("TLS close_notify from {}: closing channel", clientChannel.getRemoteAddress());
 				sslHandler.closeQuietly();
-				sslSessionHandlers.remove(clientChannel);
+				removeSslSessionHandler(clientChannel);
 				closeChannel(clientChannel);
 				return null;
 			}
@@ -1113,20 +1553,24 @@ public class HttpProtocol implements IOHandler {
 			}
 			// If we're in the middle of receiving a body, feed directly to the partial request
 			// rather than going through the small key-attachment buffer.
-			HttpRequest partial = partials.get(clientChannel);
+			HttpRequest partial = getPartial(clientChannel);
 			if (partial != null) {
-				logger.debug("SSL partial body: feeding {} plaintext bytes directly to partial request", plaintext.remaining());
+				if (logger.isDebugEnabled()) {
+					logger.debug("SSL partial body: feeding {} plaintext bytes directly to partial request", plaintext.remaining());
+				}
 				if (partial.putContentData(true, plaintext)) {
-					partials.remove(clientChannel);
-					logger.debug("SSL partial body complete");
+					removePartial(clientChannel);
+					if (logger.isDebugEnabled()) {
+						logger.debug("SSL partial body complete");
+					}
 					if (plaintext.hasRemaining()) {
 						if (plaintext.remaining() > buffer.remaining()) {
 							ByteBuffer grown = ByteBuffer.allocate(plaintext.remaining() + buffer.position());
 							buffer.flip();
 							grown.put(buffer);
 							grown.put(plaintext);
-							key.attach(grown);
-							readBuffers.put(clientChannel, grown);
+							IOLoop.setAttachment(key, grown);
+							putReadBuffer(clientChannel, grown);
 							buffer = grown;
 						} else {
 							buffer.put(plaintext);
@@ -1146,8 +1590,8 @@ public class HttpProtocol implements IOHandler {
 				grown.put(buffer);
 				grown.put(plaintext);
 				// Swap the grown buffer into the key as the new attachment
-				key.attach(grown);
-				readBuffers.put(clientChannel, grown);
+				IOLoop.setAttachment(key, grown);
+				putReadBuffer(clientChannel, grown);
 				buffer = grown;
 			} else {
 				buffer.put(plaintext);
@@ -1171,10 +1615,8 @@ public class HttpProtocol implements IOHandler {
 			// header block arrived, grow it (up to MAX_HEADER_BUFFER_SIZE) so large-but-legal
 			// requests — long URLs, big Cookie/Authorization headers — aren't truncated into an
 			// IllegalStateException. Exceeding the cap is answered with 431. Header phase only.
-			if (!buffer.hasRemaining() && !partials.containsKey(clientChannel)) {
-				ByteBuffer scan = buffer.duplicate();
-				scan.flip();
-				if (!HttpRequest.findInBB(scan, HttpRequest.HTTP_HEAD_TERM_BYTES)) {
+			if (!buffer.hasRemaining() && !hasPartial(clientChannel)) {
+				if (!containsInBB(buffer, 0, buffer.position(), HttpRequest.HTTP_HEAD_TERM_BYTES)) {
 					if (buffer.capacity() >= MAX_HEADER_BUFFER_SIZE) {
 						throw new HttpException(431, "Request Header Fields Too Large",
 							"The request header section exceeds the maximum permitted size");
@@ -1183,8 +1625,8 @@ public class HttpProtocol implements IOHandler {
 					ByteBuffer grown = ByteBuffer.allocate(newCap);
 					buffer.flip();
 					grown.put(buffer);
-					key.attach(grown);
-					readBuffers.put(clientChannel, grown);
+					IOLoop.setAttachment(key, grown);
+					putReadBuffer(clientChannel, grown);
 					key.interestOps(SelectionKey.OP_READ);
 					return null; // resume reading the header block into the larger buffer
 				}
@@ -1196,10 +1638,8 @@ public class HttpProtocol implements IOHandler {
 		// without limit (OOM). Once we're past MAX_HEADER_BUFFER_SIZE with still no terminator
 		// and no body in progress, reject with 431. (For the plaintext path this is unreachable
 		// — it already 431s when the capped buffer fills.)
-		if (buffer.position() > MAX_HEADER_BUFFER_SIZE && !partials.containsKey(clientChannel)) {
-			ByteBuffer scan = buffer.duplicate();
-			scan.flip();
-			if (!HttpRequest.findInBB(scan, HttpRequest.HTTP_HEAD_TERM_BYTES)) {
+		if (buffer.position() > MAX_HEADER_BUFFER_SIZE && !hasPartial(clientChannel)) {
+			if (!containsInBB(buffer, 0, buffer.position(), HttpRequest.HTTP_HEAD_TERM_BYTES)) {
 				throw new HttpException(431, "Request Header Fields Too Large",
 					"The request header section exceeds the maximum permitted size");
 			}
@@ -1211,9 +1651,9 @@ public class HttpProtocol implements IOHandler {
 				buffer.get(initialBytes);
 				buffer.clear();
 				org.deftserver.web.http.http2.Http2Connection conn = new org.deftserver.web.http.http2.Http2Connection(this, key, clientChannel, initialBytes);
-				http2Connections.put(clientChannel, conn);
-				readBuffers.remove(clientChannel);
-				Timeout t = headerReadTimeouts.remove(clientChannel);
+				putHttp2Connection(clientChannel, conn);
+				removeReadBuffer(clientChannel);
+				Timeout t = removeHeaderReadTimeout(clientChannel);
 				if (t != null) t.cancel();
 				prolongKeepAliveTimeout(clientChannel);
 				conn.onReadable();
@@ -1224,12 +1664,45 @@ public class HttpProtocol implements IOHandler {
 			}
 		}
 		buffer.flip();
-		logger.debug("getHttpRequest buffer remaining: {}", buffer.remaining());
+		if (logger.isDebugEnabled()) {
+			logger.debug("getHttpRequest buffer remaining: {}", buffer.remaining());
+		}
 		HttpRequest req = doGetHttpRequest(key, clientChannel, buffer);
 		if (req == null) buffer.rewind();
 		buffer.compact(); // allow for more data to be read in
 
 		return req;
+	}
+
+	private static boolean containsInBB(ByteBuffer buffer, int start, int limit, byte[] bytes) {
+		int len = bytes.length;
+		if (len == 0) return true;
+		if (buffer.hasArray()) {
+			byte[] arr = buffer.array();
+			int offset = buffer.arrayOffset();
+			for (int i = start; i <= limit - len; i++) {
+				boolean match = true;
+				for (int j = 0; j < len; j++) {
+					if (arr[offset + i + j] != bytes[j]) {
+						match = false;
+						break;
+					}
+				}
+				if (match) return true;
+			}
+		} else {
+			for (int i = start; i <= limit - len; i++) {
+				boolean match = true;
+				for (int j = 0; j < len; j++) {
+					if (buffer.get(i + j) != bytes[j]) {
+						match = false;
+						break;
+					}
+				}
+				if (match) return true;
+			}
+		}
+		return false;
 	}
 	
 	/** Continues an in-progress (partial) request or parses a fresh one from the buffer: sends an
@@ -1242,19 +1715,22 @@ public class HttpProtocol implements IOHandler {
 			buffer.duplicate().get(arr);
 			logger.trace("Buffer received: [{}]", new String(arr, java.nio.charset.StandardCharsets.ISO_8859_1));
 		}
-		//do we have any unfinished http post requests for this channel?
-		HttpRequest request = partials.get(clientChannel);
+		HttpRequest request = getPartial(clientChannel);
 		if (request != null) {
-			logger.debug("continuing to parse partial http request - http req #{}, remaining: {}", request.getRequestNum(), request.getRemaining());
+			if (logger.isDebugEnabled()) {
+				logger.debug("continuing to parse partial http request - http req #{}, remaining: {}", request.getRequestNum(), request.getRemaining());
+			}
 			if (request.putContentData(true, buffer)) {	// if received the entire payload/body
-				logger.debug("entire partial http request received, removing - http req #{}, remaining: {}, flipremain: {}", request.getRequestNum(), request.getRemaining(), request.getFlipRemain());
-				partials.remove(clientChannel);
+				if (logger.isDebugEnabled()) {
+					logger.debug("entire partial http request received, removing - http req #{}, remaining: {}, flipremain: {}", request.getRequestNum(), request.getRemaining(), request.getFlipRemain());
+				}
+				removePartial(clientChannel);
 			} else {
 				key.interestOps(SelectionKey.OP_READ);
 			}
 		} else {
 			try {
-				if (!HttpRequest.findInBB(buffer.duplicate(), HttpRequest.HTTP_HEAD_TERM_BYTES)) {
+				if (!containsInBB(buffer, buffer.position(), buffer.limit(), HttpRequest.HTTP_HEAD_TERM_BYTES)) {
 					key.interestOps(SelectionKey.OP_READ);
 					return null;
 				}
@@ -1278,15 +1754,21 @@ public class HttpProtocol implements IOHandler {
 						if (clen > HttpRequest.MAX_BODY_SIZE) {
 							throw new HttpException(413, "Payload Too Large", "Payload size exceeds maximum allowed limit");
 						}
-						ByteBuffer continueResponse = ByteBuffer.wrap("HTTP/1.1 100 Continue\r\n\r\n".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+						ByteBuffer continueResponse = ByteBuffer.wrap(CONTINUE_BYTES);
 						writeBlocking(clientChannel, continueResponse);
-						logger.debug("Sent HTTP/1.1 100 Continue early response");
+						if (logger.isDebugEnabled()) {
+							logger.debug("Sent HTTP/1.1 100 Continue early response");
+						}
 					}
-					logger.debug("adding partial http request - http req #{}, remaining: {}", request.getRequestNum(), request.getRemaining());
-					partials.put(key.channel(), request);
+					if (logger.isDebugEnabled()) {
+						logger.debug("adding partial http request - http req #{}, remaining: {}", request.getRequestNum(), request.getRemaining());
+					}
+					putPartial(key.channel(), request);
 					key.interestOps(SelectionKey.OP_READ);
 				} else {
-					logger.debug("normal HttpRequest");
+					if (logger.isDebugEnabled()) {
+						logger.debug("normal HttpRequest");
+					}
 				}
 			} catch (IOException | IllegalArgumentException e) {
 				request = MalFormedHttpRequest.instance;
@@ -1306,7 +1788,7 @@ public class HttpProtocol implements IOHandler {
 			request.setServerHost(clientChannel.socket().getLocalAddress());
 			request.setServerPort(clientChannel.socket().getLocalPort());
 		}
-		request.setSecure(sslSessionHandlers.containsKey(clientChannel));
+		request.setSecure(getSslSessionHandler(clientChannel) != null);
 		return request;
 	}
 	
@@ -1314,16 +1796,16 @@ public class HttpProtocol implements IOHandler {
 	 *  reassembles fragmented messages (bounded), answers ping/close control frames, validates UTF-8
 	 *  text, and dispatches complete messages to the handler. Prolongs the idle timeout on activity. */
 	private void handleWebSocketRead(SelectionKey key, SocketChannel clientChannel, WebSocketHandler wsHandler) throws IOException {
-		WebSocketConnection wsConn = websocketConnections.get(clientChannel);
-		ByteBuffer buffer = (ByteBuffer) key.attachment();
+		WebSocketConnection wsConn = getWebsocketConnection(clientChannel);
+		ByteBuffer buffer = (ByteBuffer) IOLoop.getAttachment(key);
 		if (buffer == null) {
 			buffer = ByteBuffer.allocate(READ_BUFFER_SIZE);
-			key.attach(buffer);
+			IOLoop.setAttachment(key, buffer);
 		}
 		int bytesRead;
 		try {
 			// Decrypt if SSL active
-			SSLSessionHandler sslHandler = sslSessionHandlers.get(clientChannel);
+			SSLSessionHandler sslHandler = getSslSessionHandler(clientChannel);
 			if (sslHandler != null) {
 				// Read into netReadBuf and unwrap
 				ByteBuffer netReadBuf = ByteBuffer.allocate(READ_BUFFER_SIZE);
@@ -1344,7 +1826,7 @@ public class HttpProtocol implements IOHandler {
 						ByteBuffer temp = ByteBuffer.allocate(appReadBuf.remaining() + buffer.capacity());
 						temp.put(buffer);
 						buffer = temp;
-						key.attach(buffer);
+						IOLoop.setAttachment(key, buffer);
 					}
 					bytesRead = appReadBuf.remaining();
 					buffer.put(appReadBuf);
@@ -1458,7 +1940,7 @@ public class HttpProtocol implements IOHandler {
 					bigger.put(buffer);   // copy the unparsed [mark, limit) bytes
 					bigger.flip();        // back to read mode for the trailing compact()
 					buffer = bigger;
-					key.attach(buffer);
+					IOLoop.setAttachment(key, buffer);
 				}
 				break; // entire payload not yet received
 			}
@@ -1513,7 +1995,7 @@ public class HttpProtocol implements IOHandler {
 				// Reassemble fragmented messages: a data frame with FIN=0 begins a message that
 				// is continued by opcode-0x0 frames until one arrives with FIN=1. Control frames
 				// may be interleaved (handled above) and do not affect this state.
-				java.io.ByteArrayOutputStream msgBuf = websocketFragments.get(clientChannel);
+				java.io.ByteArrayOutputStream msgBuf = getWebsocketFragment(clientChannel);
 				if (opcode != 0x0) {
 					// Start of a new data message. A new data frame while one is still in
 					// progress is a protocol violation.
@@ -1523,7 +2005,7 @@ public class HttpProtocol implements IOHandler {
 						return;
 					}
 					msgBuf = new java.io.ByteArrayOutputStream();
-					websocketTextMessage.put(clientChannel, opcode == 0x1); // text vs binary
+					putWebsocketTextMessage(clientChannel, opcode == 0x1); // text vs binary
 				} else if (msgBuf == null) {
 					// Continuation frame with no message in progress — protocol violation.
 					logger.warn("WebSocket: continuation frame without a started message — closing");
@@ -1537,17 +2019,15 @@ public class HttpProtocol implements IOHandler {
 				}
 				msgBuf.write(payload, 0, payload.length);
 				if (fin) {
-					boolean isText = Boolean.TRUE.equals(websocketTextMessage.remove(clientChannel));
+					boolean isText = Boolean.TRUE.equals(removeWebsocketTextMessage(clientChannel));
 					byte[] msgBytes = msgBuf.toByteArray();
-					websocketFragments.remove(clientChannel);
+					removeWebsocketFragment(clientChannel);
 					String textMsg = null;
 					if (isText) {
-						// RFC 6455 §8.1: a text message that isn't valid UTF-8 must fail the connection.
 						try {
-							textMsg = java.nio.charset.StandardCharsets.UTF_8.newDecoder()
-								.onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
-								.onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
-								.decode(ByteBuffer.wrap(msgBytes)).toString();
+							java.nio.charset.CharsetDecoder decoder = utf8Decoder.get();
+							decoder.reset();
+							textMsg = decoder.decode(ByteBuffer.wrap(msgBytes)).toString();
 						} catch (java.nio.charset.CharacterCodingException e) {
 							logger.warn("WebSocket text message is not valid UTF-8 — closing (RFC 6455 §8.1)");
 							closeChannel(clientChannel);
@@ -1569,7 +2049,7 @@ public class HttpProtocol implements IOHandler {
 					}
 				} else {
 					// More fragments to come; stash the in-progress buffer.
-					websocketFragments.put(clientChannel, msgBuf);
+					putWebsocketFragment(clientChannel, msgBuf);
 				}
 			}
 		}
@@ -1591,14 +2071,17 @@ public class HttpProtocol implements IOHandler {
 		}
 	}
 
-	/** True if {@code [offset, offset+length)} of {@code data} decodes as strict UTF-8 (no malformed
-	 *  or unmappable sequences) — used to validate a WebSocket Close-frame reason (RFC 6455 §8.1). */
+	private static final ThreadLocal<java.nio.charset.CharsetDecoder> utf8Decoder = ThreadLocal.withInitial(() -> 
+		java.nio.charset.StandardCharsets.UTF_8.newDecoder()
+			.onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+			.onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+	);
+
 	private static boolean isValidUtf8(byte[] data, int offset, int length) {
 		try {
-			java.nio.charset.StandardCharsets.UTF_8.newDecoder()
-				.onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
-				.onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
-				.decode(ByteBuffer.wrap(data, offset, length));
+			java.nio.charset.CharsetDecoder decoder = utf8Decoder.get();
+			decoder.reset();
+			decoder.decode(ByteBuffer.wrap(data, offset, length));
 			return true;
 		} catch (java.nio.charset.CharacterCodingException e) {
 			return false;
@@ -1624,7 +2107,7 @@ public class HttpProtocol implements IOHandler {
 	}
 
 	public ByteBuffer readPlaintext(SocketChannel clientChannel) throws IOException {
-		SSLSessionHandler sslHandler = sslSessionHandlers.get(clientChannel);
+		SSLSessionHandler sslHandler = getSslSessionHandler(clientChannel);
 		if (sslHandler != null) {
 			int pktSize = sslHandler.getPacketBufferSize();
 			if (sslReadScratch == null || sslReadScratch.capacity() < pktSize) {
@@ -1650,14 +2133,41 @@ public class HttpProtocol implements IOHandler {
 	}
 
 	private static boolean isUnixSocket(SocketChannel channel) {
-		try {
-			channel.socket();
-			return false;
-		} catch (UnsupportedOperationException e) {
+		String className = channel.getClass().getName();
+		if (className.contains("UnixDomainSocketChannel")) {
 			return true;
 		}
+		try {
+			java.net.SocketAddress local = channel.getLocalAddress();
+			if (local != null && local.getClass().getName().contains("UnixDomainSocketAddress")) {
+				return true;
+			}
+			java.net.SocketAddress remote = channel.getRemoteAddress();
+			if (remote != null && remote.getClass().getName().contains("UnixDomainSocketAddress")) {
+				return true;
+			}
+		} catch (Exception e) {}
+		return false;
 	}
 
 	@Override
 	public String toString() { return "HttpProtocol"; }
+
+	private void rebuildIpConnectionCounts() {
+		for (ChannelState state : connectionStates.values()) {
+			state.ip = null;
+		}
+		ipConnectionCounts.clear();
+		for (SocketChannel ch : activeChannels) {
+			if (!isUnixSocket(ch)) {
+				try {
+					java.net.InetAddress ip = ch.socket().getInetAddress();
+					if (ip != null) {
+						putChannelIp(ch, ip);
+						ipConnectionCounts.put(ip, ipConnectionCounts.getOrDefault(ip, 0) + 1);
+					}
+				} catch (Exception ignore) {}
+			}
+		}
+	}
 }

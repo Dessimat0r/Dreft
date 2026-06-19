@@ -37,6 +37,20 @@ public class AsynchronousSocket implements IOHandler {
 
 	private static DnsResolver dnsResolver = java.net.InetSocketAddress::new;
 
+	private static final java.util.concurrent.ExecutorService dnsExecutor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
+
+	private static class DnsCacheEntry {
+		final InetSocketAddress address;
+		final long expiry;
+		DnsCacheEntry(InetSocketAddress address, long expiry) {
+			this.address = address;
+			this.expiry = expiry;
+		}
+	}
+
+	private static final java.util.concurrent.ConcurrentHashMap<String, DnsCacheEntry> dnsCache = new java.util.concurrent.ConcurrentHashMap<>();
+	private static final long DNS_CACHE_TTL_MS = 10000;
+
 	/** Overrides the DNS resolver used for connects (e.g. to inject a stub in tests); defaults to the
 	 *  blocking {@link java.net.InetSocketAddress} resolution run on a virtual thread. */
 	public static void setDnsResolver(DnsResolver resolver) {
@@ -123,9 +137,18 @@ public class AsynchronousSocket implements IOHandler {
 			ioLoop.updateHandler(channel, interestOps);
 		});
 		if (channel instanceof SocketChannel) {
-			Thread.startVirtualThread(() -> {
+			dnsExecutor.submit(() -> {
 				try {
-					final InetSocketAddress address = dnsResolver.resolve(host, port);
+					final InetSocketAddress address;
+					String cacheKey = host + ":" + port;
+					long now = System.currentTimeMillis();
+					DnsCacheEntry entry = dnsCache.get(cacheKey);
+					if (entry != null && entry.expiry > now) {
+						address = entry.address;
+					} else {
+						address = dnsResolver.resolve(host, port);
+						dnsCache.put(cacheKey, new DnsCacheEntry(address, System.currentTimeMillis() + DNS_CACHE_TTL_MS));
+					}
 					ioLoop.addCallback(() -> {
 						try {
 							((SocketChannel) channel).connect(address);
@@ -212,8 +235,6 @@ public class AsynchronousSocket implements IOHandler {
 	}
 	
 	private final ByteBuffer READ_BUFFER = ByteBuffer.allocate(DEFAULT_BYTEBUFFER_SIZE);
-	private static final ThreadLocal<java.nio.charset.CharsetDecoder> DECODER =
-		ThreadLocal.withInitial(() -> StandardCharsets.ISO_8859_1.newDecoder());
 	
 	/**
 	 * Should only be invoked by the IOLoop
@@ -234,9 +255,21 @@ public class AsynchronousSocket implements IOHandler {
 			} while (read > 0 && READ_BUFFER.hasRemaining());
 		}
 		READ_BUFFER.flip();
-		// Decode directly into a char[] via a reusable CharsetDecoder, avoiding an intermediate String allocation.
-		java.nio.CharBuffer decoded = DECODER.get().decode(READ_BUFFER);
-		readBuffer.append(decoded);
+		int length = READ_BUFFER.remaining();
+		if (length > 0) {
+			if (READ_BUFFER.hasArray()) {
+				byte[] array = READ_BUFFER.array();
+				int offset = READ_BUFFER.arrayOffset() + READ_BUFFER.position();
+				readBuffer.ensureCapacity(readBuffer.length() + length);
+				for (int i = 0; i < length; i++) {
+					readBuffer.append((char) (array[offset + i] & 0xFF));
+				}
+			} else {
+				for (int i = 0; i < length; i++) {
+					readBuffer.append((char) (READ_BUFFER.get() & 0xFF));
+				}
+			}
+		}
 		if (read == -1) {	// EOF
 			reachedEOF = true;
 			ioLoop.updateHandler(channel, interestOps &= ~SelectionKey.OP_READ);
@@ -379,8 +412,7 @@ public class AsynchronousSocket implements IOHandler {
 	 */
 	public void write(String data, AsyncCallback wcb) {
 		logger.debug("write data: {}", data);
-		byte[] bytes = data.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
-		writeBuffer.put(bytes);
+		writeBuffer.put(data);
 		logger.debug("writeBuffer size: {}", writeBuffer.position());
 		writeCallback = wcb;
 		doWrite();

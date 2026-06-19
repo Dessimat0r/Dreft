@@ -38,9 +38,9 @@ public class DateUtil {
 
 	private static volatile long lastSeconds = 0;
 	private static volatile String cachedDateString = "";
+	private static volatile long lastFormattedMillis = -1;
+	private static volatile String cachedFormattedString = "";
 
-	/** The current time as an IMF-fixdate string for the response {@code Date} header, cached to
-	 *  one-second granularity (double-checked) so the formatter runs at most once per second. */
 	public static String getCurrentAsString() {
 		long nowSeconds = System.currentTimeMillis() / 1000;
 		if (nowSeconds != lastSeconds) {
@@ -54,9 +54,21 @@ public class DateUtil {
 		return cachedDateString;
 	}
 
-	/** Formats an epoch-milliseconds instant as a strict IMF-fixdate (e.g. for {@code Last-Modified}). */
 	public static String formatToRFC1123(long epochMillis) {
-		return OUTPUT_FORMATTER.format(ZonedDateTime.ofInstant(Instant.ofEpochMilli(epochMillis), GMT_ZONE));
+		long cachedMillis = lastFormattedMillis;
+		String cachedStr = cachedFormattedString;
+		if (epochMillis == cachedMillis && cachedStr != null && !cachedStr.isEmpty()) {
+			return cachedStr;
+		}
+		synchronized (DateUtil.class) {
+			if (epochMillis == lastFormattedMillis) {
+				return cachedFormattedString;
+			}
+			String formatted = OUTPUT_FORMATTER.format(ZonedDateTime.ofInstant(Instant.ofEpochMilli(epochMillis), GMT_ZONE));
+			cachedFormattedString = formatted;
+			lastFormattedMillis = epochMillis;
+			return formatted;
+		}
 	}
 
 	/** Parses an HTTP-date in any of the three RFC 9110 formats (IMF-fixdate, obsolete RFC 850,
@@ -64,19 +76,20 @@ public class DateUtil {
 	public static long parseRFC1123ToMillis(String httpDate) {
 		if (httpDate == null) return -1;
 		httpDate = httpDate.trim();
-		// IMF-fixdate (the common case) first.
-		try {
-			return ZonedDateTime.parse(httpDate, IMF_FIXDATE).toInstant().toEpochMilli();
-		} catch (Exception ignore) { /* try next format */ }
-		// Obsolete RFC 850.
-		try {
-			return ZonedDateTime.parse(httpDate, RFC850).toInstant().toEpochMilli();
-		} catch (Exception ignore) { /* try next format */ }
-		// asctime (no zone in the string → interpret as GMT).
-		try {
-			return java.time.LocalDateTime.parse(httpDate, ASCTIME).atZone(GMT_ZONE).toInstant().toEpochMilli();
-		} catch (Exception ignore) {
-			return -1;
+		int len = httpDate.length();
+		if ((len == 29 || len == 28) && httpDate.endsWith("GMT") && httpDate.charAt(3) == ',') {
+			try {
+				return ZonedDateTime.parse(httpDate, IMF_FIXDATE).toInstant().toEpochMilli();
+			} catch (Exception ignore) {}
+		} else if (httpDate.contains("-")) {
+			try {
+				return ZonedDateTime.parse(httpDate, RFC850).toInstant().toEpochMilli();
+			} catch (Exception ignore) {}
+		} else if (len == 24) {
+			try {
+				return java.time.LocalDateTime.parse(httpDate, ASCTIME).atZone(GMT_ZONE).toInstant().toEpochMilli();
+			} catch (Exception ignore) {}
 		}
+		return -1;
 	}
 }

@@ -4,7 +4,6 @@ import java.io.IOException;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
 
 import org.deftserver.web.HttpVerb;
@@ -21,8 +20,9 @@ import org.deftserver.web.http.WebSocketConnection;
  */
 public abstract class WebSocketHandler extends RequestHandler {
 
-	/** RFC 6455 §1.3 magic GUID concatenated with the client key to derive Sec-WebSocket-Accept. */
 	private static final String MAGIC_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+	private static final byte[] MAGIC_GUID_BYTES = MAGIC_GUID.getBytes(StandardCharsets.US_ASCII);
+	private static final Base64.Encoder B64_ENCODER = Base64.getEncoder();
 
 	/** Performs the WebSocket opening handshake: a valid Upgrade request gets a 101 + accept key and
 	 *  is upgraded (then {@code onOpen} fires); an unsupported version gets 426; anything else 400. */
@@ -49,15 +49,15 @@ public abstract class WebSocketHandler extends RequestHandler {
 
 		if (upgradeRequested) {
 
-			String acceptKey = calculateAcceptKey(key);
+			SocketChannel clientChannel = response.getChannel();
+			HttpProtocol protocol = response.getProtocol();
+			String acceptKey = calculateAcceptKey(key, protocol.getIOLoop());
 			response.setStatusCode(101);
 			response.setHeader("Upgrade", "websocket");
 			response.setHeader("Connection", "Upgrade");
 			response.setHeader("Sec-WebSocket-Accept", acceptKey);
 			response.finish(); // flush response headers
 
-			SocketChannel clientChannel = response.getChannel();
-			HttpProtocol protocol = response.getProtocol();
 			WebSocketConnection wsConn = new WebSocketConnection(clientChannel, protocol);
 			protocol.upgradeToWebSocket(clientChannel, this, wsConn);
 			onOpen(wsConn);
@@ -75,16 +75,23 @@ public abstract class WebSocketHandler extends RequestHandler {
 		return verb == HttpVerb.GET;
 	}
 
-	/** Computes the {@code Sec-WebSocket-Accept} value: base64(SHA-1(clientKey + MAGIC_GUID)). */
-	private String calculateAcceptKey(String key) {
-		try {
-			String input = key.trim() + MAGIC_GUID;
-			MessageDigest md = MessageDigest.getInstance("SHA-1");
-			byte[] hashBytes = md.digest(input.getBytes(StandardCharsets.US_ASCII));
-			return Base64.getEncoder().encodeToString(hashBytes);
-		} catch (NoSuchAlgorithmException e) {
-			throw new RuntimeException("SHA-1 algorithm not available", e);
+	private static String calculateAcceptKey(String key, org.deftserver.io.IOLoop ioLoop) {
+		int start = 0;
+		int end = key.length();
+		while (start < end && key.charAt(start) <= ' ') {
+			start++;
 		}
+		while (end > start && key.charAt(end - 1) <= ' ') {
+			end--;
+		}
+		MessageDigest sha1 = ioLoop.getSha1();
+		sha1.reset();
+		for (int i = start; i < end; i++) {
+			sha1.update((byte) key.charAt(i));
+		}
+		sha1.update(MAGIC_GUID_BYTES);
+		byte[] hashBytes = sha1.digest();
+		return B64_ENCODER.encodeToString(hashBytes);
 	}
 
 	/** True if the comma-separated token list contains the given token (case-insensitive). */

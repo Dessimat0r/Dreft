@@ -74,6 +74,63 @@ public class StaticContentHandler extends RequestHandler {
 
 	private final static java.util.concurrent.ConcurrentHashMap<String, FolderConfig> configCache = new java.util.concurrent.ConcurrentHashMap<>();
 
+	private static final String ETAG_SUFFIX_BR = "-br";
+	private static final String ETAG_SUFFIX_ZSTD = "-zstd";
+	private static final String ETAG_SUFFIX_GZIP = "-gzip";
+
+	private static class FileMetadata {
+		final long lastModified;
+		final String lastModifiedStr;
+		final String etag;
+		final String mimeType;
+		final long length;
+		final long lastChecked;
+		FileMetadata(long lastModified, String lastModifiedStr, String etag, String mimeType, long length, long lastChecked) {
+			this.lastModified = lastModified;
+			this.lastModifiedStr = lastModifiedStr;
+			this.etag = etag;
+			this.mimeType = mimeType;
+			this.length = length;
+			this.lastChecked = lastChecked;
+		}
+	}
+
+	private final static java.util.concurrent.ConcurrentHashMap<String, FileMetadata> metadataCache = new java.util.concurrent.ConcurrentHashMap<>();
+	private final static java.util.concurrent.ConcurrentHashMap<String, File> pathSafetyCache = new java.util.concurrent.ConcurrentHashMap<>();
+
+	public static class MappedFileCacheEntry {
+		public final java.nio.MappedByteBuffer buffer;
+		public final long lastModified;
+		public MappedFileCacheEntry(java.nio.MappedByteBuffer buffer, long lastModified) {
+			this.buffer = buffer;
+			this.lastModified = lastModified;
+		}
+	}
+
+	public final static java.util.concurrent.ConcurrentHashMap<String, MappedFileCacheEntry> mmapCache = new java.util.concurrent.ConcurrentHashMap<>();
+	public final static long MMAP_MAX_SIZE = 1024 * 1024;
+
+	public static java.nio.ByteBuffer getMappedBuffer(File file) {
+		long len = file.length();
+		if (len > MMAP_MAX_SIZE) {
+			return null;
+		}
+		String path = file.getAbsolutePath();
+		long lastMod = file.lastModified();
+		MappedFileCacheEntry entry = mmapCache.get(path);
+		if (entry != null && entry.lastModified == lastMod) {
+			return entry.buffer.duplicate();
+		}
+		try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(file, "r")) {
+			java.nio.channels.FileChannel fc = raf.getChannel();
+			java.nio.MappedByteBuffer mbb = fc.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, 0L, len);
+			mmapCache.put(path, new MappedFileCacheEntry(mbb, lastMod));
+			return mbb.duplicate();
+		} catch (Exception e) {
+			return null;
+		}
+	}
+
 	private void runStartupCleanup() {
 		if (cacheDir == null || !java.nio.file.Files.exists(cacheDir)) {
 			return;
@@ -118,11 +175,16 @@ public class StaticContentHandler extends RequestHandler {
 			this.staticContentRoot = java.nio.file.Path.of(staticContentDir).toAbsolutePath().normalize();
 			this.cacheDir = this.staticContentRoot.resolve(".dreft");
 			configCache.clear();
+			metadataCache.clear();
+			pathSafetyCache.clear();
+			mmapCache.clear();
 			runStartupCleanup();
 		} else {
 			this.staticContentRoot = null;
 			this.cacheDir = null;
 			configCache.clear();
+			metadataCache.clear();
+			pathSafetyCache.clear();
 		}
 	}
 
@@ -133,6 +195,9 @@ public class StaticContentHandler extends RequestHandler {
 			this.cacheDir = this.staticContentRoot != null ? this.staticContentRoot.resolve(".dreft") : null;
 		}
 		configCache.clear();
+		metadataCache.clear();
+		pathSafetyCache.clear();
+		mmapCache.clear();
 		runStartupCleanup();
 	}
 
@@ -309,6 +374,7 @@ public class StaticContentHandler extends RequestHandler {
 		java.util.Map.entry("cjs", "application/javascript"),
 		java.util.Map.entry("json", "application/json"),
 		java.util.Map.entry("png", "image/png"),
+		java.util.Map.entry("webp", "image/webp"),
 		java.util.Map.entry("jpg", "image/jpeg"),
 		java.util.Map.entry("jpeg", "image/jpeg"),
 		java.util.Map.entry("gif", "image/gif"),
@@ -389,46 +455,50 @@ public class StaticContentHandler extends RequestHandler {
 	private void perform(final HttpRequest request, final HttpResponse response, boolean hasBody) throws IOException {
 		logger.debug("req: {}, resp: {}, body: {}", request, response, hasBody);
 		final String path = request.getRequestedPath();
-		// HTML-escaped form of the (attacker-controlled) path for safe reflection in error
-		// messages — defence in depth even though these go out as text/plain.
 		final String safePath = org.deftserver.util.HttpUtil.escapeHtml(path);
-		Path requested = Path.of(path.substring(1)).normalize();	// remove the leading '/'
-		if (requested.startsWith("..") || path.contains("\0")) {
-			throw new HttpException(403, "Forbidden", "Requested resource: <tt>" + safePath +  "</tt> is not allowed.");
-		}
-		
-		File file = requested.toFile();
-		if (staticContentDir != null && staticContentRoot != null) {
-			File candidate = null;
-			if (file.exists()) {
-				candidate = file;
-			} else {
-				Path absoluteRequested = Path.of(path).normalize();
-				if (absoluteRequested.isAbsolute() && !absoluteRequested.startsWith("..")) {
-					File absoluteFile = absoluteRequested.toFile();
-					if (absoluteFile.exists()) {
-						file = absoluteFile;
-						candidate = absoluteFile;
+		File file = pathSafetyCache.get(path);
+		if (file == null) {
+			Path requested = Path.of(path.substring(1)).normalize();	// remove the leading '/'
+			if (requested.startsWith("..") || path.contains("\0")) {
+				throw new HttpException(403, "Forbidden", "Requested resource: <tt>" + safePath +  "</tt> is not allowed.");
+			}
+			
+			file = requested.toFile();
+			if (staticContentDir != null && staticContentRoot != null) {
+				File candidate = null;
+				if (file.exists()) {
+					candidate = file;
+				} else {
+					Path absoluteRequested = Path.of(path).normalize();
+					if (absoluteRequested.isAbsolute() && !absoluteRequested.startsWith("..")) {
+						File absoluteFile = absoluteRequested.toFile();
+						if (absoluteFile.exists()) {
+							file = absoluteFile;
+							candidate = absoluteFile;
+						}
+					}
+				}
+
+				if (candidate != null) {
+					// Resolve symlinks (toRealPath) on BOTH sides before the boundary check: a
+					// lexical normalize() would let a symlink inside the webroot that points outside
+					// it (e.g. link -> /etc) escape the root. Compare real paths instead.
+					Path fileReal;
+					Path rootReal;
+					try {
+						fileReal = candidate.toPath().toRealPath();
+						rootReal = staticContentRoot.toRealPath();
+					} catch (IOException e) {
+						// Can't safely resolve the path — deny rather than risk an escape.
+						throw new HttpException(403, "Forbidden", "Requested resource: <tt>" + safePath + "</tt> is not allowed.");
+					}
+					if (!fileReal.startsWith(rootReal)) {
+						throw new HttpException(403, "Forbidden", "Requested resource: <tt>" + safePath + "</tt> is not allowed.");
 					}
 				}
 			}
-
-			if (candidate != null) {
-				// Resolve symlinks (toRealPath) on BOTH sides before the boundary check: a
-				// lexical normalize() would let a symlink inside the webroot that points outside
-				// it (e.g. link -> /etc) escape the root. Compare real paths instead.
-				Path fileReal;
-				Path rootReal;
-				try {
-					fileReal = candidate.toPath().toRealPath();
-					rootReal = staticContentRoot.toRealPath();
-				} catch (IOException e) {
-					// Can't safely resolve the path — deny rather than risk an escape.
-					throw new HttpException(403, "Forbidden", "Requested resource: <tt>" + safePath + "</tt> is not allowed.");
-				}
-				if (!fileReal.startsWith(rootReal)) {
-					throw new HttpException(403, "Forbidden", "Requested resource: <tt>" + safePath + "</tt> is not allowed.");
-				}
+			if (file.exists()) {
+				pathSafetyCache.put(path, file);
 			}
 		}
 
@@ -566,7 +636,15 @@ public class StaticContentHandler extends RequestHandler {
 					}
 				}
 				serveFile = cachedFile;
-				baseEtagSuffix = "-" + chosenEncoding;
+				if ("br".equals(chosenEncoding)) {
+					baseEtagSuffix = ETAG_SUFFIX_BR;
+				} else if ("zstd".equals(chosenEncoding)) {
+					baseEtagSuffix = ETAG_SUFFIX_ZSTD;
+				} else if ("gzip".equals(chosenEncoding)) {
+					baseEtagSuffix = ETAG_SUFFIX_GZIP;
+				} else {
+					baseEtagSuffix = "-" + chosenEncoding;
+				}
 				response.setHeader("Content-Encoding", chosenEncoding);
 				response.addVary("Accept-Encoding");
 			} catch (IOException e) {
@@ -576,13 +654,51 @@ public class StaticContentHandler extends RequestHandler {
 			}
 		}
 
-		final long lastModified = file.lastModified();
-		final long lastModifiedSec = (lastModified / 1000) * 1000;
-		response.setHeader("Last-Modified", org.deftserver.util.DateUtil.formatToRFC1123(lastModifiedSec));
+		String absPath = file.getAbsolutePath();
+		long now = System.currentTimeMillis();
+		FileMetadata meta = metadataCache.get(absPath);
+		if (meta == null || now - meta.lastChecked >= 1500) {
+			long lastModified = file.lastModified();
+			if (meta == null || meta.lastModified != lastModified) {
+				String lastModifiedStr = org.deftserver.util.DateUtil.formatToRFC1123((lastModified / 1000) * 1000);
+				String etagValue = org.deftserver.util.HttpUtil.getEtag(response.getProtocol().getIOLoop().getMd5(), file);
+				String filename = file.getName();
+				int dot = filename.lastIndexOf('.');
+				String ext = "";
+				if (dot != -1) {
+					ext = filename.substring(dot + 1).toLowerCase(java.util.Locale.ROOT);
+				}
+				if (ext.equals("gz") && filename.regionMatches(true, filename.length() - 7, ".tar.gz", 0, 7)) {
+					ext = "tar.gz";
+				} else if (ext.equals("bz2") && filename.regionMatches(true, filename.length() - 8, ".tar.bz2", 0, 8)) {
+					ext = "tar.bz2";
+				} else if (ext.equals("xz") && filename.regionMatches(true, filename.length() - 7, ".tar.xz", 0, 7)) {
+					ext = "tar.xz";
+				}
+				String resolvedMime = EXT_TO_MIME.get(ext);
+				if (resolvedMime == null) {
+					try {
+						resolvedMime = java.nio.file.Files.probeContentType(file.toPath());
+					} catch (IOException e) {
+					}
+				}
+				if (resolvedMime == null) {
+					resolvedMime = mimeTypeMap.getContentType(file);
+				}
+				meta = new FileMetadata(lastModified, lastModifiedStr, etagValue, resolvedMime, file.length(), now);
+				metadataCache.put(absPath, meta);
+			} else {
+				meta = new FileMetadata(meta.lastModified, meta.lastModifiedStr, meta.etag, meta.mimeType, meta.length, now);
+				metadataCache.put(absPath, meta);
+			}
+		}
+
+		final long lastModifiedSec = (meta.lastModified / 1000) * 1000;
+		response.setHeader("Last-Modified", meta.lastModifiedStr);
 		response.setHeader("Cache-Control", "public");
 		response.setHeader("Accept-Ranges", "bytes");
 
-		String etag = org.deftserver.util.HttpUtil.getEtag(file);
+		String etag = meta.etag;
 		if (!etag.isEmpty()) {
 			if (!baseEtagSuffix.isEmpty()) {
 				if (etag.endsWith("\"")) {
@@ -594,31 +710,7 @@ public class StaticContentHandler extends RequestHandler {
 			response.setHeader("ETag", etag);
 		}
 
-		String ext = "";
-		String filenameLower = file.getName().toLowerCase(java.util.Locale.ROOT);
-		if (filenameLower.endsWith(".tar.gz")) {
-			ext = "tar.gz";
-		} else if (filenameLower.endsWith(".tar.bz2")) {
-			ext = "tar.bz2";
-		} else if (filenameLower.endsWith(".tar.xz")) {
-			ext = "tar.xz";
-		} else {
-			int dot = filenameLower.lastIndexOf('.');
-			if (dot != -1) {
-				ext = filenameLower.substring(dot + 1);
-			}
-		}
-		String mimeType = EXT_TO_MIME.get(ext);
-
-		if (mimeType == null) {
-			try {
-				mimeType = java.nio.file.Files.probeContentType(file.toPath());
-			} catch (IOException e) {
-			}
-		}
-		if (mimeType == null) {
-			mimeType = mimeTypeMap.getContentType(file);
-		}
+		String mimeType = meta.mimeType;
 		if (mimeType == null) {
 			mimeType = "application/octet-stream";
 		}

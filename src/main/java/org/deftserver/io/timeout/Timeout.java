@@ -7,17 +7,38 @@ import org.deftserver.util.Closeables;
 import org.deftserver.web.AsyncCallback;
 
 
-public class Timeout {
+public class Timeout implements Comparable<Timeout> {
+
+	private static final java.util.concurrent.atomic.AtomicLong seqGenerator = new java.util.concurrent.atomic.AtomicLong(0);
 
 	private final long timeout;
 	private final AsyncCallback cb;
+	private SelectableChannel channel;
+	private final long sequenceNumber = seqGenerator.getAndIncrement();
 	private boolean cancelled = false;
 	
 	/** Creates a timeout that fires {@code cb} once the wall-clock time reaches {@code timeout}
 	 *  (absolute epoch milliseconds). */
 	public Timeout(long timeout, AsyncCallback cb) {
+		this(timeout, cb, null);
+	}
+
+	public Timeout(long timeout, AsyncCallback cb, SelectableChannel channel) {
 		this.timeout = timeout;
 		this.cb = cb;
+		this.channel = channel;
+	}
+
+	public SelectableChannel getChannel() {
+		return channel;
+	}
+
+	public void setChannel(SelectableChannel channel) {
+		this.channel = channel;
+	}
+
+	public long getSequenceNumber() {
+		return sequenceNumber;
 	}
 
 	/** The absolute deadline (epoch milliseconds) at which this timeout is due. */
@@ -46,8 +67,21 @@ public class Timeout {
 	public static Timeout newKeepAliveTimeout(final IOLoop ioLoop, final SelectableChannel clientChannel, long keepAliveTimeout) {
 		return new Timeout(
 				System.currentTimeMillis() + keepAliveTimeout,
-				new AsyncCallback() { public void onCallback() { Closeables.closeQuietly(ioLoop, clientChannel); } }
+				new AsyncCallback() { public void onCallback() { Closeables.closeQuietly(ioLoop, clientChannel); } },
+				clientChannel
 		);
+	}
+
+	@Override
+	public int compareTo(Timeout that) {
+		if (this == that) {
+			return 0;
+		}
+		int diff = Long.compare(this.timeout, that.timeout);
+		if (diff != 0) {
+			return diff;
+		}
+		return Long.compare(this.sequenceNumber, that.sequenceNumber);
 	}
 
 }

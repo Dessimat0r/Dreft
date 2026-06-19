@@ -41,6 +41,17 @@ public class DynamicByteBuffer {
 		ensureCapacity(src.remaining());
 		backend.put(src);
 	}	
+
+	public void put(String s) {
+		int len = s.length();
+		ensureCapacity(len);
+		byte[] arr = backend.array();
+		int pos = backend.position();
+		for (int i = 0; i < len; i++) {
+			arr[pos + i] = (byte) s.charAt(i);
+		}
+		backend.position(pos + len);
+	}
 	
 	/**
 	 * Prepend the data. Will reallocate if needed.
@@ -86,19 +97,14 @@ public class DynamicByteBuffer {
 	}
 	
 	/** Ensures room to append {@code size} bytes, growing with the default 1.5× padding. */
-	private void ensureCapacity(int size) {
+	public void ensureCapacity(int size) {
 		ensureCapacity(size, false);
 	}
 
-	/**
-	 * Ensures that its safe to append size data to backend. 
-	 * @param size The size of the data that is about to be appended.
-	 * @param exact If true, reallocates to exactly the required size. If false, reallocates with 1.5x padding.
-	 */
 	/** Largest array the JVM can allocate (a few bytes of header reserved, per common practice). */
 	private static final int MAX_ARRAY_SIZE = Integer.MAX_VALUE - 8;
 
-	private void ensureCapacity(int size, boolean exact) {
+	public void ensureCapacity(int size, boolean exact) {
 		int remaining = backend.remaining();
 		if (size > remaining) {
 			logger.debug("allocating new DynamicByteBuffer, old capacity {}: ", backend.capacity());
@@ -117,6 +123,12 @@ public class DynamicByteBuffer {
 				}
 			}
 			reallocate((int) newSize);
+		}
+	}
+
+	public void grow(int newCapacity) {
+		if (newCapacity > backend.capacity()) {
+			reallocate(newCapacity);
 		}
 	}
 	
@@ -181,6 +193,14 @@ public class DynamicByteBuffer {
 	 */
 	public boolean hasRemaining() {
 		return backend.hasRemaining();
+	}
+
+	public byte[] prependSpace(int length) {
+		int bodyLen = backend.position();
+		ensureCapacity(length, true);
+		System.arraycopy(backend.array(), 0, backend.array(), length, bodyLen);
+		backend.position(length + bodyLen);
+		return backend.array();
 	}
 
 	/**

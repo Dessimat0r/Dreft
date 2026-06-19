@@ -10,7 +10,10 @@ public class JMXDebuggableCallbackManager implements CallbackManager, CallbackMa
 
 	private final Logger logger = LoggerFactory.getLogger(JMXDebuggableCallbackManager.class);
 	
-	private final java.util.Queue<AsyncCallback> callbacks = new java.util.concurrent.ConcurrentLinkedQueue<AsyncCallback>();
+	private final Object lock = new Object();
+	private java.util.List<AsyncCallback> inbox = new java.util.ArrayList<AsyncCallback>();
+	private java.util.List<AsyncCallback> outbox = new java.util.ArrayList<AsyncCallback>();
+	private final java.util.concurrent.atomic.AtomicInteger size = new java.util.concurrent.atomic.AtomicInteger(0);
 	
 	{ 	// instance initialization block
 		MXBeanUtil.registerMXBean(this, "CallbackManager"); 
@@ -19,14 +22,17 @@ public class JMXDebuggableCallbackManager implements CallbackManager, CallbackMa
 	/** JMX: number of callbacks currently queued. */
 	@Override
 	public int getNumberOfCallbacks() {
-		return callbacks.size();
+		return size.get();
 	}
 
 	/** Enqueues a callback to run on the next loop iteration. Thread-safe (the only safe cross-thread
 	 *  entry point into the loop) via the underlying concurrent queue. */
 	@Override
 	public void addCallback(AsyncCallback callback) {
-		callbacks.add(callback);
+		synchronized (lock) {
+			inbox.add(callback);
+		}
+		size.incrementAndGet();
 		logger.debug("Callback added");
 	}
 
@@ -39,15 +45,18 @@ public class JMXDebuggableCallbackManager implements CallbackManager, CallbackMa
 	 */
 	@Override
 	public boolean execute() {
-		int size = callbacks.size();
-		if (size == 0) {
+		if (size.get() == 0) {
 			return false;
 		}
-		for (int i = 0; i < size; i++) {
-			AsyncCallback cb = callbacks.poll();
-			if (cb == null) {
-				break;
-			}
+		synchronized (lock) {
+			java.util.List<AsyncCallback> temp = inbox;
+			inbox = outbox;
+			outbox = temp;
+		}
+		int batchSize = outbox.size();
+		for (int i = 0; i < batchSize; i++) {
+			AsyncCallback cb = outbox.get(i);
+			size.decrementAndGet();
 			try {
 				cb.onCallback();
 			} catch (RuntimeException | StackOverflowError | LinkageError e) {
@@ -63,7 +72,8 @@ public class JMXDebuggableCallbackManager implements CallbackManager, CallbackMa
 				logger.debug("Callback executed");
 			}
 		}
-		return !callbacks.isEmpty();
+		outbox.clear();
+		return size.get() > 0;
 	}
 	
 

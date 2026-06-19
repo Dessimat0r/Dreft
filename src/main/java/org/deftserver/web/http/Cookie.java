@@ -30,8 +30,19 @@ public class Cookie {
 	/** Creates a cookie with the given name and value, rejecting a null/empty name and any control
 	 *  characters in name or value (the response-splitting defence). Attributes default to a root
 	 *  Path and no Domain/Max-Age/Secure/HttpOnly/SameSite. */
+	private static boolean isBlank(String s) {
+		int len = s.length();
+		if (len == 0) return true;
+		for (int i = 0; i < len; i++) {
+			if (s.charAt(i) > ' ') {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	public Cookie(String name, String value) {
-		if (name == null || name.trim().isEmpty()) {
+		if (name == null || isBlank(name)) {
 			throw new IllegalArgumentException("Cookie name cannot be null or empty");
 		}
 		rejectControlChars("Cookie name", name);

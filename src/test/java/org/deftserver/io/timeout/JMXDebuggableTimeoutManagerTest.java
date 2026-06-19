@@ -111,6 +111,33 @@ public class JMXDebuggableTimeoutManagerTest {
 		tm.addTimeout(t);	
 	}
 	
+	@Test
+	public void testStableFifoOrdering() {
+		final long now = System.currentTimeMillis();
+		final int[] order = new int[3];
+		final int[] idx = {0};
+		
+		Timeout t1 = new Timeout(now, new AsyncCallback() {
+			@Override public void onCallback() { order[idx[0]++] = 1; }
+		});
+		Timeout t2 = new Timeout(now, new AsyncCallback() {
+			@Override public void onCallback() { order[idx[0]++] = 2; }
+		});
+		Timeout t3 = new Timeout(now, new AsyncCallback() {
+			@Override public void onCallback() { order[idx[0]++] = 3; }
+		});
+		
+		tm.addTimeout(t1);
+		tm.addTimeout(t2);
+		tm.addTimeout(t3);
+		
+		tm.execute(now + 1);
+		
+		assertEquals(1, order[0]);
+		assertEquals(2, order[1]);
+		assertEquals(3, order[2]);
+	}
+
 	private class MockChannel extends SelectableChannel {
 
 		@Override

@@ -63,12 +63,35 @@ public class IOLoop implements IOLoopMXBean {
 	private final CallbackManager cm = new JMXDebuggableCallbackManager();
 	
 	private static final AtomicInteger sequence = new AtomicInteger(0);
+
+	private long lastNow = System.currentTimeMillis();
+
+	public long getCurrentTime() {
+		return lastNow;
+	}
 	
 	/** Creates an I/O loop with its own NIO {@link Selector} and registers its JMX bean. The loop
 	 *  does not run until {@link #start()} is called on the thread that should become the loop thread. */
+	private final java.security.MessageDigest md5;
+	private final java.security.MessageDigest sha1;
+
 	public IOLoop() throws IOException {
 		selector = Selector.open();
+		try {
+			md5 = java.security.MessageDigest.getInstance("MD5");
+			sha1 = java.security.MessageDigest.getInstance("SHA-1");
+		} catch (java.security.NoSuchAlgorithmException e) {
+			throw new RuntimeException(e);
+		}
 		MXBeanUtil.registerMXBean(this, "IOLoop");
+	}
+
+	public java.security.MessageDigest getMd5() {
+		return md5;
+	}
+
+	public java.security.MessageDigest getSha1() {
+		return sha1;
 	}
 	/**
 	 * Start the io loop. The thread that invokes this method will be blocked (until {@link IOLoop#stop} is invoked) 
@@ -117,7 +140,8 @@ public class IOLoop implements IOLoopMXBean {
 		try {
 			consecutiveSelectFailures = 0;
 			if (selector.select(selectorTimeout) == 0) {
-					long ms = tm.execute();
+					lastNow = System.currentTimeMillis();
+					long ms = tm.execute(lastNow);
 					if (cm.execute()) {
 						selectorTimeout = 1;
 					} else if (ms > 0) {
@@ -127,11 +151,16 @@ public class IOLoop implements IOLoopMXBean {
 					}
 					continue;
 				}
+				lastNow = System.currentTimeMillis();
 				Iterator<SelectionKey> keys = selector.selectedKeys().iterator();
 				while (keys.hasNext()) {
 					SelectionKey key = keys.next();
 					keys.remove();
-					IOHandler handler = handlers.get(key.channel());
+					Object att = key.attachment();
+					IOHandler handler = (att instanceof ConnectionState) ? ((ConnectionState) att).getHandler() : null;
+					if (handler == null) {
+						handler = handlers.get(key.channel());
+					}
 					if (handler == null) {
 						logger.debug("No handler found in IOLoop for channel: {}", key.channel());
 						closeAndNotify(handler, key.channel());
@@ -206,7 +235,8 @@ public class IOLoop implements IOLoopMXBean {
 						dropFaultingChannel(handler, key.channel());
 					}
 				}
-				long ms = tm.execute();
+				lastNow = System.currentTimeMillis();
+				long ms = tm.execute(lastNow);
 				if (cm.execute()) { 
 					selectorTimeout = 1; 
 				} else if (ms > 0) {
@@ -298,7 +328,8 @@ public class IOLoop implements IOLoopMXBean {
 	 * 
 	 */
 	public SelectionKey addHandler(SelectableChannel channel, IOHandler handler, int interestOps, Object attachment) throws IOException {
-		SelectionKey key = registerChannel(channel, interestOps, attachment);
+		ConnectionState state = new ConnectionState(handler, attachment);
+		SelectionKey key = registerChannel(channel, interestOps, state);
 		handlers.put(channel, handler);
 		return key;
 	}
@@ -417,6 +448,10 @@ public class IOLoop implements IOLoopMXBean {
 				.collect(java.util.stream.Collectors.toList());
 	}
 	
+	public Thread getThread() {
+		return loopThread;
+	}
+
 	/** Shuts the loop down: closes every registered channel, stops the loop, and unregisters the
 	 *  JMX beans (loop/timeout/callback) to avoid classloader/memory leaks. */
 	public void dispose() {
@@ -432,6 +467,37 @@ public class IOLoop implements IOLoopMXBean {
 		}
 		if (cm instanceof JMXDebuggableCallbackManager) {
 			MXBeanUtil.unregisterMXBean(cm, "CallbackManager");
+		}
+	}
+
+	public static class ConnectionState {
+		private final IOHandler handler;
+		private Object attachment;
+
+		public ConnectionState(IOHandler handler, Object attachment) {
+			this.handler = handler;
+			this.attachment = attachment;
+		}
+
+		public IOHandler getHandler() { return handler; }
+		public Object getAttachment() { return attachment; }
+		public void setAttachment(Object attachment) { this.attachment = attachment; }
+	}
+
+	public static Object getAttachment(SelectionKey key) {
+		Object att = key.attachment();
+		if (att instanceof ConnectionState) {
+			return ((ConnectionState) att).getAttachment();
+		}
+		return att;
+	}
+
+	public static void setAttachment(SelectionKey key, Object newVal) {
+		Object att = key.attachment();
+		if (att instanceof ConnectionState) {
+			((ConnectionState) att).setAttachment(newVal);
+		} else {
+			key.attach(newVal);
 		}
 	}
 }
