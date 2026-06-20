@@ -438,13 +438,93 @@ public class StaticContentHandler extends RequestHandler {
 	/** Serves the requested file (with body) — see {@link #perform}. */
 	@Override
 	public void get(HttpRequest request, HttpResponse response) throws IOException {
-		this.perform(request, response, true);
+		serveOffLoop(request, response, true);
 	}
 
 	/** Serves the requested file without a body (HEAD) — headers/Content-Length only. */
 	@Override
 	public void head(final HttpRequest request, final HttpResponse response) throws IOException {
-		this.perform(request, response, false);
+		serveOffLoop(request, response, false);
+	}
+
+	/** GET/HEAD are served asynchronously: all the BLOCKING filesystem work (path resolution, symlink
+	 *  {@code toRealPath} check, stat, and — crucially — reading the file body) runs on a virtual thread,
+	 *  off the I/O-loop thread, so a slow/cold/network filesystem can never stall the reactor. Only the
+	 *  (non-blocking) socket write is marshalled back to the loop. */
+	@Override
+	public boolean isMethodAsynchronous(org.deftserver.web.HttpVerb verb) {
+		return verb == org.deftserver.web.HttpVerb.GET || verb == org.deftserver.web.HttpVerb.HEAD;
+	}
+
+	private void serveOffLoop(final HttpRequest request, final HttpResponse response, final boolean hasBody) throws IOException {
+		if (response.getProtocol() == null) {
+			// Direct call (e.g. a unit test) — there is no I/O loop to offload onto, so run synchronously
+			// and let any HttpException (403/404/416) propagate, preserving the throw-on-error contract
+			// those tests rely on.
+			byte[][] bodyOut = new byte[1][];
+			File[] streamFile = new File[1];
+			long[] streamRange = new long[2];
+			perform(request, response, hasBody, bodyOut, streamFile, streamRange);
+			sendBody(response, bodyOut[0], streamFile[0], streamRange);
+			return;
+		}
+		final org.deftserver.io.IOLoop ioLoop = response.getProtocol().getIOLoop();
+		Thread.startVirtualThread(() -> {
+			final byte[][] bodyOut = new byte[1][];
+			final File[] streamFile = new File[1];
+			final long[] streamRange = new long[2];
+			try {
+				perform(request, response, hasBody, bodyOut, streamFile, streamRange); // OFF the loop: stat/realpath/read
+				ioLoop.addCallback(() -> {
+					try {
+						sendBody(response, bodyOut[0], streamFile[0], streamRange);
+					} catch (Exception e) {
+						logger.debug("static send failed: {}", e.getMessage());
+						try { response.getProtocol().closeChannel(response.getChannel()); } catch (Exception ignore) {}
+					}
+				});
+			} catch (HttpException he) {
+				ioLoop.addCallback(() -> sendError(response, he.getStatusCode(), he.getLongHTMLMessage()));
+			} catch (Throwable t) {
+				logger.error("Unhandled error serving static content", t);
+				ioLoop.addCallback(() -> sendError(response, 500, "Internal Server Error"));
+			}
+		});
+	}
+
+	/** Sends the prepared response body on the I/O-loop thread (raw — no gzip — preserving the headers
+	 *  perform() set), then finalises. A small body was pre-read off-loop into {@code body}; a larger one
+	 *  is streamed via the existing mmap/windowed {@code write(File)} path ({@code streamFile} set), whose
+	 *  per-window disk I/O stays on the loop but is bounded. */
+	private static void sendBody(HttpResponse response, byte[] body, File streamFile, long[] streamRange) throws IOException {
+		if (body != null) {
+			response.write(java.nio.ByteBuffer.wrap(body));
+		} else if (streamFile != null) {
+			if (streamRange[1] > 0) {
+				response.write(streamFile, streamRange[0], streamRange[1]);
+			} else {
+				response.write(streamFile);
+			}
+		}
+		response.finish();
+	}
+
+	/** Files at or below this size are read into a heap buffer off the I/O loop; larger ones keep the
+	 *  existing mmap/windowed serving (its disk I/O stays on the loop, but big static downloads are rare).
+	 *  Bounds the off-loop heap allocation. */
+	private static final long OFFLOAD_HEAP_READ_MAX = 16L * 1024 * 1024;
+
+	/** Marshalled-to-loop error send for the async path (mirrors the dispatcher's HttpException handling). */
+	private static void sendError(HttpResponse response, int status, String body) {
+		try {
+			response.setStatusCode(status);
+			response.setHeader("Content-Type", "text/plain; charset=utf-8");
+			response.setHeader("X-Content-Type-Options", "nosniff");
+			response.write(body);
+			response.finish();
+		} catch (Exception e) {
+			try { response.getProtocol().closeChannel(response.getChannel()); } catch (Exception ignore) {}
+		}
 	}
 
 	/**
@@ -452,7 +532,7 @@ public class StaticContentHandler extends RequestHandler {
 	 * @param response the <code>HttpResponse</code> 
 	 * @param hasBody <code>true</code> to write the message body; <code>false</code> oth	erwise.
 	 */
-	private void perform(final HttpRequest request, final HttpResponse response, boolean hasBody) throws IOException {
+	private void perform(final HttpRequest request, final HttpResponse response, boolean hasBody, byte[][] bodyOut, File[] streamFile, long[] streamRange) throws IOException {
 		logger.debug("req: {}, resp: {}, body: {}", request, response, hasBody);
 		final String path = request.getRequestedPath();
 		final String safePath = org.deftserver.util.HttpUtil.escapeHtml(path);
@@ -822,7 +902,20 @@ public class StaticContentHandler extends RequestHandler {
 					response.setHeader("Content-Range", "bytes " + start + "-" + end + "/" + fileLength);
 					response.setHeader("Content-Length", String.valueOf(rangeLength));
 					if (hasBody) {
-						response.write(serveFile, start, rangeLength);
+						if (rangeLength <= OFFLOAD_HEAP_READ_MAX) {
+							// Read the requested range OFF the loop into a heap buffer; the loop sends it raw.
+							byte[] rangeBytes = new byte[(int) rangeLength];
+							try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(serveFile, "r")) {
+								raf.seek(start);
+								raf.readFully(rangeBytes);
+							}
+							bodyOut[0] = rangeBytes;
+						} else {
+							// Large range — stream via the existing mmap/windowed path on the loop.
+							streamFile[0] = serveFile;
+							streamRange[0] = start;
+							streamRange[1] = rangeLength;
+						}
 					}
 					return;
 				}
@@ -830,7 +923,17 @@ public class StaticContentHandler extends RequestHandler {
 		}
 
 		if (hasBody) {
-			response.write(serveFile);
+			// Read the file body OFF the loop into a heap buffer; the loop sends it raw (write(ByteBuffer)
+			// flushes headers+body without gzip — static manages its own .dreft-cfg compression). The
+			// Content-Length the existing code set stays authoritative. Large files keep the existing
+			// mmap/windowed serving (bounded per-window) rather than reading the whole thing into heap.
+			response.setHeader("Content-Length", String.valueOf(serveFile.length()));
+			if (serveFile.length() <= OFFLOAD_HEAP_READ_MAX) {
+				bodyOut[0] = java.nio.file.Files.readAllBytes(serveFile.toPath());
+			} else {
+				streamFile[0] = serveFile;
+				streamRange[1] = -1; // full file (not a range)
+			}
 		} else {
 			response.setHeader("Content-Length", String.valueOf(serveFile.length()));
 		}
