@@ -162,6 +162,10 @@ public class HttpRequest {
 	 *  are cheap enough to finalize inline on the I/O loop; larger or compressed bodies are finalized off
 	 *  the loop by the live server. */
 	static final int FINALIZE_OFFLOAD_THRESHOLD = 256 * 1024;
+	/** Test-only hook: artificial delay (ms) injected into {@link #finalizeContent()} to simulate a heavy,
+	 *  slow body finalization, so a regression test can prove the off-loop finalize does NOT stall the I/O
+	 *  loop (a concurrent request on the same single loop must still answer promptly). 0 in production. */
+	public static volatile long TEST_FINALIZE_DELAY_MS = 0;
 	/** When true (set only by the live-server {@code of(Application, ByteBuffer)} path), a heavy body's
 	 *  finalization is deferred to {@link #finalizeContent()} so the live server can run it off the loop;
 	 *  the of()/test paths leave it false and finalize inline (staying synchronous). */
@@ -711,6 +715,10 @@ public class HttpRequest {
 	public void finalizeContent() throws IOException {
 		finalizationPending = false;
 		logger.debug("finalizing body; raw body length: {}", currentRawBodyLength());
+		if (TEST_FINALIZE_DELAY_MS > 0) {
+			// Test hook only: simulate a CPU-heavy finalization so a probe can verify the loop stays live.
+			try { Thread.sleep(TEST_FINALIZE_DELAY_MS); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+		}
 		byte[] rawBytes;
 		if (chunked) {
 			rawBytes = chunkedBody.toByteArray();

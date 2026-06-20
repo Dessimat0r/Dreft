@@ -70,6 +70,9 @@ public class CompressionIntegrationTest {
 		reqHandlers.put("/compress", new CompressHandler());
 		reqHandlers.put("/decompress", new DecompressHandler());
 		reqHandlers.put("/decompress-multipart", new DecompressMultipartHandler());
+		reqHandlers.put("/ping", new RequestHandler() {
+			@Override public void get(HttpRequest request, HttpResponse response) { response.write("pong"); }
+		});
 
 		server = new HttpServer(new Application(reqHandlers));
 		server.bind(PORT);
@@ -231,6 +234,65 @@ public class CompressionIntegrationTest {
 		RawResponse resp = sendRequest(reqOut.toByteArray());
 		assertEquals(200, resp.statusCode);
 		assertEquals(payload, new String(resp.body, StandardCharsets.UTF_8));
+	}
+
+	/**
+	 * A corrupt Content-Encoding body must yield 400, NOT 500 — and crucially on the OFF-LOOP finalization
+	 * path (any Content-Encoding marks the body "heavy" → its decompress runs on a virtual thread). The
+	 * decompress IOException must be mapped to the MalFormedHttpRequest sentinel → 400 before dispatch.
+	 */
+	/**
+	 * The whole point of off-loop finalization: a slow, heavy body finalize must NOT stall the single I/O
+	 * loop. With a ~2 s artificial finalize delay injected, a heavy POST is in flight; a concurrent GET on
+	 * the SAME single loop must still answer promptly (well under the 2 s finalize window) — proving the
+	 * finalize runs on a virtual thread and the loop keeps servicing other connections.
+	 */
+	@Test
+	public void offLoopFinalizeDoesNotStallTheLoop() throws Exception {
+		byte[] heavyBody = new byte[300 * 1024]; // > FINALIZE_OFFLOAD_THRESHOLD → off-loop finalize
+		java.util.Arrays.fill(heavyBody, (byte) 'x');
+		ByteArrayOutputStream slowReq = new ByteArrayOutputStream();
+		slowReq.write(("POST /decompress HTTP/1.1\r\n" +
+					"Host: localhost\r\n" +
+					"Content-Length: " + heavyBody.length + "\r\n" +
+					"Connection: close\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1));
+		slowReq.write(heavyBody);
+
+		org.deftserver.web.http.HttpRequest.TEST_FINALIZE_DELAY_MS = 2000;
+		try {
+			Thread slow = new Thread(() -> {
+				try { sendRequest(slowReq.toByteArray()); } catch (Exception ignore) {}
+			});
+			slow.start();
+			Thread.sleep(200); // let the heavy POST reach its (delayed) finalize
+
+			long t0 = System.nanoTime();
+			RawResponse ping = sendRequest("GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+			long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+
+			assertEquals(200, ping.statusCode);
+			assertEquals("pong", new String(ping.body, StandardCharsets.UTF_8));
+			assertTrue("/ping took " + elapsedMs + " ms — the loop was stalled by the off-loop finalize",
+				elapsedMs < 1500);
+			slow.join(5000);
+		} finally {
+			org.deftserver.web.http.HttpRequest.TEST_FINALIZE_DELAY_MS = 0;
+		}
+	}
+
+	@Test
+	public void testCorruptInboundGzipIsBadRequest() throws Exception {
+		byte[] notGzip = "this is plainly not a valid gzip stream".getBytes(StandardCharsets.ISO_8859_1);
+		ByteArrayOutputStream reqOut = new ByteArrayOutputStream();
+		reqOut.write(("POST /decompress HTTP/1.1\r\n" +
+					"Host: localhost\r\n" +
+					"Content-Encoding: gzip\r\n" +
+					"Content-Length: " + notGzip.length + "\r\n" +
+					"Connection: close\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1));
+		reqOut.write(notGzip);
+
+		RawResponse resp = sendRequest(reqOut.toByteArray());
+		assertEquals(400, resp.statusCode);
 	}
 
 	@Test
