@@ -719,6 +719,25 @@ public class HttpRequest {
 			// Test hook only: simulate a CPU-heavy finalization so a probe can verify the loop stays live.
 			try { Thread.sleep(TEST_FINALIZE_DELAY_MS); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
 		}
+		String contentEncoding = headers.get("content-encoding");
+		boolean compressed = contentEncoding != null && !isBlank(contentEncoding);
+
+		// Fast path: an uncompressed, non-chunked body is already contiguous in rawBody's exactly-sized
+		// backing array (allocate(contentLength)), so parse it in place — no intermediate full-body byte[]
+		// copy. This is the common large-POST case (the one that triggers off-loop finalization), so it
+		// saves up to MAX_BODY_SIZE of allocation + memcpy per request.
+		if (!compressed && !chunked) {
+			if (!multipart) {
+				body = new String(rawBody.array(), rawBody.arrayOffset(), rawBody.limit(), StandardCharsets.ISO_8859_1);
+				postParameters = parseParameters2(body);
+			} else {
+				parseMultipartParts(rawBody.duplicate()); // independent position/limit; shares the bytes
+			}
+			return;
+		}
+
+		// Slow path: chunked bodies live in a separate accumulator, and compressed bodies must be
+		// decompressed into a fresh contiguous array before parsing.
 		byte[] rawBytes;
 		if (chunked) {
 			rawBytes = chunkedBody.toByteArray();
@@ -726,8 +745,7 @@ public class HttpRequest {
 			rawBytes = new byte[rawBody.limit()];
 			System.arraycopy(rawBody.array(), 0, rawBytes, 0, rawBody.limit());
 		}
-		String contentEncoding = headers.get("content-encoding");
-		if (contentEncoding != null && !isBlank(contentEncoding)) {
+		if (compressed) {
 			rawBytes = org.deftserver.util.HttpUtil.decompress(rawBytes, contentEncoding);
 		}
 		if (!multipart) {
