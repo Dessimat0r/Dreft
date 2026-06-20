@@ -17,14 +17,14 @@ field base64 over ISO-8859-1 bytes):
 {"version":"<b64>","method":"<b64>","uri":"<b64>","headers":[["<b64name>","<b64val>"],...],"body":"<b64>"}
 ```
 
-Dreft's adapter is [`GardenServer`](../../src/test/java/org/deftserver/garden/GardenServer.java) (in
+Dreft's adapter is [`GardenServer`](../../java/org/deftserver/garden/GardenServer.java) (in
 Dreft's **test** sources — it's a compliance harness, not framework code). It wraps `Application` so every
 request Dreft *accepts* is echoed, while Dreft's own rejections (a `400` for a malformed/invalid request)
 pass through unchanged as the differential **"rejected"** signal. It listens on port `80` (override with
 the `GARDEN_PORT` env var or the first CLI arg).
 
 The adapter is verified by
-[`GardenServerTest`](../../src/test/java/org/deftserver/garden/GardenServerTest.java)
+[`GardenServerTest`](../../java/org/deftserver/garden/GardenServerTest.java)
 (`mvn test -Dtest=GardenServerTest`), which boots it on an ephemeral port and asserts the decoded
 round-trip for plain requests, arbitrary paths/methods, headers, raw body bytes, and malformed→4xx.
 
@@ -34,7 +34,7 @@ round-trip for plain requests, arbitrary paths/methods, headers, raw body bytes,
 
    ```bash
    git clone https://github.com/narfindustries/http-garden
-   cp -r /path/to/Dreft/compliance/http-garden http-garden/images/dreft
+   cp -r /path/to/Dreft/src/test/resources/http-garden http-garden/images/dreft
    ```
 
 2. Register the service in `http-garden/docker-compose.yml` (mirroring the other origin servers — pin
