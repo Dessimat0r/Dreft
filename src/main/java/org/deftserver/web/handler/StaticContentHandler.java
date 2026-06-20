@@ -514,6 +514,11 @@ public class StaticContentHandler extends RequestHandler {
 	 *  Bounds the off-loop heap allocation. */
 	private static final long OFFLOAD_HEAP_READ_MAX = 16L * 1024 * 1024;
 
+	/** Test-only hook: artificial delay (ms) injected into the off-loop file read, so a regression test can
+	 *  prove a slow static disk read does NOT stall the I/O loop (a concurrent request must still answer
+	 *  promptly while the read is in flight on its virtual thread). 0 in production. */
+	public static volatile long TEST_STATIC_READ_DELAY_MS = 0;
+
 	/** Marshalled-to-loop error send for the async path (mirrors the dispatcher's HttpException handling). */
 	private static void sendError(HttpResponse response, int status, String body) {
 		try {
@@ -928,6 +933,10 @@ public class StaticContentHandler extends RequestHandler {
 			// Content-Length the existing code set stays authoritative. Large files keep the existing
 			// mmap/windowed serving (bounded per-window) rather than reading the whole thing into heap.
 			response.setHeader("Content-Length", String.valueOf(serveFile.length()));
+			if (TEST_STATIC_READ_DELAY_MS > 0) {
+				// Test hook only: simulate a slow disk read so a probe can verify the loop stays live.
+				try { Thread.sleep(TEST_STATIC_READ_DELAY_MS); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+			}
 			if (serveFile.length() <= OFFLOAD_HEAP_READ_MAX) {
 				bodyOut[0] = java.nio.file.Files.readAllBytes(serveFile.toPath());
 			} else {
