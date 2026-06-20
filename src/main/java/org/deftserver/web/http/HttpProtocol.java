@@ -1378,39 +1378,32 @@ public class HttpProtocol implements IOHandler {
 	/** Writes a plain {@link ByteBuffer} attached to the key (same completion semantics as
 	 *  {@link #writeDynamicByteBuffer}). */
 	private long writeByteBuffer(SelectionKey key, SocketChannel channel) throws IOException {
+		// The attached buffer is already in READ mode — every producer flips it before attaching — so
+		// write straight from it, advancing its position; a partial write simply resumes on the next
+		// OP_WRITE. (The old code flipped on entry, which DOUBLE-flipped an already-flipped buffer to
+		// limit=0 and silently dropped the whole body — e.g. a >1 MiB static file would hang the client
+		// until its timeout. It also compacted as if the buffer were a write-mode accumulator.)
 		ByteBuffer toSend = (ByteBuffer) IOLoop.getAttachment(key);
-		if (logger.isDebugEnabled()) {
-			logger.debug("pending data about to be written");
-		}
-		if (!toSend.isReadOnly()) toSend.flip(); // prepare for write
 		long bytesWritten = 0;
 		if (toSend.hasRemaining()) {
-			int written = 0;
+			int written;
 			do {
 				written = write(channel, toSend);
 				if (written > 0) {
 					bytesWritten += written;
 				}
 			} while (written > 0 && toSend.hasRemaining());
-			if (logger.isDebugEnabled()) {
-				logger.debug("sent {} bytes to wire", bytesWritten);
-			}
 		}
-		if (!toSend.hasRemaining()) {
+		if (toSend.hasRemaining()) {
+			key.interestOps(SelectionKey.OP_WRITE); // socket send buffer full — resume on next OP_WRITE
+		} else {
 			SSLSessionHandler sslHandler = getSslSessionHandler(channel);
 			if (sslHandler != null && sslHandler.hasPendingWrite()) {
-				if (!toSend.isReadOnly()) toSend.compact();
-				key.interestOps(SelectionKey.OP_WRITE);
+				key.interestOps(SelectionKey.OP_WRITE); // plaintext drained but TLS ciphertext still draining
 			} else {
-				if (logger.isDebugEnabled()) {
-					logger.debug("sent all data in toSend buffer");
-				}
 				// Honour a deferred Connection: close, otherwise re-register for the next request.
 				finishDeferredWrite(key, channel);
 			}
-		} else {
-			if (!toSend.isReadOnly()) toSend.compact(); // make room for more data be "read" in
-			key.interestOps(SelectionKey.OP_WRITE);
 		}
 		return bytesWritten;
 	}
