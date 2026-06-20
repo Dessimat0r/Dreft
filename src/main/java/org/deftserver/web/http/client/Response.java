@@ -29,14 +29,25 @@ public class Response {
 		return statusLine;
 	}
 
-	/** Sets a response header. */
+	/** Sets a response header. HTTP field names are case-insensitive (RFC 9110 §5.1), so the name is
+	 *  folded to lower-case (Locale.ROOT) for storage — mirroring the server-side {@code HttpRequest}
+	 *  normalisation — while the value keeps its original casing. Last write wins across name casings.
+	 *  A null name is ignored. */
 	public void setHeader(String key, String value) {
-		headers.put(key, value);
+		if (key == null) {
+			return;
+		}
+		headers.put(key.toLowerCase(java.util.Locale.ROOT), value);
 	}
 
-	/** A response header value, or null if absent. */
+	/** A response header value, or null if absent. Lookup is case-insensitive (the name is folded the
+	 *  same way {@link #setHeader} stores it), so {@code getHeader("content-type")} finds a
+	 *  {@code Content-Type} sent by the server. A null name returns null. */
 	public String getHeader(String key) {
-		return headers.get(key);
+		if (key == null) {
+			return null;
+		}
+		return headers.get(key.toLowerCase(java.util.Locale.ROOT));
 	}
 
 	/** Sets the full response body explicitly. */
