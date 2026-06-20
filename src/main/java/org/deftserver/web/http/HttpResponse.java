@@ -37,6 +37,10 @@ public class HttpResponse {
 	
 	protected final Map<String, String> headers = new HashMap<String, String>();
 	protected boolean headersCreated = false;
+	// True once the CPU-heavy response finalization (gzip + ETag over the whole body, both O(body size))
+	// has run, so it happens exactly once whether done off-loop by the dispatcher's virtual thread
+	// (finalizeFramingOffLoop) or on the loop by finish(). See setEtagAndContentLength.
+	private boolean framingFinalized = false;
 	private final DynamicByteBuffer responseData = DynamicByteBuffer.allocate(WRITE_BUFFER_SIZE);
 	private final boolean suppressBody;
 	
@@ -427,10 +431,31 @@ public class HttpResponse {
 		}
 	}	
 
+	/**
+	 * Package-private hook for the {@link HttpRequestDispatcher} virtual-thread offload: runs the
+	 * CPU-heavy response finalization (gzip compression + ETag over the whole body, both O(body size))
+	 * OFF the I/O-loop thread, so that {@link #finish()} — which the dispatcher marshals back to the loop
+	 * — only has to do the (non-blocking) socket write. Without this a multi-MB dynamic response would
+	 * gzip+hash on the loop, stalling every other connection for the duration. Idempotent (guarded by
+	 * {@code framingFinalized}) and a no-op once headers have already been flushed (a streaming handler),
+	 * so it never re-frames an in-flight response. Touches only the request headers and this response's
+	 * own buffer, so it's safe to run off-loop.
+	 */
+	void finalizeFramingOffLoop() {
+		if (!headersCreated) {
+			setEtagAndContentLength();
+		}
+	}
+
 	/** Finalises body framing before sending: applies gzip where appropriate, computes the ETag,
 	 *  evaluates conditional-request preconditions (304/412), and sets Content-Length or chunked
-	 *  Transfer-Encoding (clearing the body for bodiless statuses). */
+	 *  Transfer-Encoding (clearing the body for bodiless statuses). Idempotent: runs its work at most
+	 *  once (it may be invoked off-loop via {@link #finalizeFramingOffLoop} and then again by finish()). */
 	private void setEtagAndContentLength() {
+		if (framingFinalized) {
+			return; // already finalized (e.g. off-loop by the dispatcher) — don't gzip/hash/evaluate twice
+		}
+		framingFinalized = true;
 		// gzip here is framed with Transfer-Encoding: chunked, which HTTP/1.0 clients cannot parse
 		// — only enable it for HTTP/1.1 requests so a 1.0 client gets an identity, Content-Length
 		// response instead of an unreadable chunked one. Also never gzip a 206 Partial Content

@@ -90,6 +90,11 @@ public class HttpRequestDispatcher {
 			Thread.startVirtualThread(() -> {
 				try {
 					doDispatch(rh, method, request, response);
+					// Run the CPU-heavy response finalization (gzip + ETag over the whole body) HERE, on the
+					// virtual thread, so the loop-side finish() only does the non-blocking socket write — a
+					// multi-MB response must not gzip/hash on the I/O-loop thread. finish() re-invokes it,
+					// but it is idempotent.
+					response.finalizeFramingOffLoop();
 					ioLoop.addCallback(() -> response.finish());
 				} catch (Throwable e) {
 					logger.error("Unhandled throwable in virtual-thread handler dispatch — sending 500", e);
@@ -113,6 +118,14 @@ public class HttpRequestDispatcher {
 			long start = System.nanoTime();
 			try {
 				doDispatch(rh, method, request, response);
+				// Fold the response-finalization cost (gzip + ETag) into the heavy-timing measurement below
+				// for synchronous handlers, so a handler that returns a large body FAST but is expensive to
+				// gzip/hash still gets flagged heavy and offloaded on subsequent requests (after which the
+				// finalization runs off-loop). finish() re-invokes it idempotently. Skipped for async
+				// handlers, which own their own finishing/streaming.
+				if (!isAsync) {
+					response.finalizeFramingOffLoop();
+				}
 			} catch (RuntimeException | StackOverflowError | LinkageError e) {
 				logger.error("Unhandled error in synchronous handler dispatch — sending 500", e);
 				try {
