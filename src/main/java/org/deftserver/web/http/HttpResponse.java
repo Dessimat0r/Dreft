@@ -277,13 +277,17 @@ public class HttpResponse {
 				bytesWritten += written;
 
 				if (headerBuf.hasRemaining()) {
-					int remHeaders = headerBuf.remaining();
-					responseData.compact();
-					byte[] arr = responseData.prependSpace(remHeaders);
-					headerBuf.get(arr, 0, remHeaders);
-				} else {
-					responseData.compact();
+					// The header write stalled mid-header (send buffer full). The gathered write fills the
+					// header before the body, so the body (responseData) is untouched — stash the unwritten
+					// header remainder as a pending prefix, drained before the body on the next OP_WRITE.
+					// O(1): no body shift (the old prependSpace arraycopy'd the whole body right).
+					protocol.setPendingResponsePrefix(channel, headerBuf);
 				}
+				responseData.compact();
+			} else if (protocol.hasPendingResponsePrefix(channel)) {
+				// A header remainder is still queued ahead of the body (a prior header write stalled).
+				// Writing the body here would reorder it ahead of the header — leave it buffered and let
+				// the OP_WRITE handler drain the prefix, then the body, in order (OP_WRITE re-armed below).
 			} else {
 				responseData.flip();
 				if (responseData.hasRemaining()) {
@@ -302,7 +306,10 @@ public class HttpResponse {
 			}
 			SSLSessionHandler sslHandler = protocol.getSslSessionHandler(channel);
 			boolean sslPending = (sslHandler != null && sslHandler.hasPendingWrite());
-			if (responseData.hasRemaining() || sslPending) {
+			boolean prefixPending = protocol.hasPendingResponsePrefix(channel);
+			if (responseData.hasRemaining() || sslPending || prefixPending) {
+				// A pending header prefix means the body (even if empty) can't finish yet — drive OP_WRITE
+				// so writeDynamicByteBuffer drains the prefix (then the body) on the next writable event.
 				key.channel().register(key.selector(), SelectionKey.OP_WRITE, responseData);
 			}
 			if (sslPending) {
@@ -401,22 +408,31 @@ public class HttpResponse {
 					protocol.armWriteTimeout(clientChannel);
 				} else {
 					boolean isWriting = key.isValid() && (key.interestOps() & SelectionKey.OP_WRITE) != 0;
+					// An undrained header remainder means the response isn't finished even if the body buffer
+					// is empty — it must drain (before the body) on OP_WRITE first, so don't close/re-arm now.
+					boolean prefixPending = protocol.hasPendingResponsePrefix(clientChannel);
 					if (isWriting) {
 						rawAtt = IOLoop.getAttachment(key);
 						if (rawAtt instanceof DynamicByteBuffer) {
 							DynamicByteBuffer dbb = (DynamicByteBuffer) rawAtt;
-							if (!dbb.hasRemaining()) {
+							if (!dbb.hasRemaining() && !prefixPending) {
 								finishConnection(closeConnection);
 							} else if (closeConnection) {
 								protocol.markCloseAfterWrite(clientChannel);
 							}
 						} else if (rawAtt instanceof ByteBuffer) {
 							ByteBuffer bb = (ByteBuffer) rawAtt;
-							if (!bb.hasRemaining()) {
+							if (!bb.hasRemaining() && !prefixPending) {
 								finishConnection(closeConnection);
 							} else if (closeConnection) {
 								protocol.markCloseAfterWrite(clientChannel);
 							}
+						}
+					} else if (prefixPending) {
+						// Defensive: a prefix is pending but OP_WRITE wasn't observed set — ensure we don't
+						// close early. (flush() registers OP_WRITE whenever a prefix is pending, so this is rare.)
+						if (closeConnection) {
+							protocol.markCloseAfterWrite(clientChannel);
 						}
 					} else {
 						finishConnection(closeConnection);

@@ -65,6 +65,13 @@ public class HttpProtocol implements IOHandler {
 	// buffer is reused). Touched only on the I/O-loop thread.
 	private final Map<SocketChannel, java.util.ArrayDeque<ByteBuffer>> pendingFrameWrites = new ConcurrentHashMap<>();
 
+	// Per-channel unwritten HEADER remainder when a plaintext response's header write went partial (the
+	// socket send buffer filled mid-header). Stored as a ByteBuffer positioned at the remainder — drained
+	// BEFORE the body on the next write — so the body is NEVER shifted to prepend it (O(1) vs the old
+	// O(body) DynamicByteBuffer.prepend, which arraycopy'd the whole body right). Plaintext-only: the TLS
+	// path consumes all header plaintext during wrap, so it never leaves a remainder. Loop-thread only.
+	private final Map<SocketChannel, ByteBuffer> pendingResponsePrefix = new ConcurrentHashMap<>();
+
 	private ChannelState getState(SelectableChannel channel) {
 		if (channel == null) return null;
 		return connectionStates.get(channel);
@@ -540,6 +547,7 @@ public class HttpProtocol implements IOHandler {
 	public void closeChannel(SocketChannel channel) {
 		if (channel != null) {
 			pendingFrameWrites.remove(channel); // drop any undrained control-write buffers
+			pendingResponsePrefix.remove(channel); // drop any undrained header remainder
 			ChannelState state = connectionStates.remove(channel);
 			if (state != null) {
 				if (state.websocketHandler != null) {
@@ -1118,6 +1126,42 @@ public class HttpProtocol implements IOHandler {
 		}
 	}
 
+	/** Stashes a plaintext response's unwritten HEADER remainder so the next write drains it BEFORE the
+	 *  body — O(1), instead of shifting the whole body to prepend it (O(body)). The buffer is positioned at
+	 *  its remainder and owned exclusively by this channel; {@link #drainPendingResponsePrefix} consumes it. */
+	/** Test-only: counts how many times the partial-header-write (pending-prefix) path engaged, so a
+	 *  regression test can prove it actually fired rather than trivially passing. */
+	public static volatile long TEST_PREFIX_STASH_COUNT = 0;
+
+	void setPendingResponsePrefix(SocketChannel channel, ByteBuffer headerRemainder) {
+		pendingResponsePrefix.put(channel, headerRemainder);
+		TEST_PREFIX_STASH_COUNT++;
+	}
+
+	/** True if an unwritten header remainder is still queued ahead of this channel's response body — the
+	 *  response is NOT complete until this drains (used by finish()'s completion check). */
+	public boolean hasPendingResponsePrefix(SocketChannel channel) {
+		ByteBuffer p = pendingResponsePrefix.get(channel);
+		return p != null && p.hasRemaining();
+	}
+
+	/** Drains a pending header remainder (if any); returns true once it is fully written (or none was
+	 *  pending), false if the socket filled again and it must resume on the next OP_WRITE. */
+	private boolean drainPendingResponsePrefix(SocketChannel channel) throws IOException {
+		ByteBuffer prefix = pendingResponsePrefix.get(channel);
+		if (prefix == null) {
+			return true;
+		}
+		while (prefix.hasRemaining()) {
+			int n = write(channel, prefix);
+			if (n <= 0) {
+				return false; // socket send buffer full again — resume on the next OP_WRITE
+			}
+		}
+		pendingResponsePrefix.remove(channel);
+		return true;
+	}
+
 	/** True if a previously deferred control-write (WebSocket frame / 100-Continue) is still draining. */
 	public boolean hasPendingFrameWrite(SocketChannel channel) {
 		java.util.ArrayDeque<ByteBuffer> q = pendingFrameWrites.get(channel);
@@ -1302,6 +1346,12 @@ public class HttpProtocol implements IOHandler {
 	/** Writes the dynamic response buffer attached to the key; on completion honours a deferred
 	 *  Connection: close or re-registers for the next request, else defers the remainder to OP_WRITE. */
 	private long writeDynamicByteBuffer(SelectionKey key, SocketChannel channel) throws IOException {
+		// Drain any unwritten header remainder BEFORE the body (the wire is a byte stream — order must hold).
+		// If it doesn't fully drain, the body must wait for the next OP_WRITE.
+		if (!drainPendingResponsePrefix(channel)) {
+			key.interestOps(SelectionKey.OP_WRITE);
+			return 0;
+		}
 		DynamicByteBuffer dbb = (DynamicByteBuffer) IOLoop.getAttachment(key);
 		if (logger.isDebugEnabled()) {
 			logger.debug("pending data about to be written");
