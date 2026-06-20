@@ -72,15 +72,17 @@ public class HttpFuzzTest {
 	 *  errors are expected and ignored — only the server's survival matters. */
 	private static void fireRawBytesAndForget(byte[] payload) {
 		try (Socket socket = new Socket("localhost", PORT)) {
-			socket.setSoLinger(true, 0);
-			// Many fuzz inputs are deliberately incomplete, so the server correctly waits for more —
-			// a short timeout + single read keeps the fuzzer fast instead of blocking on each one.
-			socket.setSoTimeout(120);
+			// Graceful close (FIN, not RST): after we write+flush and close, the kernel still delivers the
+			// buffered payload to the server, which parses it asynchronously — so there is no need to block
+			// on a per-iteration read to hold the connection open (the old code waited up to 120 ms PER
+			// incomplete input, which dominated the runtime). Many fuzz inputs are deliberately incomplete,
+			// so the server never replies; we don't care about the response, only that the server survives,
+			// which the periodic/final liveness() round-trips below verify. Not setting SO_LINGER(0) keeps
+			// the close graceful so every payload is delivered regardless of timing.
 			socket.getOutputStream().write(payload);
 			socket.getOutputStream().flush();
-			socket.getInputStream().read(new byte[2048]); // best-effort, content ignored
 		} catch (IOException expected) {
-			// reset / timeout / refused — fine; the server must merely not crash.
+			// connect / write failure — fine; the server must merely not crash.
 		}
 	}
 

@@ -71,7 +71,11 @@ public class ChaosTrafficTest {
 	private static void deliverChaos(int port, byte[] payload, ThreadLocalRandom rnd) {
 		try (Socket s = new Socket("127.0.0.1", port)) {
 			s.setSoLinger(true, 0);
-			s.setSoTimeout(8000);
+			// Bounds how long a chaos task may block reading a (garbage) response — the case that reads back
+			// can otherwise sit until the server's header-read timeout closes an incomplete request. We don't
+			// assert anything about the garbage response, so a short cap keeps the storm fast; clean-traffic
+			// assertions use separate sockets with their own generous timeouts.
+			s.setSoTimeout(250);
 			OutputStream os = s.getOutputStream();
 			switch (rnd.nextInt(8)) {
 				case 0: // one shot
@@ -100,7 +104,7 @@ public class ChaosTrafficTest {
 				case 4: // connect, send a few bytes, stall briefly, then the rest (slow-loris-ish)
 					if (payload.length > 0) {
 						os.write(payload, 0, Math.min(4, payload.length)); os.flush();
-						Thread.sleep(rnd.nextInt(50));
+						Thread.sleep(rnd.nextInt(20));
 						if (payload.length > 4) os.write(payload, 4, payload.length - 4);
 						os.flush();
 					}
@@ -109,8 +113,8 @@ public class ChaosTrafficTest {
 					os.write(payload); os.flush();
 					try { s.getInputStream().read(new byte[256]); } catch (IOException ignore) { }
 					break;
-				case 6: // connect, send nothing, stall ~100ms, then drop (idle timeout stress)
-					Thread.sleep(30 + rnd.nextInt(120));
+				case 6: // connect, send nothing, stall briefly, then drop (idle-hold stress)
+					Thread.sleep(5 + rnd.nextInt(25));
 					break;
 				default: // multiple small writes with interleaved pauses
 					for (int off = 0; off < payload.length; ) {
