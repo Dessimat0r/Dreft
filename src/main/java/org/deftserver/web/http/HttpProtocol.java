@@ -858,10 +858,23 @@ public class HttpProtocol implements IOHandler {
 			bt.cancel();
 		}
 		key.interestOps(key.interestOps() & ~SelectionKey.OP_READ);
+		// The body is fully received. If its (heavy) decompress/parse was deferred, run it OFF the loop
+		// first, then route+dispatch — preserving the malformed-body → 400 / 413 contract by mapping a
+		// finalize failure to the same status BEFORE any handler runs.
+		if (request.isFinalizationPending()) {
+			finalizeRequestOffLoop(key, clientChannel, request);
+			return;
+		}
+		proceedWithCompleteRequest(key, clientChannel, request);
+	}
+
+	/** Routes and dispatches a fully-received, FINALIZED request — the tail shared by the inline path and
+	 *  the off-loop-finalization completion. */
+	private void proceedWithCompleteRequest(SelectionKey key, SocketChannel clientChannel, HttpRequest request) throws IOException {
 		if (logger.isDebugEnabled()) {
 			logger.debug("handle read 3..., req class: {}, req: {}", request.getClass(), request);
 		}
-		
+
 		final boolean keepAlive;
 
 		if (!(request instanceof MalFormedHttpRequest) && request.isKeepAlive()) {
@@ -876,7 +889,7 @@ public class HttpProtocol implements IOHandler {
 				ioLoop.addKeepAliveTimeout(clientChannel, newKeepAliveTimeout(clientChannel));
 			}
 		} else keepAlive = false;
-		
+
 		HttpResponse response = new HttpResponse(this, key, keepAlive, request.getMethod() == org.deftserver.web.HttpVerb.HEAD);
 		response.setRequest(request);
 		if (logger.isDebugEnabled()) {
@@ -923,6 +936,66 @@ public class HttpProtocol implements IOHandler {
 				logger.debug("Failed to send 500 after routing/dispatch failure", suppressed);
 				closeChannel(clientChannel);
 			}
+		}
+	}
+
+	/**
+	 * Runs a fully-received request's deferred {@link HttpRequest#finalizeContent()} (decompress +
+	 * form/multipart parse, O(body size)) on a VIRTUAL THREAD — off the I/O loop — then marshals the
+	 * routing+dispatch back onto the loop. A parse failure is mapped to the SAME status the inline parse
+	 * would have produced (ProtocolException/etc → 400 via the MalFormedHttpRequest sentinel; HttpException
+	 * 413 → its own status), preserving the malformed-body contract. OP_READ stays suspended (the caller
+	 * cleared it) so nothing races this request's buffers while it finalizes.
+	 */
+	private void finalizeRequestOffLoop(final SelectionKey key, final SocketChannel clientChannel, final HttpRequest request) {
+		Thread.startVirtualThread(() -> {
+			HttpException httpFailure = null;
+			boolean malformed = false;
+			try {
+				request.finalizeContent(); // decompress + parse + validate, off the I/O loop
+			} catch (HttpException he) {
+				httpFailure = he; // e.g. 413 from an over-large decompressed body — preserve the status
+			} catch (Throwable t) {
+				logger.debug("malformed body during off-loop finalization", t);
+				malformed = true; // ProtocolException/IOException/IllegalArgumentException → 400
+			}
+			final HttpException fHttpFailure = httpFailure;
+			final boolean fMalformed = malformed;
+			ioLoop.addCallback(() -> {
+				if (!key.isValid() || !clientChannel.isOpen()) {
+					return; // channel gone while finalizing — nothing to do
+				}
+				try {
+					if (fHttpFailure != null) {
+						sendHttpExceptionResponse(key, clientChannel, fHttpFailure);
+					} else if (fMalformed) {
+						// Route the sentinel through normal dispatch → 400, exactly like the inline path.
+						proceedWithCompleteRequest(key, clientChannel, MalFormedHttpRequest.instance);
+					} else {
+						proceedWithCompleteRequest(key, clientChannel, request);
+					}
+				} catch (Exception e) {
+					logger.debug("Failed to complete off-loop-finalized request: {}", e.getMessage());
+					closeChannel(clientChannel);
+				}
+			});
+		});
+	}
+
+	/** Sends a bare {@link HttpException} response (status + plain-text body) and finalises — used when an
+	 *  off-loop body finalization fails with a specific status (e.g. 413). */
+	private void sendHttpExceptionResponse(SelectionKey key, SocketChannel clientChannel, HttpException he) {
+		try {
+			HttpResponse response = new HttpResponse(this, key, false, false);
+			response.setStatusCode(he.getStatusCode());
+			response.setHeader("Connection", "close");
+			response.setHeader("Content-Type", "text/plain; charset=utf-8");
+			response.setHeader("X-Content-Type-Options", "nosniff");
+			response.write(he.getLongHTMLMessage());
+			response.finish();
+		} catch (Exception e) {
+			logger.debug("Failed to send HttpException response: {}", e.getMessage());
+			closeChannel(clientChannel);
 		}
 	}
 

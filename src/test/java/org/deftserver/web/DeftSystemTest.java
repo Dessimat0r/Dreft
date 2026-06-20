@@ -1037,6 +1037,52 @@ public class DeftSystemTest {
 		}
 	}
 	
+	/**
+	 * Happy path for off-loop body finalization: a body larger than FINALIZE_OFFLOAD_THRESHOLD (256 KiB)
+	 * is finalized (parsed) on a virtual thread before dispatch, then marshaled back to the loop. The
+	 * echoed body must come back byte-identical — proving the offload path doesn't corrupt/truncate.
+	 */
+	@Test
+	public void largeBodyOffLoopFinalizationTest() throws IOException, InterruptedException {
+		StringBuilder sb = new StringBuilder();
+		for (int i = 0; sb.length() < 300 * 1024; i++) {
+			sb.append("line-").append(i).append("-payload\n");
+		}
+		String body = sb.toString();
+		java.net.http.HttpClient httpClient = java.net.http.HttpClient.newHttpClient();
+		java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+				.uri(URI.create("http://localhost:" + PORT + "/echo"))
+				.POST(BodyPublishers.ofString(body))
+				.build();
+		java.net.http.HttpResponse<String> response = httpClient.send(request, BodyHandlers.ofString());
+		assertNotNull(response);
+		assertEquals(200, response.statusCode());
+		assertEquals(body, response.body());
+	}
+
+	/**
+	 * Contract on the off-loop finalization path: a malformed body large enough (>256 KiB) to be finalized
+	 * OFF the loop must still map to 400 (via the MalFormedHttpRequest sentinel), exactly like the inline
+	 * path — NOT 500. Locks the malformed-body→400 guarantee for the deferred-parse branch, which existing
+	 * (small, inline-finalized) malformed tests don't exercise.
+	 */
+	@Test
+	public void largeMalformedMultipartIsBadRequestTest() throws IOException {
+		int bodyLen = 300 * 1024; // > FINALIZE_OFFLOAD_THRESHOLD → deferred off-loop finalization
+		StringBuilder garbage = new StringBuilder(bodyLen);
+		for (int i = 0; i < bodyLen; i++) garbage.append('A'); // no multipart boundary anywhere → parse fails
+		String response = sendRawRequest(
+			"POST /echo HTTP/1.1\r\n" +
+			"Host: localhost\r\n" +
+			"Content-Type: multipart/form-data; boundary=----XYZ\r\n" +
+			"Content-Length: " + bodyLen + "\r\n" +
+			"Connection: close\r\n" +
+			"\r\n" +
+			garbage);
+		assertTrue("expected 400 on off-loop malformed-multipart finalization, got: " +
+			response.substring(0, Math.min(64, response.length())), response.startsWith("HTTP/1.1 400"));
+	}
+
 	@Test
 	public void authenticatedRequestHandlerTest() throws IOException, InterruptedException {
 		java.net.http.HttpClient httpclient = java.net.http.HttpClient.newHttpClient();

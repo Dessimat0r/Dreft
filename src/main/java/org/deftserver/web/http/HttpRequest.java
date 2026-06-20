@@ -158,6 +158,16 @@ public class HttpRequest {
 	private static final int MAX_HEADER_COUNT = 100;
 	/** Maximum request body size in bytes (16 MiB). Requests exceeding this → 413 Payload Too Large. */
 	public static final int MAX_BODY_SIZE = 16 * 1024 * 1024;
+	/** Bodies at/below this size whose finalization (decompress + form/multipart parse) is uncompressed
+	 *  are cheap enough to finalize inline on the I/O loop; larger or compressed bodies are finalized off
+	 *  the loop by the live server. */
+	static final int FINALIZE_OFFLOAD_THRESHOLD = 256 * 1024;
+	/** When true (set only by the live-server {@code of(Application, ByteBuffer)} path), a heavy body's
+	 *  finalization is deferred to {@link #finalizeContent()} so the live server can run it off the loop;
+	 *  the of()/test paths leave it false and finalize inline (staying synchronous). */
+	private boolean deferFinalization = false;
+	/** True once the body is fully received but its (heavy) finalization was deferred (see above). */
+	private boolean finalizationPending = false;
 	/** Cap on the number of multipart parts, to bound the object/memory amplification a body of
 	 *  many tiny parts would otherwise cause (a 16 MiB body could hold ~300k minimal parts). */
 	static final int MAX_MULTIPART_PARTS = 10000;
@@ -277,6 +287,13 @@ public class HttpRequest {
 	 * rejecting smuggling combinations) and keep-alive disposition, then begins consuming the body.
 	 */
 	public HttpRequest(int requestNum, String requestLine, Map<String, String> headers, ByteBuffer buffer) throws IOException {
+		this(requestNum, requestLine, headers, buffer, false);
+	}
+
+	/** As above, but {@code deferFinalization} controls whether a heavy body's decompress/parse is
+	 *  deferred (live server) or run inline (of()/test paths). */
+	public HttpRequest(int requestNum, String requestLine, Map<String, String> headers, ByteBuffer buffer, boolean deferFinalization) throws IOException {
+		this.deferFinalization = deferFinalization;
 		this.requestNum  = requestNum;
 		this.requestLine = requestLine;
 		if (requestLine != null && headers != null) {
@@ -559,7 +576,7 @@ public class HttpRequest {
 			}
 			logger.debug("buffer remaining: {}", buffer.remaining());
 		}
-		return new HttpRequest(app.nextHttpReqNum(), requestLine, generalHeaders, buffer);
+		return new HttpRequest(app.nextHttpReqNum(), requestLine, generalHeaders, buffer, true /* live server: defer heavy finalization off-loop */);
 	}
 	
 	/** Multipart parts keyed by field name (last-wins for duplicate names; use {@link #getAllParts()}
@@ -656,8 +673,44 @@ public class HttpRequest {
 			if (!complete) return false;
 		}
 
-		logger.debug("complete, now parsing; raw body length: {}", rawBody.remaining());
+		// Body bytes are all received. The CPU-heavy finalization (decompress + form/multipart parse, both
+		// O(body size)) can be deferred OFF the I/O loop for heavy bodies (compressed, or large) — see
+		// finalizeContent(). The live server (deferFinalization=true) marshals it to a virtual thread; the
+		// of()/test paths finalize inline so they stay synchronous. Small uncompressed bodies always
+		// finalize inline (the parse is cheap and the offload isn't worth its overhead).
+		String contentEncoding = headers.get("content-encoding");
+		boolean heavy = (contentEncoding != null && !isBlank(contentEncoding))
+			|| currentRawBodyLength() > FINALIZE_OFFLOAD_THRESHOLD;
+		if (deferFinalization && heavy) {
+			finalizationPending = true;
+			return true; // complete (all bytes received); caller runs finalizeContent() off-loop
+		}
+		finalizeContent();
+		return true;
+	}
 
+	/** Bytes received so far for the body (decoded for chunked), used to decide whether finalization is
+	 *  heavy enough to offload. */
+	private int currentRawBodyLength() {
+		return chunked ? chunkedBody.size() : rawBody.limit();
+	}
+
+	/** True once {@link #putContentData} has received the whole body but deferred the (heavy)
+	 *  decompress + parse to a later {@link #finalizeContent()} call, run off the I/O loop. */
+	public boolean isFinalizationPending() {
+		return finalizationPending;
+	}
+
+	/**
+	 * Runs the CPU-heavy body finalization — decompress (if Content-Encoding) and form/multipart parse,
+	 * both O(body size) — that {@link #putContentData} deferred. Throws exactly as the inline parse did
+	 * (a {@link ProtocolException}/{@link IllegalArgumentException} for a malformed body, an
+	 * {@link HttpException} 413 for an over-large decompressed body), so the caller maps it to the same
+	 * 400/413 BEFORE dispatch. Safe to run off-loop: it only touches this request's own buffers.
+	 */
+	public void finalizeContent() throws IOException {
+		finalizationPending = false;
+		logger.debug("finalizing body; raw body length: {}", currentRawBodyLength());
 		byte[] rawBytes;
 		if (chunked) {
 			rawBytes = chunkedBody.toByteArray();
@@ -675,7 +728,6 @@ public class HttpRequest {
 		} else {
 			parseMultipartParts(ByteBuffer.wrap(rawBytes));
 		}
-		return true;
 	}
 
 	/**
