@@ -21,4 +21,12 @@ public class HttpServerDescriptor {
 	/** Length of the TCP accept backlog. Default 1024 (vs JDK default 50). */
 	public static volatile int ACCEPT_BACKLOG = 1024;
 
+	/** Max connections drained from the OS accept queue per OP_ACCEPT readiness event. The selector is
+	 *  level-triggered, so accepting only one per event drains the backlog one connection per event-loop
+	 *  iteration — under a burst that needlessly delays accepts and can let the backlog fill (forcing
+	 *  clients into multi-second SYN-retransmit backoff). Draining a bounded batch empties it far faster;
+	 *  the cap still yields the loop to read/write/timeout work and bounds cross-reactor imbalance in
+	 *  multi-loop mode. Default 64. */
+	public static volatile int MAX_ACCEPTS_PER_EVENT = 64;
+
 }

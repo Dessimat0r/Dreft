@@ -65,7 +65,11 @@ public class ImpairmentProxy implements AutoCloseable {
 		this.targetPort = targetPort;
 		this.listen = new ServerSocket();
 		this.listen.setReuseAddress(true);
-		this.listen.bind(new InetSocketAddress("127.0.0.1", 0));
+		// Bind with a real accept backlog. The JDK default (50) overflows when a chaos storm opens dozens
+		// of connections to the proxy at once: overflowed SYNs are dropped, forcing the *client* into
+		// multi-second TCP retransmit backoff — which shows up as occasional clean-request failures. Size
+		// it like the server's own ACCEPT_BACKLOG so the proxy never becomes the bottleneck.
+		this.listen.bind(new InetSocketAddress("127.0.0.1", 0), 1024);
 		this.acceptThread = new Thread(this::acceptLoop, "impairment-proxy-accept");
 		this.acceptThread.setDaemon(true);
 		this.acceptThread.start();

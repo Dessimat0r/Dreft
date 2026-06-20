@@ -612,23 +612,33 @@ public class HttpProtocol implements IOHandler {
 	@Override
 	public void handleAccept(SelectionKey key) throws IOException {
 		logger.debug("handle accept... isSSLEnabled={}", isSSLEnabled());
-		SocketChannel clientChannel = ((ServerSocketChannel) key.channel()).accept();
-		if (clientChannel == null) {
-			return; // another loop won the race (multi-reactor), or nothing to accept
-		}
-		// CRITICAL: isolate ALL per-connection setup. If anything here throws (most importantly the
-		// initial TLS handshake, which an immediate-garbage client can make throw an SSLException or
-		// RuntimeException), it must NOT propagate out of handleAccept — the IOLoop's accept-error
-		// path closes key.channel(), which for an OP_ACCEPT key is the shared *listening*
-		// ServerSocketChannel. A single hostile connection would otherwise close the listening socket
-		// and stop the whole server from accepting (a trivial remote DoS). Close only this client.
-		try {
-			boolean isSsl = Boolean.TRUE.equals(IOLoop.getAttachment(key));
-			setUpAcceptedConnection(clientChannel, isSsl);
-		} catch (IOException | RuntimeException e) {
-			logger.debug("Failed to set up accepted connection {} — closing it (not the listener): {}",
-				clientChannel, e.toString());
-			closeChannel(clientChannel);
+		final ServerSocketChannel listener = (ServerSocketChannel) key.channel();
+		final boolean isSsl = Boolean.TRUE.equals(IOLoop.getAttachment(key));
+		// Drain a bounded BATCH of pending connections per readiness event rather than one. The selector
+		// is level-triggered, so a single accept() per event empties the OS backlog only one connection
+		// per event-loop iteration — under a burst that needlessly delays accepts (and, once the backlog
+		// fills, pushes clients into multi-second SYN-retransmit backoff). The cap keeps the loop fair to
+		// read/write/timeout work and bounds cross-reactor imbalance in multi-loop mode; the next
+		// iteration's OP_ACCEPT resumes draining any remainder.
+		final int maxAccepts = Math.max(1, HttpServerDescriptor.MAX_ACCEPTS_PER_EVENT);
+		for (int i = 0; i < maxAccepts; i++) {
+			SocketChannel clientChannel = listener.accept();
+			if (clientChannel == null) {
+				break; // backlog drained (or another reactor won the race in multi-reactor mode)
+			}
+			// CRITICAL: isolate ALL per-connection setup. If anything here throws (most importantly the
+			// initial TLS handshake, which an immediate-garbage client can make throw an SSLException or
+			// RuntimeException), it must NOT propagate out of handleAccept — the IOLoop's accept-error
+			// path closes key.channel(), which for an OP_ACCEPT key is the shared *listening*
+			// ServerSocketChannel. A single hostile connection would otherwise close the listening socket
+			// and stop the whole server from accepting (a trivial remote DoS). Close only this client.
+			try {
+				setUpAcceptedConnection(clientChannel, isSsl);
+			} catch (IOException | RuntimeException e) {
+				logger.debug("Failed to set up accepted connection {} — closing it (not the listener): {}",
+					clientChannel, e.toString());
+				closeChannel(clientChannel);
+			}
 		}
 	}
 
