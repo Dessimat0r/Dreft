@@ -46,27 +46,29 @@ public class WebSocketConnection {
 	 *  RFC 6455 §5.2; a failed write tears the connection down. */
 	private void doWrite(byte firstByte, byte[] payload) {
 		int len = payload.length;
-		ByteBuffer header;
+		ByteBuffer frame;
 		if (len < 126) {
-			header = ByteBuffer.allocate(2);
-			header.put(firstByte);
-			header.put((byte) len);
+			frame = ByteBuffer.allocate(2 + len);
+			frame.put(firstByte);
+			frame.put((byte) len);
 		} else if (len <= 65535) {
-			header = ByteBuffer.allocate(4);
-			header.put(firstByte);
-			header.put((byte) 126);
-			header.putShort((short) len);
+			frame = ByteBuffer.allocate(4 + len);
+			frame.put(firstByte);
+			frame.put((byte) 126);
+			frame.putShort((short) len);
 		} else {
-			header = ByteBuffer.allocate(10);
-			header.put(firstByte);
-			header.put((byte) 127);
-			header.putLong(len);
+			frame = ByteBuffer.allocate(10 + len);
+			frame.put(firstByte);
+			frame.put((byte) 127);
+			frame.putLong(len);
 		}
-		header.flip();
-		ByteBuffer body = ByteBuffer.wrap(payload);
+		frame.put(payload);
+		frame.flip();
 
 		try {
-			protocol.writeBlocking(channel, new ByteBuffer[]{header, body});
+			// Non-blocking: any bytes the socket can't take now are deferred to OP_WRITE, so a slow/non-
+			// reading peer is reaped by the idle write timeout instead of freezing the I/O-loop thread.
+			protocol.writeFrame(channel, frame);
 		} catch (IOException e) {
 			protocol.closeChannel(channel);
 		}
@@ -86,11 +88,16 @@ public class WebSocketConnection {
 		frame.putShort((short) 1000); // Normal closure
 		frame.flip();
 		try {
-			protocol.writeBlocking(channel, frame);
+			protocol.writeFrame(channel, frame);
+			if (protocol.hasPendingFrameWrite(channel)) {
+				// Slow reader: close once the Close frame has actually flushed (OP_WRITE drain), so the
+				// close handshake never blocks the I/O-loop thread yet the frame still goes out first.
+				protocol.markCloseAfterWrite(channel);
+				return;
+			}
 		} catch (IOException ignored) {
-		} finally {
-			protocol.closeChannel(channel);
 		}
+		protocol.closeChannel(channel);
 	}
 
 	/** The underlying socket channel for this WebSocket connection. */

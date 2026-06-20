@@ -57,6 +57,14 @@ public class HttpProtocol implements IOHandler {
 
 	private final Map<SocketChannel, ChannelState> connectionStates = new ConcurrentHashMap<>();
 
+	// Per-channel FIFO of small "must-flush-now" control buffers (WebSocket frames, the 100-Continue
+	// interim response) whose socket write did not fully drain. The remainder is flushed on OP_WRITE and a
+	// peer that never drains is reaped by the idle write timeout — so a slow/non-reading peer can NEVER
+	// freeze the I/O-loop thread (which the bounded-but-blocking writeBlocking did, parking the loop for up
+	// to RESPONSE_WRITE_TIMEOUT_MS). Buffers are stored already SSL-wrapped (and copied, since the SSL wrap
+	// buffer is reused). Touched only on the I/O-loop thread.
+	private final Map<SocketChannel, java.util.ArrayDeque<ByteBuffer>> pendingFrameWrites = new ConcurrentHashMap<>();
+
 	private ChannelState getState(SelectableChannel channel) {
 		if (channel == null) return null;
 		return connectionStates.get(channel);
@@ -531,6 +539,7 @@ public class HttpProtocol implements IOHandler {
 	 *  nothing leaks. */
 	public void closeChannel(SocketChannel channel) {
 		if (channel != null) {
+			pendingFrameWrites.remove(channel); // drop any undrained control-write buffers
 			ChannelState state = connectionStates.remove(channel);
 			if (state != null) {
 				if (state.websocketHandler != null) {
@@ -930,6 +939,25 @@ public class HttpProtocol implements IOHandler {
 			http2Conn.onWritable();
 			return;
 		}
+		// Deferred control-write (WebSocket frame / 100-Continue) draining? Such a channel has no response
+		// attachment to service — it's a frame-write channel — so handle it here and return.
+		if (hasPendingFrameWrite(channel)) {
+			prolongWriteTimeout(channel); // OP_WRITE fired ⇒ the peer made room ⇒ progress
+			try {
+				if (drainPendingFrameWrites(channel)) {
+					cancelWriteTimeout(channel);
+					if (isCloseAfterWrite(channel)) {
+						closeChannel(channel); // the Close frame finished flushing — now tear down
+					} else {
+						ioLoop.updateHandler(channel, SelectionKey.OP_READ); // resume reading frames / the body
+					}
+				}
+			} catch (IOException e) {
+				logger.debug("Frame write failed during drain — closing channel: {}", e.getMessage());
+				closeChannel(channel);
+			}
+			return;
+		}
 		Object attachment = IOLoop.getAttachment(key);
 		if (logger.isDebugEnabled()) {
 			logger.debug("handle write... attachment={}", attachment == null ? "null" : attachment.getClass().getSimpleName());
@@ -1129,6 +1157,79 @@ public class HttpProtocol implements IOHandler {
 		} else {
 			writeFully(channel, srcs);
 		}
+	}
+
+	/** True if a previously deferred control-write (WebSocket frame / 100-Continue) is still draining. */
+	public boolean hasPendingFrameWrite(SocketChannel channel) {
+		java.util.ArrayDeque<ByteBuffer> q = pendingFrameWrites.get(channel);
+		return q != null && !q.isEmpty();
+	}
+
+	/**
+	 * Non-blocking write of a small must-flush-now control buffer (a WebSocket frame, or a 100-Continue
+	 * interim response). Sends what the socket accepts immediately; any unsent bytes are queued and flushed
+	 * on OP_WRITE, and a peer that never drains is reaped by the idle write timeout — so a slow/non-reading
+	 * peer can NEVER freeze the I/O-loop thread (unlike {@link #writeBlocking}, which parks the loop for up
+	 * to the multi-second write-stall window, stalling every other connection on the loop). Ordering is
+	 * preserved (FIFO): a buffer that arrives while a previous one is still draining is queued behind it.
+	 * Must run on the I/O-loop thread (WebSocket sends are marshalled there via {@code addCallback}; the
+	 * 100-Continue / inbound-frame paths are already on it).
+	 */
+	public void writeFrame(SocketChannel channel, ByteBuffer frame) throws IOException {
+		SSLSessionHandler sslHandler = getSslSessionHandler(channel);
+		final ByteBuffer toSend;
+		if (sslHandler != null) {
+			// wrap() returns a REUSED internal buffer — copy the ciphertext out before it can be deferred,
+			// or the next wrap would overwrite the bytes still queued for this channel.
+			toSend = copyRemaining(sslHandler.wrap(frame));
+		} else {
+			toSend = frame;
+		}
+		java.util.ArrayDeque<ByteBuffer> q = pendingFrameWrites.get(channel);
+		if (q != null && !q.isEmpty()) {
+			// A previous frame is still draining — queue behind it (the wire is a byte stream, so order
+			// must be preserved). Copy so the caller may reuse its buffer.
+			q.addLast(copyRemaining(toSend));
+			armWriteTimeout(channel);
+			return;
+		}
+		channel.write(toSend);
+		if (toSend.hasRemaining()) {
+			if (q == null) {
+				q = new java.util.ArrayDeque<>();
+				pendingFrameWrites.put(channel, q);
+			}
+			q.addLast(copyRemaining(toSend));
+			ioLoop.updateHandler(channel, SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+			armWriteTimeout(channel);
+		}
+	}
+
+	/** A fresh ByteBuffer holding a copy of {@code src}'s remaining bytes (src is consumed). */
+	private static ByteBuffer copyRemaining(ByteBuffer src) {
+		ByteBuffer copy = ByteBuffer.allocate(src.remaining());
+		copy.put(src);
+		copy.flip();
+		return copy;
+	}
+
+	/** Drains queued control-write buffers on OP_WRITE; returns true once the queue is empty. The caller
+	 *  resumes OP_READ / closes the channel as appropriate. */
+	private boolean drainPendingFrameWrites(SocketChannel channel) throws IOException {
+		java.util.ArrayDeque<ByteBuffer> q = pendingFrameWrites.get(channel);
+		if (q == null) {
+			return true;
+		}
+		while (!q.isEmpty()) {
+			ByteBuffer head = q.peekFirst();
+			channel.write(head);
+			if (head.hasRemaining()) {
+				return false; // socket buffer full again — resume on the next OP_WRITE
+			}
+			q.removeFirst();
+		}
+		pendingFrameWrites.remove(channel);
+		return true;
 	}
 
 	/** Encrypts {@code src} via the TLS engine and writes the resulting record fully to the socket. */
@@ -1765,7 +1866,11 @@ public class HttpProtocol implements IOHandler {
 							throw new HttpException(413, "Payload Too Large", "Payload size exceeds maximum allowed limit");
 						}
 						ByteBuffer continueResponse = ByteBuffer.wrap(CONTINUE_BYTES);
-						writeBlocking(clientChannel, continueResponse);
+						// Non-blocking, like the WS frame path: a client that asked for 100-continue but then
+						// stalls reading our interim response must not pin the I/O-loop thread. If the 25-byte
+						// response can't flush now it defers to OP_WRITE; the drain restores OP_READ so the body
+						// read resumes once the client has actually received the 100.
+						writeFrame(clientChannel, continueResponse);
 						if (logger.isDebugEnabled()) {
 							logger.debug("Sent HTTP/1.1 100 Continue early response");
 						}
@@ -1774,7 +1879,11 @@ public class HttpProtocol implements IOHandler {
 						logger.debug("adding partial http request - http req #{}, remaining: {}", request.getRequestNum(), request.getRemaining());
 					}
 					putPartial(key.channel(), request);
-					key.interestOps(SelectionKey.OP_READ);
+					// Don't clobber the OP_READ|OP_WRITE that a deferred 100-Continue set — its OP_WRITE drain
+					// restores OP_READ. Only force read-only when nothing is pending.
+					if (!hasPendingFrameWrite(clientChannel)) {
+						key.interestOps(SelectionKey.OP_READ);
+					}
 				} else {
 					if (logger.isDebugEnabled()) {
 						logger.debug("normal HttpRequest");
@@ -1986,7 +2095,14 @@ public class HttpProtocol implements IOHandler {
 					closeFrame.put((byte) 2);
 					closeFrame.putShort((short) code);
 					closeFrame.flip();
-					writeBlocking(clientChannel, closeFrame);
+					// Non-blocking: if the Close frame can't flush now (slow reader), defer it and tear the
+					// channel down only once it has actually gone out — so the close handshake never parks
+					// the I/O-loop thread.
+					writeFrame(clientChannel, closeFrame);
+					if (hasPendingFrameWrite(clientChannel)) {
+						markCloseAfterWrite(clientChannel);
+						return; // closeChannel happens when the OP_WRITE drain finishes the frame
+					}
 				} catch (IOException ignore) {
 					// peer already gone; proceed to tear down
 				}
@@ -2000,7 +2116,7 @@ public class HttpProtocol implements IOHandler {
 				pong.put((byte) pongLen);
 				pong.put(payload, 0, pongLen);
 				pong.flip();
-				writeBlocking(clientChannel, pong);
+				writeFrame(clientChannel, pong); // non-blocking; defers to OP_WRITE if the socket is full
 			} else if (opcode == 0x1 || opcode == 0x2 || opcode == 0x0) { // Text, Binary or Continuation
 				// Reassemble fragmented messages: a data frame with FIN=0 begins a message that
 				// is continued by opcode-0x0 frames until one arrives with FIN=1. Control frames
