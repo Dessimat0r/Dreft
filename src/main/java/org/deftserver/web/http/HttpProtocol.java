@@ -1137,18 +1137,24 @@ public class HttpProtocol implements IOHandler {
 	public void writeFrame(SocketChannel channel, ByteBuffer frame) throws IOException {
 		SSLSessionHandler sslHandler = getSslSessionHandler(channel);
 		final ByteBuffer toSend;
+		final boolean owned; // true if toSend is a private buffer we may queue directly (no re-copy)
 		if (sslHandler != null) {
 			// wrap() returns a REUSED internal buffer — copy the ciphertext out before it can be deferred,
-			// or the next wrap would overwrite the bytes still queued for this channel.
+			// or the next wrap would overwrite the bytes still queued for this channel. The copy is ours,
+			// so it can be queued as-is (its position/limit track the unsent remainder).
 			toSend = copyRemaining(sslHandler.wrap(frame));
+			owned = true;
 		} else {
+			// Plaintext path uses the caller's buffer directly; copy only if/when we have to queue it, so
+			// the caller may reuse its buffer.
 			toSend = frame;
+			owned = false;
 		}
 		java.util.ArrayDeque<ByteBuffer> q = pendingFrameWrites.get(channel);
 		if (q != null && !q.isEmpty()) {
 			// A previous frame is still draining — queue behind it (the wire is a byte stream, so order
-			// must be preserved). Copy so the caller may reuse its buffer.
-			q.addLast(copyRemaining(toSend));
+			// must be preserved).
+			q.addLast(owned ? toSend : copyRemaining(toSend));
 			armWriteTimeout(channel);
 			return;
 		}
@@ -1158,7 +1164,7 @@ public class HttpProtocol implements IOHandler {
 				q = new java.util.ArrayDeque<>();
 				pendingFrameWrites.put(channel, q);
 			}
-			q.addLast(copyRemaining(toSend));
+			q.addLast(owned ? toSend : copyRemaining(toSend));
 			ioLoop.updateHandler(channel, SelectionKey.OP_READ | SelectionKey.OP_WRITE);
 			armWriteTimeout(channel);
 		}
