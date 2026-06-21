@@ -72,22 +72,20 @@ public class IOLoop implements IOLoopMXBean {
 	
 	/** Creates an I/O loop with its own NIO {@link Selector} and registers its JMX bean. The loop
 	 *  does not run until {@link #start()} is called on the thread that should become the loop thread. */
-	private final java.security.MessageDigest md5;
+	// SHA-1 for the WebSocket handshake accept-key. Shared per-loop and ONLY safe because the handshake
+	// runs on the I/O-loop thread. (There is deliberately no shared MD5 here: ETag hashing now happens off
+	// the loop on virtual threads — see HttpResponse / StaticContentHandler — where a shared, non-thread-
+	// safe MessageDigest would be corrupted by concurrent use, so those paths allocate a fresh digest.)
 	private final java.security.MessageDigest sha1;
 
 	public IOLoop() throws IOException {
 		selector = Selector.open();
 		try {
-			md5 = java.security.MessageDigest.getInstance("MD5");
 			sha1 = java.security.MessageDigest.getInstance("SHA-1");
 		} catch (java.security.NoSuchAlgorithmException e) {
 			throw new RuntimeException(e);
 		}
 		MXBeanUtil.registerMXBean(this, "IOLoop");
-	}
-
-	public java.security.MessageDigest getMd5() {
-		return md5;
 	}
 
 	public java.security.MessageDigest getSha1() {

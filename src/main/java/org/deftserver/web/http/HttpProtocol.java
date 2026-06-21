@@ -913,17 +913,23 @@ public class HttpProtocol implements IOHandler {
 				logger.debug("handle read 7...");
 			}
 
-			//Only close if not async or offloaded. In that case its up to RH or Virtual Thread to close it (+ don't close if it's a partial request).
-			if (request instanceof MalFormedHttpRequest || (!isAsyncOrOffloaded && request.isComplete())) {
+			// Finish on the I/O-loop thread ONLY when dispatch ran SYNCHRONOUSLY (it did not hand the
+			// response off to a virtual thread / async handler). A MalFormedHttpRequest is logically
+			// complete but isComplete() reports false for the sentinel, so it is checked explicitly — yet
+			// it MUST still respect the offload gate. If the terminal handler (e.g. BadRequestRequestHandler)
+			// was itself flagged "heavy" under load and offloaded, the virtual thread now owns the response;
+			// finishing it here too would run finish()/flush() on the loop CONCURRENTLY with the vthread's
+			// doDispatch + framing + finish() on the SAME HttpResponse — a data race that flushes a still-
+			// empty 200/Content-Length:0 while the vthread writes the real body/status (corrupting framing).
+			if (!isAsyncOrOffloaded && (request instanceof MalFormedHttpRequest || request.isComplete())) {
 				response.finish();
-			} else if (isAsyncOrOffloaded && request.isComplete() && !(request instanceof MalFormedHttpRequest)
-					&& !response.hasFinished()) {
-				// The response is still pending — it will be finished later, off the loop. Bound that
-				// with a processing timeout so a hung/over-long async handler can't hold the connection
-				// forever (the idle timer is extended/replaced meanwhile so a legitimately long async
-				// handler isn't cut off; registerForRead restores it on completion). Skipped when the
-				// "async" handler already finished synchronously during dispatch — notably a WebSocket
-				// upgrade, which sends its 101 inline and then runs under the WebSocket idle timeout.
+			} else if (isAsyncOrOffloaded && !response.hasFinished()) {
+				// The response is still pending — it will be finished later, off the loop (by the async
+				// handler or the offload virtual thread, including an offloaded terminal handler). Bound
+				// that with a processing timeout so a hung/over-long handler can't hold the connection
+				// forever. Skipped when the "async" handler already finished synchronously during dispatch
+				// — notably a WebSocket upgrade, which sends its 101 inline and then runs under the WS idle
+				// timeout.
 				armProcessingTimeout(clientChannel);
 			}
 		} catch (RuntimeException e) {

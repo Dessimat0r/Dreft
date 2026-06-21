@@ -746,7 +746,10 @@ public class StaticContentHandler extends RequestHandler {
 			long lastModified = file.lastModified();
 			if (meta == null || meta.lastModified != lastModified) {
 				String lastModifiedStr = org.deftserver.util.DateUtil.formatToRFC1123((lastModified / 1000) * 1000);
-				String etagValue = org.deftserver.util.HttpUtil.getEtag(response.getProtocol().getIOLoop().getMd5(), file);
+				// Fresh-digest overload, NOT the per-IOLoop shared MessageDigest: static serving runs this on
+				// a virtual thread off the I/O loop (and several may run concurrently), so a shared,
+				// non-thread-safe MessageDigest would be corrupted by concurrent use.
+				String etagValue = org.deftserver.util.HttpUtil.getEtag(file);
 				String filename = file.getName();
 				int dot = filename.lastIndexOf('.');
 				String ext = "";

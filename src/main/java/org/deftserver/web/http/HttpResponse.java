@@ -536,7 +536,12 @@ public class HttpResponse {
 		if (responseData.position() > 0) {
 			// RFC 9110 §8.8.3: an ETag is a quoted-string. Quoting is also required for
 			// If-None-Match / If-Match to match, since clients echo the quoted value back.
-			etag = "\"" + HttpUtil.getEtag(protocol.getIOLoop().getMd5(), responseData.array(), 0, responseData.position()) + "\"";
+			// Use the fresh-digest overload (NOT the per-IOLoop shared MessageDigest): this finalization
+			// runs OFF the I/O loop on a virtual thread for offloaded handlers, and possibly several at once,
+			// so a shared, non-thread-safe MessageDigest would be corrupted by concurrent use — producing
+			// garbled response framing. A fresh MD5 per ETag is O(1) allocation vs the O(body) hash already
+			// being done here.
+			etag = "\"" + HttpUtil.getEtag(responseData.array(), 0, responseData.position()) + "\"";
 			// Use the RFC 9110 §8.8.3 canonical spelling "ETag" (matches the static handler and what
 			// case-sensitive clients/caches expect), even though header names are case-insensitive.
 			setHeader("ETag", etag);
