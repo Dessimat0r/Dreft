@@ -75,15 +75,13 @@ public class Http2Connection {
 	}
 
 	public void onReadable() {
-		logger.info("onReadable start");
 		try {
 			ByteBuffer readBuf = protocol.readPlaintext(channel);
 			if (readBuf == null) {
-				logger.info("readPlaintext returned null, closing channel");
+				logger.debug("readPlaintext returned null, closing channel");
 				protocol.closeChannel(channel);
 				return;
 			}
-			logger.info("Read plaintext bytes: {}", readBuf.remaining());
 			inboundBuffer.put(readBuf);
 			inboundBuffer.flip();
 
@@ -99,10 +97,10 @@ public class Http2Connection {
 						}
 					}
 					prefaceReceived = true;
-					logger.info("Preface matched, sending initial settings");
+					logger.debug("Preface matched, sending initial settings");
 					sendInitialSettings();
 				} else {
-					logger.info("Preface incomplete, waiting");
+					logger.debug("Preface incomplete, waiting");
 					inboundBuffer.compact();
 					return;
 				}
@@ -113,7 +111,6 @@ public class Http2Connection {
 				if (frame == null) {
 					break;
 				}
-				logger.info("Read frame: type={}, flags={}, streamId={}, length={}", frame.type, frame.flags, frame.streamId, frame.length);
 				processFrame(frame);
 			}
 
@@ -125,7 +122,6 @@ public class Http2Connection {
 	}
 
 	public void onWritable() {
-		logger.info("onWritable");
 		tryWrite();
 	}
 
@@ -192,7 +188,7 @@ public class Http2Connection {
 					protocol.closeChannel(channel);
 					return;
 				}
-				logger.info("Received GOAWAY, closing channel");
+				logger.debug("Received GOAWAY, closing channel");
 				protocol.closeChannel(channel);
 				break;
 			case Http2Frame.TYPE_PRIORITY:
@@ -212,7 +208,7 @@ public class Http2Connection {
 				protocol.closeChannel(channel);
 				return;
 			}
-			logger.info("Received SETTINGS ACK");
+			logger.debug("Received SETTINGS ACK");
 			return;
 		}
 		if (frame.payload.length % 6 != 0) {
@@ -224,7 +220,6 @@ public class Http2Connection {
 		while (buf.remaining() >= 6) {
 			int id = buf.getShort() & 0xFFFF;
 			int value = buf.getInt();
-			logger.info("Setting: id={}, value={}", id, value);
 			if (id == 2) {
 				if (value != 0 && value != 1) {
 					logger.warn("Invalid SETTINGS_ENABLE_PUSH: {}", value);
@@ -321,7 +316,6 @@ public class Http2Connection {
 		}
 		Http2Stream stream = streams.computeIfAbsent(streamId, id -> new Http2Stream(id, initialStreamOutboundWindowSize));
 		stream.requestHeaders.addAll(fields);
-		logger.info("Headers complete for stream={}: {}", streamId, fields);
 
 		if (endStream) {
 			stream.setState(Http2Stream.STATE_HALF_CLOSED_REMOTE);
@@ -354,7 +348,6 @@ public class Http2Connection {
 			return;
 		}
 		stream.requestBody.write(frame.payload, offset, dataLength);
-		logger.info("Received data chunk for stream={}, len={}", frame.streamId, dataLength);
 
 		connectionInboundWindowSize -= frame.length;
 		stream.inboundWindowSize -= frame.length;
@@ -386,7 +379,6 @@ public class Http2Connection {
 			protocol.closeChannel(channel);
 			return;
 		}
-		logger.info("WINDOW_UPDATE: stream={}, increment={}", frame.streamId, increment);
 		if (frame.streamId == 0) {
 			long newSize = (long) connectionOutboundWindowSize + increment;
 			if (newSize > Integer.MAX_VALUE) {
@@ -429,7 +421,6 @@ public class Http2Connection {
 			protocol.closeChannel(channel);
 			return;
 		}
-		logger.info("RST_STREAM: stream={}", frame.streamId);
 		Http2Stream stream = streams.remove(frame.streamId);
 		if (stream != null) {
 			stream.setState(Http2Stream.STATE_CLOSED);
@@ -467,7 +458,9 @@ public class Http2Connection {
 			return;
 		}
 
-		logger.info("Dispatching stream={} method={} path={} headers={}", stream.streamId, method, path, headers);
+		if (logger.isDebugEnabled()) {
+			logger.debug("Dispatching stream={} method={} path={} headers={}", stream.streamId, method, path, headers);
+		}
 		Http2Request request = new Http2Request(method, path, headers, stream.requestBody.toByteArray());
 		Http2Response response = new Http2Response(protocol, this, stream);
 		stream.request = request;
@@ -490,7 +483,9 @@ public class Http2Connection {
 	}
 
 	public void sendHeaders(int streamId, List<Hpack.HeaderField> headers, boolean endStream) {
-		logger.info("sendHeaders: streamId={}, headers={}, endStream={}", streamId, headers, endStream);
+		if (logger.isDebugEnabled()) {
+			logger.debug("sendHeaders: streamId={}, headers={}, endStream={}", streamId, headers, endStream);
+		}
 		try {
 			ByteArrayOutputStream baos = new ByteArrayOutputStream();
 			hpackWriter.writeHeaders(baos, headers);
@@ -528,14 +523,12 @@ public class Http2Connection {
 	}
 
 	public void sendData(int streamId, byte[] data, boolean endStream) {
-		logger.info("sendData: streamId={}, length={}, endStream={}", streamId, data.length, endStream);
 		PendingData pending = new PendingData(streamId, data, endStream);
 		pendingDataQueue.add(pending);
 		flushPendingData();
 	}
 
 	private void flushPendingData() {
-		logger.info("flushPendingData: queueSize={}", pendingDataQueue.size());
 		Iterator<PendingData> iterator = pendingDataQueue.iterator();
 		while (iterator.hasNext()) {
 			PendingData pending = iterator.next();
@@ -548,7 +541,6 @@ public class Http2Connection {
 			int availableConn = connectionOutboundWindowSize;
 			int limit = Math.min(availableStream, availableConn);
 			limit = Math.min(limit, maxFrameSize);
-			logger.info("flushPendingData stream={}: streamWindow={}, connWindow={}, limit={}", pending.streamId, availableStream, availableConn, limit);
 			if (limit <= 0 && pending.data.length > 0) {
 				continue;
 			}
@@ -574,7 +566,9 @@ public class Http2Connection {
 	}
 
 	private void writeFrame(int type, int flags, int streamId, byte[] payload) {
-		logger.info("Writing frame: type={}, flags={}, streamId={}, len={}", type, flags, streamId, payload == null ? 0 : payload.length);
+		if (logger.isDebugEnabled()) {
+			logger.debug("Writing frame: type={}, flags={}, streamId={}, len={}", type, flags, streamId, payload == null ? 0 : payload.length);
+		}
 		byte[] frameBytes = Http2Frame.toBytes(type, flags, streamId, payload);
 		writeBuffer.put(frameBytes);
 		tryWrite();
@@ -584,8 +578,7 @@ public class Http2Connection {
 		writeBuffer.flip();
 		if (writeBuffer.hasRemaining()) {
 			try {
-				int written = protocol.write(channel, writeBuffer.getByteBuffer());
-				logger.info("Wrote bytes to channel: {}", written);
+				protocol.write(channel, writeBuffer.getByteBuffer());
 			} catch (IOException e) {
 				logger.error("IOException during write", e);
 				protocol.closeChannel(channel);
@@ -593,11 +586,9 @@ public class Http2Connection {
 			}
 		}
 		if (writeBuffer.hasRemaining()) {
-			logger.info("writeBuffer has remaining, registering OP_WRITE");
 			writeBuffer.compact();
 			key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
 		} else {
-			logger.info("writeBuffer fully written, clearing OP_WRITE");
 			writeBuffer.clear();
 			key.interestOps(key.interestOps() & ~SelectionKey.OP_WRITE);
 		}
