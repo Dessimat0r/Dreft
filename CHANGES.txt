@@ -1,3 +1,31 @@
+Dreft fork
+==========
+Dreft is a hardened, HTTP/1.1-compliance-focused fork of Deft. The entries below
+this section are the upstream Deft changelog (ending at 0.4.0); the fork's full
+history is in git and the feature set is documented in README.md. Recent highlights:
+
+0.8.1
+ * Crash-proof I/O loop: no per-request blocking I/O or heavy CPU runs on the reactor
+   thread. Static-file disk reads, inbound body decompression + form/multipart parsing,
+   and outbound gzip + ETag hashing run off-loop on virtual threads; all writes are
+   non-blocking (defer to OP_WRITE), with an O(1) pending-prefix for a stalled mid-header
+   write (no O(body) buffer shift).
+ * Adaptive virtual-thread offload of slow handlers, with trivial terminal handlers
+   (400/403/404/CORS-preflight/OPTIONS *) opting out via RequestHandler.isOffloadable()
+   to avoid offload amplification under malformed/not-found floods.
+ * Request-smuggling / parser-DoS hardening: strict Transfer-Encoding+Content-Length and
+   duplicate-Content-Length rejection, obs-fold and control-char rejection, and bounded
+   header/body/parameter/multipart/chunked sizes (incremental, overflow-safe caps).
+ * Inbound request decompression (gzip/zstd), plus the existing response compression
+   (gzip/brotli/zstd) and full HTTP/1.1 conditional-request / range / content-negotiation
+   support; WebSocket (RFC 6455) incl. WSS; per-directory .dreft-cfg static configuration.
+ * Build/tooling: a Maven sources jar is now attached; a closed-loop raw-socket throughput
+   benchmark (ThroughputBenchmarkManual); and an HTTP Garden differential-fuzzer adapter
+   (src/test/resources/http-garden) for cross-server HTTP/1.1 parser conformance.
+
+------------------------------------------------------------------------------------------
+Upstream Deft changelog:
+
 0.4.0
  * Renaming org.deftserver.web.http.client.{HttpRequest.java -> Request.java} and
    org.deftserver.web.http.client.{HttpResponse.java -> Response.java}.

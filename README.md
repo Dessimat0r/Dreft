@@ -28,6 +28,7 @@
 - **Range requests** — `Range: bytes=...` on static files, `206 Partial Content`, suffix ranges
 - **Content negotiation** — `Accept`, `Accept-Encoding`, `Accept-Language`, `Accept-Charset` parsing with quality values (`q=0.0` rejection)
 - **Response compression** — **gzip** (JDK built-in), **Brotli** (brotjli), **Zstd** (zstd-jni)
+- **Inbound decompression** — a request body sent with `Content-Encoding: gzip`/`zstd` is decompressed (off the I/O loop) before the handler sees it, with the decompressed size bounded to the 16 MiB body cap (`413` on a decompression bomb)
 - **Vary header management** — `Vary: Origin` on CORS, `Vary: Accept-Encoding` on gzip, merge-aware `addVary()`
 - **Connection management** — keep-alive (HTTP/1.1 default), `Connection: close` enforcement, max keep-alive requests cap
 
@@ -36,7 +37,9 @@
 - **Request smuggling prevention** — obs-fold rejection, whitespace-before-colon rejection, control-char rejection, strict `Transfer-Encoding` last-coding enforcement, lenient Content-Length rejection
 - **Parser DoS protection** — all collections bounded: ≤100 header lines, ≤64 KiB header block, ≤16 MiB body, ≤10k multipart parts, ≤10k parameters, ≤32 param-nesting depth, ≤1000 keep-alive requests
 - **Memory amplification prevention** — O(n) char-scan parameter parsing (no eager split), bounded header/part/trailer counts, geometric buffer growth
-- **Bounded non-blocking writes** — `writeFully`/`writeBlocking` helpers with 30 s stall timeout prevent infinite CPU spin on stalled sockets
+- **Fully non-blocking writes** — no write ever blocks the I/O loop. Response bodies, WebSocket frames, and the `100-Continue` interim response all send what the socket accepts immediately and defer any remainder to `OP_WRITE` (so a slow/non-reading peer can't freeze the reactor); a stalled deferred write is reaped by a write timeout, and a header write that stalls mid-header stashes the unwritten remainder as an O(1) pending-prefix (no O(body) buffer shift)
+- **No CPU-heavy or blocking per-request work on the reactor** — static-file disk reads, inbound body decompression + form/multipart parsing, and outbound gzip + ETag hashing all run OFF the I/O-loop thread on a virtual thread, marshalling the result back via `IOLoop.addCallback`. The loop thread only does non-blocking socket I/O and the strict header parse
+- **Offload-amplification hardening** — trivial terminal handlers (400/403/404/CORS-preflight/`OPTIONS *`) opt out of virtual-thread offload (`RequestHandler.isOffloadable()`), so a flood of malformed or not-found requests can't make every one spawn a virtual thread
 - **Error containment** — per-channel exception catching in the selector loop, `StackOverflowError` and `LinkageError` recovery, handler runtime exceptions → 500
 - **Cookie injection prevention** — control-char rejection in name, value, domain, path
 - **Per-IP connection limiting** — configurable `maxConnectionsPerIp`
@@ -109,7 +112,7 @@ Request lifecycle:
 
 ```bash
 mvn compile                    # build
-mvn test                       # full suite (373 tests, JUnit 4)
+mvn test                       # full suite (363 tests, JUnit 4)
 mvn test -Dtest=FooTest        # one test class
 mvn test -Dtest=FooTest#bar    # one test method
 
@@ -124,9 +127,13 @@ Dependencies: JUnit 4 (test), Logback, Apache HttpClient (test), `javax.activati
 
 ## Test Suite
 
-- **47 test classes**, **373 `@Test` methods** — true integration tests against real sockets on ephemeral ports
-- Covers: byte-level protocol parsing, request smuggling, chunked encoding, multipart, cookies, WebSocket, TLS, CORS, compression, concurrent load, fuzz payloads, network impairment, per-IP limiting, timeout correctness
+- **363 tests** across 50+ source files — true integration tests against real sockets on ephemeral ports
+- Covers: byte-level protocol parsing, request smuggling, chunked encoding, multipart, cookies, WebSocket, TLS, CORS, inbound/outbound compression, concurrent load + keep-alive reuse, fuzz payloads, network impairment, per-IP limiting, timeout correctness, and loop-stall / off-loop-isolation regressions (a slow disk read, a heavy inbound finalize, or an offloaded handler must never stall or corrupt other connections)
 - `forkCount=1`, `reuseForks=true`, 600 s fork timeout
+
+### Compliance & throughput tooling
+- **HTTP Garden** — a drop-in adapter ([`src/test/resources/http-garden/`](src/test/resources/http-garden/)) lets Dreft be added as an origin server in the [HTTP Garden](https://github.com/narfindustries/http-garden) differential fuzzer to surface HTTP/1.1 parsing discrepancies against other servers
+- **Throughput benchmark** — `ThroughputBenchmarkManual` is a closed-loop raw-socket load generator (`mvn test -Dtest=ThroughputBenchmarkManual#benchmarkGetThroughput`); not run by the normal suite
 
 ## Examples
 
