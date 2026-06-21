@@ -54,6 +54,16 @@
 - Secure (WSS) over TLS
 - Separate idle timeout from HTTP keep-alive
 
+### HTTP/2 (cleartext h2c)
+Functional cleartext HTTP/2, negotiated by the connection **preface** — *prior knowledge* (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`):
+- **HPACK** header compression (`Hpack`)
+- Multiplexed **streams** over `HEADERS` / `DATA` / `WINDOW_UPDATE` / `RST_STREAM` / `SETTINGS` / `PING` / `GOAWAY` frames
+- `SETTINGS` negotiation + validation (`ENABLE_PUSH`, `INITIAL_WINDOW_SIZE`, `MAX_FRAME_SIZE`)
+- **DoS hardening** — frame-size cap, max concurrent streams, `RST_STREAM`-flood limit, idle timeout
+- End-to-end tested (GET / POST / static-file over h2c) in `Http2SystemTest`, plus `Http2DosHardeningTest`
+
+> **Scope:** negotiation is *prior-knowledge h2c only* — there is no ALPN (`h2` over TLS) and no HTTP/1.1 `Upgrade: h2c`, so browsers (which require ALPN) won't select HTTP/2; it serves clients that speak h2c with prior knowledge. The project's active compliance focus remains HTTP/1.1; HTTP/3 is not implemented.
+
 ### Static File Serving
 - Extension-based MIME mapping with `Files.probeContentType` fallback
 - Composite archive extensions (`.tar.gz`, `.tar.bz2`, `.tar.xz`)
