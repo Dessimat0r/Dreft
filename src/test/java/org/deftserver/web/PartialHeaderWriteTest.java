@@ -75,10 +75,16 @@ public class PartialHeaderWriteTest {
 				.getBytes(StandardCharsets.ISO_8859_1));
 			out.flush();
 
-			// Do NOT read for a moment: let the server attempt to write the whole (multi-MB-header) response
-			// and block mid-header once its send buffer + the tiny client window fill — forcing the header
-			// write to go partial and the O(1) pending-prefix path to engage. Then drain everything slowly.
-			Thread.sleep(400);
+			// Do NOT read yet: the server attempts to write the whole (multi-MB-header) response and blocks
+			// mid-header once its send buffer + the tiny client window fill, forcing the header write to go
+			// partial and the O(1) pending-prefix path to engage. Rather than guess a fixed delay, WAIT for
+			// that to actually happen — the stash is observable via TEST_PREFIX_STASH_COUNT — and proceed the
+			// instant it does (parking, not sleeping, between checks; bounded so a regression can't hang).
+			long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+			while (org.deftserver.web.http.HttpProtocol.TEST_PREFIX_STASH_COUNT == stashesBefore
+					&& System.nanoTime() < deadline) {
+				java.util.concurrent.locks.LockSupport.parkNanos(1_000_000L); // 1ms
+			}
 
 			InputStream in = socket.getInputStream();
 			java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();

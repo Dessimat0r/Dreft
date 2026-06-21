@@ -14,6 +14,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import org.deftserver.web.handler.RequestHandler;
 import org.deftserver.web.http.HttpRequest;
@@ -73,13 +75,27 @@ public class StaticContentOffLoopTest {
 		StaticContentHandlerDelay.set(2000);
 		try {
 			final String staticPath = webroot.getAbsolutePath() + "/file.txt";
+			// The slow request signals this latch once it has been DELIVERED (written to the socket), so the
+			// main thread waits on that trigger rather than sleeping a guessed interval: the server has the
+			// request and is entering its delayed off-loop read by the time we fire /ping.
+			final CountDownLatch slowDelivered = new CountDownLatch(1);
 			Thread slow = new Thread(() -> {
-				try {
-					request("GET " + staticPath + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-				} catch (Exception ignore) {}
+				try (Socket s = new Socket()) {
+					s.connect(new InetSocketAddress("localhost", PORT), 3000);
+					s.setSoTimeout(8000);
+					s.getOutputStream().write(("GET " + staticPath
+						+ " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+						.getBytes(StandardCharsets.ISO_8859_1));
+					s.getOutputStream().flush();
+					slowDelivered.countDown();      // request on the wire — server will now do its slow read
+					s.getInputStream().readAllBytes(); // block while the server serves it (slowly)
+				} catch (Exception ignore) {
+					slowDelivered.countDown();
+				}
 			});
 			slow.start();
-			Thread.sleep(200); // let the static request reach its (delayed) off-loop read
+			assertTrue("slow static request was not delivered in time",
+				slowDelivered.await(3, TimeUnit.SECONDS));
 
 			long t0 = System.nanoTime();
 			String ping = request("GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");

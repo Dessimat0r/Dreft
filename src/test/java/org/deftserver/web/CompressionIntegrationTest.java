@@ -10,6 +10,8 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
@@ -260,11 +262,24 @@ public class CompressionIntegrationTest {
 
 		org.deftserver.web.http.HttpRequest.TEST_FINALIZE_DELAY_MS = 2000;
 		try {
+			// The slow request signals this latch once its (heavy) body has been written, so the main thread
+			// waits on that trigger instead of sleeping a guessed interval: the server has the full body and
+			// is entering its delayed off-loop finalize by the time we fire /ping.
+			final byte[] slowBytes = slowReq.toByteArray();
+			final CountDownLatch slowDelivered = new CountDownLatch(1);
 			Thread slow = new Thread(() -> {
-				try { sendRequest(slowReq.toByteArray()); } catch (Exception ignore) {}
+				try (Socket s = new Socket("localhost", PORT)) {
+					s.setSoTimeout(8000);
+					s.getOutputStream().write(slowBytes);
+					s.getOutputStream().flush();
+					slowDelivered.countDown();       // body on the wire — server will now do its slow finalize
+					s.getInputStream().readAllBytes(); // block while the server finalizes (slowly)
+				} catch (Exception ignore) {
+					slowDelivered.countDown();
+				}
 			});
 			slow.start();
-			Thread.sleep(200); // let the heavy POST reach its (delayed) finalize
+			assertTrue("slow request was not delivered in time", slowDelivered.await(3, TimeUnit.SECONDS));
 
 			long t0 = System.nanoTime();
 			RawResponse ping = sendRequest("GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");

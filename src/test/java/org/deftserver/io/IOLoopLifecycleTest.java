@@ -113,14 +113,16 @@ public class IOLoopLifecycleTest {
 			});
 			assertTrue("listener registered", registered.await(2, TimeUnit.SECONDS));
 
-			// First connection → handleAccept throws. The listener must survive.
+			// First connection → handleAccept throws. The listener must survive. Wait for the loop thread to
+			// actually process the accept (observable: acceptCalls is bumped at the top of handleAccept)
+			// rather than sleeping a guessed interval, then assert the listener survived the exception.
 			try (java.net.Socket s1 = new java.net.Socket("127.0.0.1", port)) { /* trigger accept */ }
-			Thread.sleep(200);
+			awaitAtLeast(acceptCalls, 1);
 			assertTrue("listening socket must stay open after handleAccept threw", server.isOpen());
 
 			// Second connection must still trigger an accept — proving the server keeps accepting.
 			try (java.net.Socket s2 = new java.net.Socket("127.0.0.1", port)) { /* trigger accept */ }
-			Thread.sleep(200);
+			awaitAtLeast(acceptCalls, 2);
 			assertTrue("server must keep accepting after a handleAccept exception (calls=" + acceptCalls.get() + ")",
 				acceptCalls.get() >= 2);
 			assertTrue("listening socket must still be open", server.isOpen());
@@ -158,6 +160,16 @@ public class IOLoopLifecycleTest {
 			loop.stop();
 			t.join(2000);
 			loop.dispose();
+		}
+	}
+
+	/** Waits (bounded) until {@code counter} reaches {@code target}, parking briefly between checks. Used to
+	 *  wait on the loop thread having processed an accept (it bumps the counter) instead of sleeping a
+	 *  guessed interval — proceeds the instant the event happens. */
+	private static void awaitAtLeast(AtomicInteger counter, int target) {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+		while (counter.get() < target && System.nanoTime() < deadline) {
+			java.util.concurrent.locks.LockSupport.parkNanos(500_000L); // 0.5ms
 		}
 	}
 }
