@@ -50,10 +50,16 @@ public class HttpResponse {
 	protected boolean finished = false;
 	private boolean suppressContentLength = false;
 	protected long contentLength = -1;
-	protected final java.util.List<Cookie> cookies = new java.util.ArrayList<>();
+	// Defaults to the shared immutable empty-list singleton (no per-response allocation) and is replaced
+	// with a real list only on the first setCookie — most responses set no cookies. Kept NON-NULL so it is
+	// always safe to iterate directly (incl. from the Http2Response subclass), no null checks needed.
+	protected java.util.List<Cookie> cookies = java.util.Collections.emptyList();
 
 	/** Queues a cookie to be emitted as its own {@code Set-Cookie} response header line. */
 	public void setCookie(Cookie cookie) {
+		if (cookies.isEmpty()) { // still the shared empty singleton — promote to a mutable list
+			cookies = new java.util.ArrayList<>(2);
+		}
 		cookies.add(cookie);
 	}
 
