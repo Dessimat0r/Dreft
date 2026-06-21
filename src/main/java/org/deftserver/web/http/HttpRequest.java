@@ -497,12 +497,12 @@ public class HttpRequest {
 				// Oversized header section is 431, not a generic 400 (RFC 9110 §15.5.18).
 				throw new HttpException(431, "Request Header Fields Too Large", "The request header section is too large");
 			}
-			byte[] headerBytes = new byte[headerLen];
-			buffer.position(oldpos);
-			buffer.get(headerBytes);
-			buffer.position(bodystartpos); // Keep exactly at start of body
-
-			String headerStr = new String(headerBytes, StandardCharsets.ISO_8859_1);
+			// Build the header String straight from the read buffer's backing array (it is always heap-
+			// allocated, hence array-backed). The previous code copied the header block into an intermediate
+			// byte[] first — an extra full-header-block allocation + memcpy on every request. position() is
+			// already at bodystartpos (start of body) after findInBB, so leave it there.
+			String headerStr = new String(buffer.array(), buffer.arrayOffset() + oldpos, headerLen,
+				StandardCharsets.ISO_8859_1);
 			// Iterate the header block line-by-line via indexOf("\r\n") rather than split("\r\n"):
 			// split would materialise every line of the (up to 64 KiB) header block up front, before
 			// the MAX_HEADER_COUNT cap could apply — the same materialise-before-cap pattern as P50,
