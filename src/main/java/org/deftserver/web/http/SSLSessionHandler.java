@@ -53,7 +53,13 @@ public class SSLSessionHandler {
 		this.netReadBuf = ByteBuffer.allocate(packetBufferSize);
 		this.appReadBuf = ByteBuffer.allocate(appBufferSize);
 		this.netWriteBuf = ByteBuffer.allocate(packetBufferSize);
-		this.appWriteBuf = ByteBuffer.allocate(appBufferSize);
+		// appWriteBuf is ONLY the empty application-data source handed to engine.wrap() during the
+		// handshake (NEED_WRAP) — outbound application data goes through wrap(src) with the caller's own
+		// buffer + wrapDst, never this one. So it never holds data and needs no capacity; a zero-length
+		// buffer saves ~appBufferSize (≈16 KiB) of heap PER HTTPS CONNECTION (less per-connection memory =
+		// harder for one client to exhaust the heap by opening many connections). flip()/compact() on it
+		// stay no-ops, and engine.wrap() accepts an empty src during the handshake.
+		this.appWriteBuf = ByteBuffer.allocate(0);
 
 		this.engine.beginHandshake();
 	}
