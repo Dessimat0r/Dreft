@@ -17,6 +17,9 @@ private final static BadRequestRequestHandler instance = new BadRequestRequestHa
 		return instance;
 	}
 
+	/** Trivial terminal handler — never worth offloading to a virtual thread. */
+	@Override public boolean isOffloadable() { return false; }
+
 	/** Writes the 400 response (Connection: close). */
 	@Override
 	public void get(HttpRequest request, HttpResponse response) throws IOException {

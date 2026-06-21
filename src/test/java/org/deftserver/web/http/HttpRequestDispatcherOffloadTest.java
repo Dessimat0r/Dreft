@@ -108,4 +108,18 @@ public class HttpRequestDispatcherOffloadTest {
 			+ "(its NIO must stay on the I/O-loop thread)",
 			HttpRequestDispatcher.isFlaggedHeavy(FlushingHandler.class, HttpVerb.GET));
 	}
+
+	@Test
+	public void terminalHandlersAreNeverFlaggedForOffload() throws IOException {
+		// A trivial terminal handler (here the 404 NotFound for an unrouted path) opts out of offload
+		// (isOffloadable()=false). Even with HEAVY_THRESHOLD_NS forced to 0 — so any normal handler would
+		// be flagged after one call — it must never be flagged, so a flood of unmatched/malformed requests
+		// can't make every one spawn a virtual thread + cross-thread callback (a DoS-amplification vector,
+		// and the precondition for the offloaded-terminal-handler response race).
+		hit("/no-such-path-404");
+		hit("/no-such-path-404");
+		assertFalse("a terminal (404) handler must never be flagged for virtual-thread offload",
+			HttpRequestDispatcher.isFlaggedHeavy(
+				org.deftserver.web.handler.NotFoundRequestHandler.class, HttpVerb.GET));
+	}
 }

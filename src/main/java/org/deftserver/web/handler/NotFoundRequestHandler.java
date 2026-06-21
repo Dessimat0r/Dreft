@@ -19,6 +19,9 @@ public class NotFoundRequestHandler extends RequestHandler {
 		return instance;
 	}
 
+	/** Trivial terminal handler — never worth offloading to a virtual thread. */
+	@Override public boolean isOffloadable() { return false; }
+
 	/** Writes the 404 response (HTML-escaped reflected path, nosniff, Connection: close). */
 	@Override
 	public void get(HttpRequest request, HttpResponse response) throws IOException {

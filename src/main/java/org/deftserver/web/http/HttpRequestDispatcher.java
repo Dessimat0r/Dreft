@@ -82,7 +82,8 @@ public class HttpRequestDispatcher {
 		}
 
 		HandlerKey key = new HandlerKey(rh.getClass(), method);
-		boolean isHeavy = heavyHandlers.getOrDefault(key, false);
+		boolean offloadable = rh.isOffloadable();
+		boolean isHeavy = offloadable && heavyHandlers.getOrDefault(key, false);
 
 		if (isHeavy && !isAsync) {
 			logger.debug("Adaptive Dispatcher: executing slow method {} of {} on Virtual Thread", method, rh.getClass().getSimpleName());
@@ -142,7 +143,7 @@ public class HttpRequestDispatcher {
 				return true;
 			} finally {
 				long duration = System.nanoTime() - start;
-				if (!isAsync && duration > HEAVY_THRESHOLD_NS && !response.hasFlushedHeaders()) {
+				if (offloadable && !isAsync && duration > HEAVY_THRESHOLD_NS && !response.hasFlushedHeaders()) {
 					logger.info("Adaptive Dispatcher: method {} of {} took {} ms. Flagging as slow/heavy for future requests.",
 						method, rh.getClass().getSimpleName(), duration / 1_000_000.0);
 					heavyHandlers.put(key, true);

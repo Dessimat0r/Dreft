@@ -124,6 +124,15 @@ public abstract class RequestHandler {
 		return authVerbs.get(effective);
 	}
 
+	/** Whether the adaptive dispatcher may offload this handler to a virtual thread when it measures as
+	 *  "heavy". Default true. The trivial terminal handlers (400/403/404/OPTIONS-*) override this to false:
+	 *  they do negligible work, so a single timing hiccup under load could otherwise flag them heavy and
+	 *  permanently offload them — spawning a virtual thread + a cross-thread callback for every malformed
+	 *  or not-found request (a needless DoS-amplification vector), with no benefit. */
+	public boolean isOffloadable() {
+		return true;
+	}
+
 	// Default verb implementations return 501; a concrete handler overrides the verbs it supports.
 	// (The dispatcher answers a known-but-unoverridden verb with 405 + Allow rather than calling
 	// these, so in practice they are a fallback.)

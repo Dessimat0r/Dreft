@@ -18,6 +18,9 @@ public class CorsPreflightRequestHandler extends RequestHandler {
 		return instance;
 	}
 
+	/** Trivial terminal handler — never worth offloading to a virtual thread. */
+	@Override public boolean isOffloadable() { return false; }
+
 	/** Writes the 204 preflight response with Vary: Origin and reflected CORS headers. */
 	@Override
 	public void options(HttpRequest request, HttpResponse response) throws IOException {

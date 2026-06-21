@@ -21,6 +21,9 @@ public class ServerOptionsRequestHandler extends RequestHandler {
 		return instance;
 	}
 
+	/** Trivial terminal handler — never worth offloading to a virtual thread. */
+	@Override public boolean isOffloadable() { return false; }
+
 	/** Writes the 204 response advertising the server-wide {@code Allow} method set. */
 	@Override
 	public void options(HttpRequest request, HttpResponse response) throws IOException {
