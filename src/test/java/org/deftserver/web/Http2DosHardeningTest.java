@@ -60,7 +60,7 @@ public class Http2DosHardeningTest {
 				}
 			});
 
-		Thread.sleep(1000);
+		TestServerSupport.awaitListening(PORT); // poll until ready instead of a fixed 1s sleep
 	}
 
 	@AfterClass
@@ -301,7 +301,7 @@ public class Http2DosHardeningTest {
 	@Test
 	public void testIdleTimeout() throws Exception {
 		long original = HttpServerDescriptor.KEEP_ALIVE_TIMEOUT;
-		HttpServerDescriptor.KEEP_ALIVE_TIMEOUT = 1000;
+		HttpServerDescriptor.KEEP_ALIVE_TIMEOUT = 500;
 		try {
 			Socket socket = new Socket("localhost", PORT);
 			OutputStream out = socket.getOutputStream();
@@ -313,8 +313,8 @@ public class Http2DosHardeningTest {
 
 			establishConnection(in, out);
 
-			Thread.sleep(2000);
-
+			// No fixed sleep: assertConnectionClosed blocks reading frames until the server closes the idle
+			// connection (~KEEP_ALIVE_TIMEOUT after the last activity), so it returns as soon as that fires.
 			assertConnectionClosed(socket, in);
 			socket.close();
 		} finally {

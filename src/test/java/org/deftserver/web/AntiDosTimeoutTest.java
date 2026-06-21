@@ -58,26 +58,33 @@ public class AntiDosTimeoutTest {
 
 	@Test
 	public void testHeaderReadTimeout() throws Exception {
-		Socket socket = new Socket("127.0.0.1", PORT);
-		assertTrue(socket.isConnected());
-		
-		// Send incomplete request headers
-		socket.getOutputStream().write("GET / HTTP/1.1\r\nHost: localhost\r\n".getBytes());
-		socket.getOutputStream().flush();
-		
-		// Sleep for 6 seconds (timeout is 5 seconds)
-		Thread.sleep(6000);
+		// Use a short header-read timeout (mirroring testBodyReadTimeout) and block on the read instead of
+		// sleeping past the 5s default: the read returns as soon as the 408 arrives (~the timeout), so the
+		// test exercises the same incomplete-headers → 408 → close path in a fraction of a second.
+		long original = org.deftserver.web.http.HttpProtocol.HEADER_READ_TIMEOUT_MS;
+		org.deftserver.web.http.HttpProtocol.HEADER_READ_TIMEOUT_MS = 600;
+		try {
+			Socket socket = new Socket("127.0.0.1", PORT);
+			assertTrue(socket.isConnected());
+			socket.setSoTimeout(5000); // safety: never hang if no 408 is sent
 
-		// The server now sends a best-effort 408 Request Timeout (RFC 9110 §15.5.9) before
-		// closing the connection, rather than dropping it silently.
-		java.io.InputStream is = socket.getInputStream();
-		byte[] buf = new byte[256];
-		int n = is.read(buf);
-		String response = n > 0 ? new String(buf, 0, n, java.nio.charset.StandardCharsets.ISO_8859_1) : "";
-		assertTrue("expected 408, got: " + response, response.startsWith("HTTP/1.1 408"));
-		// And the connection must then be closed (subsequent read hits EOF).
-		assertEquals(-1, is.read());
-		socket.close();
+			// Send incomplete request headers (no terminating CRLF CRLF)
+			socket.getOutputStream().write("GET / HTTP/1.1\r\nHost: localhost\r\n".getBytes());
+			socket.getOutputStream().flush();
+
+			// The server arms the header-read timeout; after it elapses it sends a best-effort 408 Request
+			// Timeout (RFC 9110 §15.5.9) before closing the connection, rather than dropping it silently.
+			java.io.InputStream is = socket.getInputStream();
+			byte[] buf = new byte[256];
+			int n = is.read(buf);
+			String response = n > 0 ? new String(buf, 0, n, java.nio.charset.StandardCharsets.ISO_8859_1) : "";
+			assertTrue("expected 408, got: " + response, response.startsWith("HTTP/1.1 408"));
+			// And the connection must then be closed (subsequent read hits EOF).
+			assertEquals(-1, is.read());
+			socket.close();
+		} finally {
+			org.deftserver.web.http.HttpProtocol.HEADER_READ_TIMEOUT_MS = original;
+		}
 	}
 
 	@Test

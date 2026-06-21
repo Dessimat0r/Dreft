@@ -113,7 +113,9 @@ public class ExhaustedServerTest {
 				exec.submit(() -> {
 					try (Socket s = new Socket("127.0.0.1", PORT)) {
 						s.setSoLinger(true, 0);
-						s.setSoTimeout(3000);
+						// The (garbage) response is never asserted on — a short read cap keeps the storm fast
+						// instead of blocking until the server's own timeout closes an incomplete request.
+						s.setSoTimeout(300);
 						s.getOutputStream().write(FuzzPayloads.random(ThreadLocalRandom.current()));
 						s.getOutputStream().flush();
 						try { s.getInputStream().read(new byte[256]); } catch (IOException ignore) { }
@@ -175,7 +177,8 @@ public class ExhaustedServerTest {
 				exec.submit(() -> {
 					try (Socket s = new Socket("127.0.0.1", PORT)) {
 						s.setSoLinger(true, 0);
-						s.setSoTimeout(2000);
+						// Short read cap — the garbage response is ignored (see the other storm above).
+						s.setSoTimeout(300);
 						s.getOutputStream().write(FuzzPayloads.random(ThreadLocalRandom.current()));
 						s.getOutputStream().flush();
 						try { s.getInputStream().read(new byte[256]); } catch (IOException ignore) { }
