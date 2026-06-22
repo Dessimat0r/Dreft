@@ -57,7 +57,11 @@ public class Http2Response extends HttpResponse {
 		if (req == null) {
 			return data;
 		}
-		String encoding = org.deftserver.util.HttpUtil.getPreferredCompression(req.getHeader("Accept-Encoding"));
+		// Negotiate gzip/zstd only — the bundled brotli codec (brotjli 0.1.0) emits a non-RFC-7932
+		// stream that standard brotli decoders (browsers, the `brotli` CLI) cannot decode, so offering
+		// "br" would corrupt the response for real clients. Strip any br token before choosing.
+		String encoding = org.deftserver.util.HttpUtil.getPreferredCompression(
+			stripBrotli(req.getHeader("Accept-Encoding")));
 		if (encoding == null) {
 			return data;
 		}
@@ -88,6 +92,27 @@ public class Http2Response extends HttpResponse {
 			logger.warn("HTTP/2 response compression failed ({}), sending identity: {}", encoding, e.toString());
 			return data;
 		}
+	}
+
+	/** Returns the {@code Accept-Encoding} value with any {@code br} (brotli) content-coding removed, so
+	 *  the negotiator never selects the non-standard bundled brotli for an HTTP/2 response. */
+	private static String stripBrotli(String acceptEncoding) {
+		if (acceptEncoding == null || acceptEncoding.isBlank()) {
+			return acceptEncoding;
+		}
+		StringBuilder sb = new StringBuilder(acceptEncoding.length());
+		for (String segment : acceptEncoding.split(",")) {
+			int semi = segment.indexOf(';');
+			String name = (semi == -1 ? segment : segment.substring(0, semi)).trim();
+			if (name.equalsIgnoreCase("br")) {
+				continue;
+			}
+			if (sb.length() > 0) {
+				sb.append(',');
+			}
+			sb.append(segment);
+		}
+		return sb.toString();
 	}
 
 	/** Adds {@code Accept-Encoding} to the {@code Vary} header in the map (synchronously, merging with any

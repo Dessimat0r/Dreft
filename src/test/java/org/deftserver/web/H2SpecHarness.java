@@ -64,7 +64,13 @@ public final class H2SpecHarness {
 		handlers.put("/1m", new FixedSizeHandler(1024 * 1024));
 		handlers.put("/echo", new EchoHandler());
 		handlers.put("/text", new TextHandler());
-		HttpServer server = new HttpServer(new Application(handlers));
+		Application application = new Application(handlers);
+		// Optional static-file serving (for testing ETag/conditional/range over h2): -Dh2.staticDir=<abs dir>
+		String staticDir = System.getProperty("h2.staticDir");
+		if (staticDir != null) {
+			application.setStaticContentDir(staticDir);
+		}
+		HttpServer server = new HttpServer(application);
 		boolean tls = args.length > 1 && args[1].equalsIgnoreCase("tls");
 		if (tls) {
 			// HTTP/2 over TLS via ALPN, using the test keystore.

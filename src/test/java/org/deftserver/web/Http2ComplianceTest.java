@@ -495,6 +495,34 @@ public class Http2ComplianceTest {
 			TEXT_BODY, new String(identity, StandardCharsets.UTF_8));
 	}
 
+	/** The bundled brotli (brotjli) emits a non-standard stream, so HTTP/2 must never negotiate it: a
+	 *  browser-style Accept-Encoding (which includes br) must pick a standard codec (zstd/gzip), and a
+	 *  br-only request must fall back to identity rather than send an undecodable response. */
+	@Test public void brotliNeverNegotiatedOverHttp2() throws Exception {
+		String enc = contentEncodingFor("gzip, deflate, br, zstd");
+		assertTrue("must negotiate a standard codec (zstd/gzip), got: " + enc, enc != null && !enc.equals("br"));
+		assertEquals("a br-only request must be served identity", null, contentEncodingFor("br"));
+	}
+
+	/** Returns the content-encoding header of GET /text with the given Accept-Encoding, or null if none. */
+	private static String contentEncodingFor(String acceptEncoding) throws Exception {
+		try (Socket s = connect()) {
+			List<Hpack.HeaderField> req = new ArrayList<>();
+			req.add(new Hpack.HeaderField(":method", "GET"));
+			req.add(new Hpack.HeaderField(":path", "/text"));
+			req.add(new Hpack.HeaderField(":scheme", "http"));
+			req.add(new Hpack.HeaderField(":authority", "localhost"));
+			req.add(new Hpack.HeaderField("accept-encoding", acceptEncoding));
+			writeFrame(s.getOutputStream(), Http2Frame.TYPE_HEADERS,
+				Http2Frame.FLAG_END_HEADERS | Http2Frame.FLAG_END_STREAM, 1, encodeHeaders(req));
+			Http2Frame headers = readUntil(s.getInputStream(), Http2Frame.TYPE_HEADERS);
+			for (Hpack.HeaderField f : new Hpack.Reader(4096).readHeaders(java.nio.ByteBuffer.wrap(headers.payload))) {
+				if (f.name.equals("content-encoding")) return f.value;
+			}
+			return null;
+		}
+	}
+
 	/** GETs /text (optionally offering an encoding), asserts the framing, and returns the raw DATA bytes. */
 	private static byte[] fetchTextBody(String acceptEncoding) throws Exception {
 		try (Socket s = connect()) {
