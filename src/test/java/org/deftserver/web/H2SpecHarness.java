@@ -43,6 +43,15 @@ public final class H2SpecHarness {
 		@Override public void put(HttpRequest req, HttpResponse resp)  { resp.write(req.getBody()); }
 	}
 
+	/** A compressible text/plain body (for checking response compression / Accept-Encoding over h2). */
+	private static final class TextHandler extends RequestHandler {
+		private static final String BODY = "The quick brown fox jumps over the lazy dog. ".repeat(400);
+		@Override public void get(HttpRequest req, HttpResponse resp) {
+			resp.setHeader("Content-Type", "text/plain; charset=utf-8");
+			resp.write(BODY);
+		}
+	}
+
 	public static void main(String[] args) throws Exception {
 		int port = args.length > 0 ? Integer.parseInt(args[0]) : 18080;
 		Map<String, RequestHandler> handlers = new HashMap<>();
@@ -54,6 +63,7 @@ public final class H2SpecHarness {
 		handlers.put("/256k", new FixedSizeHandler(256 * 1024));
 		handlers.put("/1m", new FixedSizeHandler(1024 * 1024));
 		handlers.put("/echo", new EchoHandler());
+		handlers.put("/text", new TextHandler());
 		HttpServer server = new HttpServer(new Application(handlers));
 		boolean tls = args.length > 1 && args[1].equalsIgnoreCase("tls");
 		if (tls) {

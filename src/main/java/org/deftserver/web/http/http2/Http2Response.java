@@ -27,8 +27,85 @@ public class Http2Response extends HttpResponse {
 		this.stream = stream;
 	}
 
+	private static final org.slf4j.Logger logger = org.slf4j.LoggerFactory.getLogger(Http2Response.class);
+
 	private void runOnLoop(org.deftserver.web.AsyncCallback action) {
 		getProtocol().getIOLoop().addCallback(action);
+	}
+
+	/**
+	 * Compresses a fully-buffered response body when the client asked for it and the body is worth
+	 * compressing — mirroring the HTTP/1.1 path's decision (RFC 9110 content-coding): only when the
+	 * request carries a supported {@code Accept-Encoding}, the response {@code Content-Type} is textual
+	 * (text/json/xml/javascript), no {@code Content-Encoding} is already set, and the status is not 206.
+	 * On success it sets {@code content-encoding} + {@code Vary: Accept-Encoding} and returns the
+	 * compressed bytes (the caller advertises the compressed length); otherwise returns {@code data}
+	 * unchanged. HTTP/2 frames the body with {@code DATA}/{@code END_STREAM}, so there is no chunked
+	 * transfer-encoding (unlike the HTTP/1.1 path). Only the buffered ({@code finish()}) path compresses;
+	 * a streamed ({@code flush()}) response, whose total length is unknown, is sent uncompressed.
+	 */
+	private byte[] maybeCompress(byte[] data) {
+		if (data.length == 0 || statusCode == 206) {
+			return data;
+		}
+		for (String name : headers.keySet()) {
+			if (name.equalsIgnoreCase("Content-Encoding")) {
+				return data; // handler pre-encoded the body — never double-encode
+			}
+		}
+		org.deftserver.web.http.HttpRequest req = stream.request;
+		if (req == null) {
+			return data;
+		}
+		String encoding = org.deftserver.util.HttpUtil.getPreferredCompression(req.getHeader("Accept-Encoding"));
+		if (encoding == null) {
+			return data;
+		}
+		String contentType = null;
+		for (Map.Entry<String, String> e : headers.entrySet()) {
+			if (e.getKey().equalsIgnoreCase("Content-Type")) {
+				contentType = e.getValue();
+				break;
+			}
+		}
+		if (contentType == null) {
+			return data;
+		}
+		String ctLower = contentType.toLowerCase(java.util.Locale.ROOT);
+		if (!(ctLower.contains("text") || ctLower.contains("json") || ctLower.contains("xml")
+				|| ctLower.contains("javascript"))) {
+			return data;
+		}
+		try {
+			byte[] compressed = org.deftserver.util.HttpUtil.compress(data, 0, data.length, encoding);
+			headers.put("content-encoding", encoding);
+			// The representation now varies by Accept-Encoding. Set Vary directly in the header map
+			// (merging with any existing Vary) — the overridden setHeader() defers via runOnLoop, which
+			// would land after these headers are already framed.
+			mergeVaryAcceptEncoding();
+			return compressed;
+		} catch (java.io.IOException e) {
+			logger.warn("HTTP/2 response compression failed ({}), sending identity: {}", encoding, e.toString());
+			return data;
+		}
+	}
+
+	/** Adds {@code Accept-Encoding} to the {@code Vary} header in the map (synchronously, merging with any
+	 *  existing Vary), so a cache never serves gzipped bytes to a client that didn't ask for them. */
+	private void mergeVaryAcceptEncoding() {
+		for (Map.Entry<String, String> e : headers.entrySet()) {
+			if (e.getKey().equalsIgnoreCase("Vary")) {
+				String v = e.getValue();
+				if (v == null || v.isBlank()) {
+					e.setValue("Accept-Encoding");
+				} else if (!v.trim().equals("*")
+						&& !v.toLowerCase(java.util.Locale.ROOT).contains("accept-encoding")) {
+					e.setValue(v + ", Accept-Encoding");
+				}
+				return;
+			}
+		}
+		headers.put("vary", "Accept-Encoding");
 	}
 
 	@Override
@@ -163,8 +240,10 @@ public class Http2Response extends HttpResponse {
 				return;
 			}
 			if (!headersCreated) {
-				// The complete body is known now, so advertise its exact length and, if it is empty,
-				// end the stream on the HEADERS frame (no DATA needed).
+				// The complete body is known now: compress it where appropriate (mirrors the HTTP/1.1
+				// path), then advertise its exact length and, if it is empty, end the stream on the
+				// HEADERS frame (no DATA needed).
+				data = maybeCompress(data);
 				boolean endStream = (data.length == 0);
 				sendHeaders(endStream, data.length);
 				if (endStream) {

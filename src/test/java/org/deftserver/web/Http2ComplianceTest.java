@@ -49,11 +49,21 @@ public class Http2ComplianceTest {
 		@Override public void get(org.deftserver.web.http.HttpRequest req, org.deftserver.web.http.HttpResponse resp) { resp.write(BODY); }
 	}
 
+	static final String TEXT_BODY = "The quick brown fox jumps over the lazy dog. ".repeat(200);
+
+	public static class TextHandler extends RequestHandler {
+		@Override public void get(org.deftserver.web.http.HttpRequest req, org.deftserver.web.http.HttpResponse resp) {
+			resp.setHeader("Content-Type", "text/plain; charset=utf-8");
+			resp.write(TEXT_BODY);
+		}
+	}
+
 	@BeforeClass
 	public static void setup() throws Exception {
 		Map<String, RequestHandler> handlers = new HashMap<>();
 		handlers.put("/", new OkHandler());
 		handlers.put("/big", new BigHandler());
+		handlers.put("/text", new TextHandler());
 		server = new HttpServer(new Application(handlers));
 		server.bind(0);
 		PORT = server.getPort();
@@ -468,6 +478,68 @@ public class Http2ComplianceTest {
 				if (f.name.equals("content-length")) { hasCl = true; assertEquals("2", f.value); }
 			}
 			assertTrue("HEAD response should still advertise the would-be content-length", hasCl);
+		}
+	}
+
+	/** A textual response is gzip-compressed over HTTP/2 when the client offers it, with a matching
+	 *  content-length, content-encoding: gzip and Vary: Accept-Encoding — and is sent identity when not
+	 *  offered. (HTTP/2 response compression did not exist; Http2Response bypassed the HTTP/1.1 gzip path.) */
+	@Test public void textResponseGzippedWhenOffered() throws Exception {
+		byte[] gz = fetchTextBody("gzip");
+		assertEquals("gzip body must inflate to the original", TEXT_BODY,
+			new String(gunzip(gz), StandardCharsets.UTF_8));
+		assertTrue("compressed body must be smaller than the original", gz.length < TEXT_BODY.length());
+
+		byte[] identity = fetchTextBody(null);
+		assertEquals("without Accept-Encoding the body is sent identity",
+			TEXT_BODY, new String(identity, StandardCharsets.UTF_8));
+	}
+
+	/** GETs /text (optionally offering an encoding), asserts the framing, and returns the raw DATA bytes. */
+	private static byte[] fetchTextBody(String acceptEncoding) throws Exception {
+		try (Socket s = connect()) {
+			List<Hpack.HeaderField> req = new ArrayList<>();
+			req.add(new Hpack.HeaderField(":method", "GET"));
+			req.add(new Hpack.HeaderField(":path", "/text"));
+			req.add(new Hpack.HeaderField(":scheme", "http"));
+			req.add(new Hpack.HeaderField(":authority", "localhost"));
+			if (acceptEncoding != null) req.add(new Hpack.HeaderField("accept-encoding", acceptEncoding));
+			writeFrame(s.getOutputStream(), Http2Frame.TYPE_HEADERS,
+				Http2Frame.FLAG_END_HEADERS | Http2Frame.FLAG_END_STREAM, 1, encodeHeaders(req));
+			InputStream in = s.getInputStream();
+			Http2Frame headers = readUntil(in, Http2Frame.TYPE_HEADERS);
+			List<Hpack.HeaderField> fields = new Hpack.Reader(4096).readHeaders(java.nio.ByteBuffer.wrap(headers.payload));
+			long declared = -1; String encoding = null; boolean varyAE = false;
+			for (Hpack.HeaderField f : fields) {
+				switch (f.name) {
+					case "content-length": declared = Long.parseLong(f.value); break;
+					case "content-encoding": encoding = f.value; break;
+					case "vary": if (f.value.toLowerCase().contains("accept-encoding")) varyAE = true; break;
+				}
+			}
+			if (acceptEncoding != null) {
+				assertEquals("offered encoding must be applied", "gzip", encoding);
+				assertTrue("a compressed response must advertise Vary: Accept-Encoding", varyAE);
+			} else {
+				assertEquals("identity response must not set content-encoding", null, encoding);
+			}
+			ByteArrayOutputStream body = new ByteArrayOutputStream();
+			boolean ended = (headers.flags & Http2Frame.FLAG_END_STREAM) != 0;
+			while (!ended) {
+				Http2Frame f = readFrame(in);
+				if (f.type == Http2Frame.TYPE_DATA) {
+					body.write(f.payload);
+					if ((f.flags & Http2Frame.FLAG_END_STREAM) != 0) ended = true;
+				}
+			}
+			assertEquals("content-length must equal the DATA length", declared, body.size());
+			return body.toByteArray();
+		}
+	}
+
+	private static byte[] gunzip(byte[] gz) throws IOException {
+		try (java.util.zip.GZIPInputStream gis = new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(gz))) {
+			return gis.readAllBytes();
 		}
 	}
 

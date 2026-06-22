@@ -64,6 +64,9 @@ Core:
 - **HPACK** header compression (`Hpack`) — RFC 7541 Huffman coding (decoder validated against the RFC Appendix C vectors, with §5.2 padding checks)
 - Multiplexed **streams** over `HEADERS` / `CONTINUATION` / `DATA` / `WINDOW_UPDATE` / `RST_STREAM` / `SETTINGS` / `PING` / `GOAWAY` / `PRIORITY` frames, with connection + per-stream flow control
 - `SETTINGS` negotiation + validation (`ENABLE_PUSH`, `INITIAL_WINDOW_SIZE`, `MAX_FRAME_SIZE`)
+- **Connection + per-stream flow control** — responses larger than a window are drained across `WINDOW_UPDATE`s; correct framing (`content-length` matches the DATA, bodiless `HEAD`)
+- **Response compression** — textual responses are gzip/brotli/zstd-compressed when the client offers it (`Accept-Encoding`), with `Vary: Accept-Encoding`
+- **Protocol conformance** — verified with `h2spec` (144/146; the 2 non-passes are a skipped case and the dual-mode cleartext-port preface caveat) over both cleartext and TLS; see `HTTP2_COMPLIANCE.md` and `./run-h2spec.sh`
 - **DoS hardening** — frame-size cap, max concurrent streams, control-frame + `RST_STREAM`-flood limits, idle timeout
 - **Allocation-lean write path** — frame headers emitted from a reused scratch buffer; DATA/HEADERS payloads sliced straight into the connection write buffer (no per-frame copies); per-frame trace logging guarded so it allocates nothing when disabled
 - End-to-end tested in `Http2SystemTest` (GET / POST / static-file over h2c), `Http2AlpnTest` (real JDK `HttpClient` over ALPN h2 + http/1.1 fallback), `Http2H2cUpgradeTest` (the `Upgrade: h2c` handshake), `HpackHuffmanTest` (RFC 7541 conformance), and `Http2DosHardeningTest`
