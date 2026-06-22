@@ -354,6 +354,38 @@ public class Http2ComplianceTest {
 		}
 	}
 
+	/** The response's declared content-length MUST equal the summed DATA payload — strict HTTP/2 clients
+	 *  (browsers, curl, nghttp, h2load) reject a mismatch as PROTOCOL_ERROR. Regression for the bug where
+	 *  every response advertised content-length: 0 regardless of the actual body. */
+	@Test public void responseContentLengthMatchesBody() throws Exception {
+		try (Socket s = connect()) {
+			byte[] block = encodeHeaders(validRequestHeaders());
+			writeFrame(s.getOutputStream(), Http2Frame.TYPE_HEADERS,
+				Http2Frame.FLAG_END_HEADERS | Http2Frame.FLAG_END_STREAM, 1, block);
+			InputStream in = s.getInputStream();
+			Http2Frame headers = readUntil(in, Http2Frame.TYPE_HEADERS);
+			List<Hpack.HeaderField> fields = new Hpack.Reader(4096).readHeaders(java.nio.ByteBuffer.wrap(headers.payload));
+			long declared = -1;
+			for (Hpack.HeaderField f : fields) {
+				if (f.name.equals("content-length")) declared = Long.parseLong(f.value);
+			}
+			// Sum DATA payloads until END_STREAM (unless headers already ended the stream).
+			long body = 0;
+			boolean ended = (headers.flags & Http2Frame.FLAG_END_STREAM) != 0;
+			while (!ended) {
+				Http2Frame f = readFrame(in);
+				if (f.type == Http2Frame.TYPE_DATA) {
+					body += f.payload.length;
+					if ((f.flags & Http2Frame.FLAG_END_STREAM) != 0) ended = true;
+				}
+			}
+			if (declared >= 0) {
+				assertEquals("declared content-length must equal the DATA length", declared, body);
+			}
+			assertEquals("handler wrote \"ok\" (2 bytes)", 2, body);
+		}
+	}
+
 	/** A valid request must still get a normal response (sanity: the validations don't reject good traffic). */
 	@Test public void validRequest_succeeds() throws Exception {
 		try (Socket s = connect()) {

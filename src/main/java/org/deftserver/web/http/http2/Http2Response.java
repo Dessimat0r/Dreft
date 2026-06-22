@@ -35,6 +35,13 @@ public class Http2Response extends HttpResponse {
 
 	@Override
 	public void setHeader(String header, String value) {
+		// Content-Length is computed by Http2Response itself from the body it frames, so a handler/parent
+		// setHeader("Content-Length", …) is ignored for HTTP/2 framing to guarantee it can never disagree
+		// with the actual DATA (RFC 7540 §8.1.2.6). The file/streaming write paths pass the known length
+		// to sendHeaders directly.
+		if (header.equalsIgnoreCase("Content-Length")) {
+			return;
+		}
 		runOnLoop(() -> super.setHeader(header, value));
 	}
 
@@ -61,10 +68,10 @@ public class Http2Response extends HttpResponse {
 
 	@Override
 	public long write(File file) {
-		setHeader("Content-Length", String.valueOf(file.length()));
+		long len = file.length();
 		runOnLoop(() -> {
 			if (!headersCreated) {
-				sendHeaders(false);
+				sendHeaders(false, len); // advertise the exact file length
 			}
 			if (isBodySuppressed()) {
 				return;
@@ -88,7 +95,7 @@ public class Http2Response extends HttpResponse {
 	public long write(File file, long start, long length) {
 		runOnLoop(() -> {
 			if (!headersCreated) {
-				sendHeaders(false);
+				sendHeaders(false, length); // advertise the exact range length
 			}
 			if (isBodySuppressed()) {
 				return;
@@ -122,7 +129,8 @@ public class Http2Response extends HttpResponse {
 				return;
 			}
 			if (!headersCreated) {
-				sendHeaders(false);
+				// Streaming: the total body length is not known yet, so omit content-length.
+				sendHeaders(false, -1);
 			}
 			byte[] data = buffer.toByteArray();
 			buffer.reset();
@@ -140,37 +148,56 @@ public class Http2Response extends HttpResponse {
 				return;
 			}
 			finished = true;
+			byte[] data = buffer.toByteArray();
+			buffer.reset();
 			if (!headersCreated) {
-				boolean endStream = (buffer.size() == 0);
-				sendHeaders(endStream);
+				// The complete body is known now, so advertise its exact length and, if it is empty,
+				// end the stream on the HEADERS frame (no DATA needed).
+				boolean endStream = (data.length == 0);
+				sendHeaders(endStream, data.length);
 				if (endStream) {
 					return;
 				}
 			}
-			byte[] data = buffer.toByteArray();
-			buffer.reset();
 			connection.sendData(stream.streamId, data, true);
 		});
 		return 0;
 	}
 
-	private void sendHeaders(boolean endStream) {
+	/**
+	 * Emits the response HEADERS. {@code bodyLength} is the exact number of body bytes that will follow
+	 * when it is known (the buffered-response and file paths), or {@code -1} when the body is being
+	 * streamed and its total length is not yet known. A {@code content-length} is advertised only when
+	 * the length is known and one was not already set explicitly (e.g. via {@code write(File)}) — this
+	 * is critical: HTTP/2 clients treat a {@code content-length} that disagrees with the summed DATA as
+	 * a PROTOCOL_ERROR (RFC 7540 §8.1.2.6), and connection-specific headers are stripped (§8.1.2.2).
+	 */
+	private void sendHeaders(boolean endStream, long bodyLength) {
 		headersCreated = true;
 		List<Hpack.HeaderField> headerFields = new ArrayList<>();
 		headerFields.add(new Hpack.HeaderField(":status", String.valueOf(statusCode)));
+		boolean hasContentLength = false;
 		for (Map.Entry<String, String> entry : headers.entrySet()) {
 			String name = entry.getKey().toLowerCase(java.util.Locale.ROOT);
-			if (name.equals("connection") || name.equals("keep-alive") || name.equals("transfer-encoding")) {
+			if (name.equals("connection") || name.equals("keep-alive") || name.equals("transfer-encoding")
+					|| name.equals("upgrade") || name.equals("proxy-connection")) {
 				continue;
+			}
+			if (name.equals("content-length")) {
+				hasContentLength = true;
 			}
 			headerFields.add(new Hpack.HeaderField(name, entry.getValue()));
 		}
-		if (contentLength != -1) {
-			headerFields.add(new Hpack.HeaderField("content-length", String.valueOf(contentLength)));
+		// Advertise content-length when it is known, preferring a value the handler set explicitly (the
+		// parent routes setHeader("Content-Length", …) into the `contentLength` field — e.g. write(File))
+		// over the measured buffered-body length. When neither is known (streaming) it is omitted and
+		// END_STREAM delimits the body. Critically it must never disagree with the actual DATA (§8.1.2.6).
+		if (!hasContentLength && bodyLength >= 0) {
+			headerFields.add(new Hpack.HeaderField("content-length", String.valueOf(bodyLength)));
 		}
 		for (Cookie cookie : cookies) {
 			headerFields.add(new Hpack.HeaderField("set-cookie", cookie.toString()));
 		}
-		connection.sendHeaders(stream.streamId, headerFields, endStream && buffer.size() == 0);
+		connection.sendHeaders(stream.streamId, headerFields, endStream);
 	}
 }

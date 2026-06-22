@@ -34,6 +34,9 @@ public final class H2SpecHarness {
 		Map<String, RequestHandler> handlers = new HashMap<>();
 		handlers.put("/", new OkHandler());
 		HttpServer server = new HttpServer(new Application(handlers));
+		// Enable the h2c Upgrade so load testers that default to it (e.g. h2load) can connect over
+		// cleartext. h2spec uses prior-knowledge (sends the preface directly), so it is unaffected.
+		server.setHttp2CleartextUpgradeEnabled(true);
 		server.bind(port);
 		server.start(1);
 		System.out.println("H2SpecHarness listening on " + port + " (Ctrl-C to stop)");
