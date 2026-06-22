@@ -550,8 +550,7 @@ public class Http2Connection {
 			boolean first = true;
 			while (offset < payload.length || first) {
 				int toSend = Math.min(payload.length - offset, maxFrameSize);
-				byte[] chunk = new byte[toSend];
-				System.arraycopy(payload, offset, chunk, 0, toSend);
+				int chunkStart = offset;
 				offset += toSend;
 				boolean last = offset == payload.length;
 				int type = first ? Http2Frame.TYPE_HEADERS : Http2Frame.TYPE_CONTINUATION;
@@ -562,7 +561,7 @@ public class Http2Connection {
 				if (last) {
 					flags |= Http2Frame.FLAG_END_HEADERS;
 				}
-				writeFrame(type, flags, streamId, chunk);
+				writeFrameDirect(type, flags, streamId, payload, chunkStart, toSend);
 				first = false;
 			}
 			if (endStream) {
@@ -601,8 +600,7 @@ public class Http2Connection {
 				continue;
 			}
 			int toSend = Math.min(pending.data.length - pending.offset, limit);
-			byte[] chunk = new byte[toSend];
-			System.arraycopy(pending.data, pending.offset, chunk, 0, toSend);
+			int chunkStart = pending.offset;
 			pending.offset += toSend;
 			boolean last = pending.endStream && (pending.offset == pending.data.length);
 			int flags = last ? Http2Frame.FLAG_END_STREAM : 0;
@@ -610,7 +608,7 @@ public class Http2Connection {
 			stream.outboundWindowSize -= toSend;
 			connectionOutboundWindowSize -= toSend;
 
-			writeFrame(Http2Frame.TYPE_DATA, flags, pending.streamId, chunk);
+			writeFrameDirect(Http2Frame.TYPE_DATA, flags, pending.streamId, pending.data, chunkStart, toSend);
 			if (last) {
 				stream.setState(Http2Stream.STATE_CLOSED);
 				streams.remove(pending.streamId);
@@ -621,12 +619,38 @@ public class Http2Connection {
 		}
 	}
 
+	// Reused per-connection 9-byte frame-header scratch (only ever touched on this connection's I/O-loop
+	// thread). Lets writeFrameDirect emit the header straight into writeBuffer with no per-frame array.
+	private final byte[] frameHeaderScratch = new byte[9];
+
 	private void writeFrame(int type, int flags, int streamId, byte[] payload) {
+		writeFrameDirect(type, flags, streamId, payload, 0, payload == null ? 0 : payload.length);
+	}
+
+	/**
+	 * Writes a frame header followed by {@code src[off..off+len)} straight into the connection write
+	 * buffer — no intermediate {@code toBytes()} array and no per-frame payload copy (the DATA and
+	 * HEADERS/CONTINUATION hot paths slice directly out of the response payload). One copy total: into
+	 * the write buffer.
+	 */
+	private void writeFrameDirect(int type, int flags, int streamId, byte[] src, int off, int len) {
 		if (logger.isDebugEnabled()) {
-			logger.debug("Writing frame: type={}, flags={}, streamId={}, len={}", type, flags, streamId, payload == null ? 0 : payload.length);
+			logger.debug("Writing frame: type={}, flags={}, streamId={}, len={}", type, flags, streamId, len);
 		}
-		byte[] frameBytes = Http2Frame.toBytes(type, flags, streamId, payload);
-		writeBuffer.put(frameBytes);
+		byte[] h = frameHeaderScratch;
+		h[0] = (byte) ((len >>> 16) & 0xFF);
+		h[1] = (byte) ((len >>> 8) & 0xFF);
+		h[2] = (byte) (len & 0xFF);
+		h[3] = (byte) (type & 0xFF);
+		h[4] = (byte) (flags & 0xFF);
+		h[5] = (byte) ((streamId >>> 24) & 0x7F);
+		h[6] = (byte) ((streamId >>> 16) & 0xFF);
+		h[7] = (byte) ((streamId >>> 8) & 0xFF);
+		h[8] = (byte) (streamId & 0xFF);
+		writeBuffer.put(h, 0, 9);
+		if (src != null && len > 0) {
+			writeBuffer.put(src, off, len);
+		}
 		tryWrite();
 	}
 

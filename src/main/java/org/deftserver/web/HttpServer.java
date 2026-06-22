@@ -30,6 +30,7 @@ public class HttpServer {
 	
 	private int maxConnections = -1;
 	private int maxConnectionsPerIp = -1;
+	private boolean h2cUpgradeEnabled = false;
 
 	/** Creates a server for the given application (handlers). Configure TLS/limits, then bind+start. */
 	public HttpServer(Application application) {
@@ -44,6 +45,18 @@ public class HttpServer {
 	/** Caps simultaneous connections from a single remote IP (<= 0 disables). */
 	public void setMaxConnectionsPerIp(int max) {
 		this.maxConnectionsPerIp = max;
+	}
+
+	/**
+	 * Enables the HTTP/1.1 → HTTP/2 cleartext upgrade ({@code Upgrade: h2c}, RFC 7540 §3.2), disabled
+	 * by default. When off, a plaintext {@code Upgrade: h2c} request is served as ordinary HTTP/1.1
+	 * (the upgrade is ignored, which RFC 7540 permits) — so a client defaulting to HTTP/2 (e.g. the JDK
+	 * {@code HttpClient}) transparently falls back to HTTP/1.1. It is opt-in because honouring it
+	 * silently switches every such cleartext connection to HTTP/2. HTTP/2 over TLS (ALPN) and
+	 * prior-knowledge cleartext h2c are always available and unaffected by this flag.
+	 */
+	public void setHttp2CleartextUpgradeEnabled(boolean enabled) {
+		this.h2cUpgradeEnabled = enabled;
 	}
 
 	public int getPort() {
@@ -103,6 +116,7 @@ public class HttpServer {
 		if (isSSLEnabled()) {
 			protocol.enableSSL(sslContext);
 		}
+		protocol.setH2cUpgradeEnabled(h2cUpgradeEnabled);
 		registerHandler(IOLoop.INSTANCE, protocol);
 	}
 	
@@ -173,6 +187,7 @@ public class HttpServer {
 			if (isSSLEnabled()) {
 				protocol.enableSSL(sslContext);
 			}
+			protocol.setH2cUpgradeEnabled(h2cUpgradeEnabled);
 			Thread.ofPlatform()
 				.name("I/O-LOOP-" + i)
 				.start(() -> {

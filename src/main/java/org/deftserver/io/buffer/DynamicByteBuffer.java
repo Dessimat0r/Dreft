@@ -35,6 +35,14 @@ public class DynamicByteBuffer {
 	}
 
 	/**
+	 * Append a slice of the data. Will reallocate if needed.
+	 */
+	public void put(byte[] src, int offset, int length) {
+		ensureCapacity(length);
+		backend.put(src, offset, length);
+	}
+
+	/**
 	 * Append the data. Will reallocate if needed.
 	 */
 	public void put(ByteBuffer src) {

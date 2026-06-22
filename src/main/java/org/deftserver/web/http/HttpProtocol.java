@@ -497,10 +497,17 @@ public class HttpProtocol implements IOHandler {
 
 	private int maxConnections = -1;
 	private int maxConnectionsPerIp = -1;
+	private boolean h2cUpgradeEnabled = false;
 
 	/** Caps the total simultaneous connections this protocol instance will accept ({@code <= 0} disables). */
 	public void setMaxConnections(int max) {
 		this.maxConnections = max;
+	}
+
+	/** Enables/disables the cleartext HTTP/1.1→HTTP/2 {@code Upgrade: h2c} negotiation (default off).
+	 *  See {@link org.deftserver.web.HttpServer#setHttp2CleartextUpgradeEnabled(boolean)}. */
+	public void setH2cUpgradeEnabled(boolean enabled) {
+		this.h2cUpgradeEnabled = enabled;
 	}
 
 	/** Caps simultaneous connections from a single remote IP (<= 0 disables). Prevents one client
@@ -992,6 +999,7 @@ public class HttpProtocol implements IOHandler {
 	 * is negotiated by ALPN instead, so the h2c upgrade is ignored there.
 	 */
 	private boolean tryH2cUpgrade(SelectionKey key, SocketChannel clientChannel, HttpRequest request) {
+		if (!h2cUpgradeEnabled) return false;                              // opt-in (default off)
 		if (getSslSessionHandler(clientChannel) != null) return false;     // TLS ⇒ use ALPN, not h2c
 		if (!"HTTP/1.1".equals(request.getVersion())) return false;
 		if (!headerListContainsToken(request.getHeader("Upgrade"), "h2c")) return false;

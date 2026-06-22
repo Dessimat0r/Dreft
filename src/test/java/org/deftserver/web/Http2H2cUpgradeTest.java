@@ -47,6 +47,7 @@ public class Http2H2cUpgradeTest {
 		Map<String, RequestHandler> handlers = new HashMap<>();
 		handlers.put("/", new HelloHandler());
 		server = new HttpServer(new Application(handlers));
+		server.setHttp2CleartextUpgradeEnabled(true); // opt-in; off by default
 		server.bind(0);
 		PORT = server.getPort();
 		Thread.ofPlatform().name("H2c-I/O-Loop").start(() -> {
