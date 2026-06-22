@@ -24,7 +24,7 @@ stream id and an error code before closing (RFC 7540 §5.4.1, §6.8); a **stream
 - [x] 5.1.1 — client stream ids must strictly increase; reused/old id → `PROTOCOL_ERROR`
 - [x] 5.1.1 — client-initiated streams must be odd; even id → `PROTOCOL_ERROR`
 - [x] 5.1.2 — `SETTINGS_MAX_CONCURRENT_STREAMS` enforced → `REFUSED_STREAM`
-- [~] 5.1 — stream state machine: HEADERS/DATA on an idle/closed stream not fully validated (`STREAM_CLOSED` / `PROTOCOL_ERROR`)
+- [x] 5.1 — stream state: DATA/HEADERS on a half-closed/closed stream → `STREAM_CLOSED`; on an idle stream → `PROTOCOL_ERROR`; WINDOW_UPDATE on an idle stream → `PROTOCOL_ERROR`; trailers (a second END_STREAM HEADERS on an open stream) accepted
 - [x] 5.3.1 — PRIORITY/HEADERS self-dependency (stream depends on itself) → `PROTOCOL_ERROR`
 - [x] 5.4.1 — connection errors send `GOAWAY(last_stream_id, code)` before closing
 
@@ -48,7 +48,7 @@ stream id and an error code before closing (RFC 7540 §5.4.1, §6.8); a **stream
 - [x] 8.1.2.1 — pseudo-headers: unknown pseudo-header, a pseudo-header after a regular header, or a duplicate → malformed
 - [x] 8.1.2.2 — connection-specific headers (`Connection`, `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding`, `Upgrade`) → malformed; `TE` only if its value is exactly `trailers`
 - [x] 8.1.2.3 — request requires `:method`, `:path`, `:scheme`; missing/duplicate → malformed
-- [~] 8.1.2.6 — `Content-Length` vs DATA length consistency not yet enforced
+- [x] 8.1.2.6 — a declared `Content-Length` must equal the summed DATA payload length, else malformed
 
 ## RFC 7541 (HPACK)
 - [x] 5.2 — Huffman end-of-string padding validated (≤7 bits, all-ones); EOS-in-input rejected

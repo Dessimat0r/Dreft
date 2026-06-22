@@ -331,8 +331,7 @@ public class Http2Connection {
 	}
 
 	private void handleHeaders(Http2Frame frame) throws IOException {
-		// RFC 7540 §6.2 / §5.1.1: HEADERS must be on a client-initiated (odd, non-zero) stream whose id
-		// strictly exceeds every previous one (a lower/equal id is a reused or idle stream).
+		// RFC 7540 §6.2 / §5.1.1: HEADERS must be on a client-initiated (odd, non-zero) stream.
 		if (frame.streamId == 0) {
 			connectionError(PROTOCOL_ERROR, "HEADERS must not be on stream 0");
 			return;
@@ -341,11 +340,27 @@ public class Http2Connection {
 			connectionError(PROTOCOL_ERROR, "client stream id must be odd: " + frame.streamId);
 			return;
 		}
-		if (frame.streamId <= maxClientStreamId) {
-			connectionError(PROTOCOL_ERROR, "stream id " + frame.streamId + " not greater than " + maxClientStreamId);
-			return;
+		// §5.1 stream-state check. A HEADERS frame either opens a brand-new stream (id strictly greater
+		// than any seen) or carries trailers for an already-open one; anything else is an error.
+		Http2Stream existing = streams.get(frame.streamId);
+		if (existing != null) {
+			if (!existing.isOpen()) {
+				// half-closed (remote) or closed → the client already ended its half of the stream.
+				connectionError(STREAM_CLOSED, "HEADERS on non-open stream " + frame.streamId);
+				return;
+			}
+			// Trailers: a second HEADERS on an open stream MUST terminate it (END_STREAM).
+			if ((frame.flags & Http2Frame.FLAG_END_STREAM) == 0) {
+				connectionError(PROTOCOL_ERROR, "trailer HEADERS must set END_STREAM on stream " + frame.streamId);
+				return;
+			}
+		} else {
+			if (frame.streamId <= maxClientStreamId) {
+				connectionError(PROTOCOL_ERROR, "stream id " + frame.streamId + " not greater than " + maxClientStreamId);
+				return;
+			}
+			maxClientStreamId = frame.streamId;
 		}
-		maxClientStreamId = frame.streamId;
 		int offset = 0;
 		int padLength = 0;
 		if ((frame.flags & Http2Frame.FLAG_PADDED) != 0) {
@@ -443,8 +458,15 @@ public class Http2Connection {
 		}
 		Http2Stream stream = streams.get(frame.streamId);
 		if (stream == null) {
-			// DATA for an idle stream (never opened) or one already closed → no valid recipient.
-			connectionError(PROTOCOL_ERROR, "DATA on non-open stream " + frame.streamId);
+			// An id we've never opened is idle (PROTOCOL_ERROR); a lower id is a stream we already
+			// closed and dropped (STREAM_CLOSED) — RFC 7540 §5.1.
+			int code = frame.streamId > maxClientStreamId ? PROTOCOL_ERROR : STREAM_CLOSED;
+			connectionError(code, "DATA on non-open stream " + frame.streamId);
+			return;
+		}
+		if (!stream.isOpen()) {
+			// The client already half-closed (END_STREAM) or the stream is closed: no more DATA allowed.
+			connectionError(STREAM_CLOSED, "DATA on half-closed/closed stream " + frame.streamId);
 			return;
 		}
 		int offset = 0;
@@ -510,7 +532,14 @@ public class Http2Connection {
 			connectionOutboundWindowSize = (int) newSize;
 		} else {
 			Http2Stream stream = streams.get(frame.streamId);
-			if (stream != null) {
+			if (stream == null) {
+				// WINDOW_UPDATE on an idle stream (never opened) is a connection PROTOCOL_ERROR (§5.1);
+				// on a recently-closed stream it's permitted and ignored.
+				if (frame.streamId % 2 != 0 && frame.streamId > maxClientStreamId) {
+					connectionError(PROTOCOL_ERROR, "WINDOW_UPDATE on idle stream " + frame.streamId);
+					return;
+				}
+			} else {
 				long newSize = (long) stream.outboundWindowSize + increment;
 				if (newSize > Integer.MAX_VALUE) {
 					streamError(frame.streamId, FLOW_CONTROL_ERROR);
@@ -603,6 +632,21 @@ public class Http2Connection {
 		// §8.1.2.3: a request must include :method, :scheme and :path (non-empty for the schemes we serve).
 		if (invalid == null && (method == null || scheme == null || path == null || path.isEmpty())) {
 			invalid = "missing/empty mandatory pseudo-header";
+		}
+		// §8.1.2.6: a declared Content-Length must equal the sum of the DATA frame payloads.
+		if (invalid == null) {
+			String cl = headers.get("content-length");
+			if (cl != null) {
+				long declared;
+				try {
+					declared = Long.parseLong(cl.trim());
+				} catch (NumberFormatException nfe) {
+					declared = -1;
+				}
+				if (declared != stream.requestBody.size()) {
+					invalid = "content-length (" + cl + ") != body length " + stream.requestBody.size();
+				}
+			}
 		}
 		if (invalid != null) {
 			malformed(stream, invalid);

@@ -29,7 +29,7 @@ import org.junit.Test;
 public class Http2ComplianceTest {
 
 	private static final int NO_ERROR = 0x0, PROTOCOL_ERROR = 0x1, FLOW_CONTROL_ERROR = 0x3,
-		FRAME_SIZE_ERROR = 0x6;
+		STREAM_CLOSED = 0x5, FRAME_SIZE_ERROR = 0x6;
 
 	private static int PORT;
 	private static HttpServer server;
@@ -245,6 +245,74 @@ public class Http2ComplianceTest {
 			fields.add(new Hpack.HeaderField(":path", "/"));      // pseudo after regular
 			sendRequestExpectRst(s, fields, PROTOCOL_ERROR);
 		}
+	}
+
+	// ---- stream-state machine ----
+
+	@Test public void dataAfterEndStream_streamClosed() throws Exception {
+		try (Socket s = connect()) {
+			OutputStream out = s.getOutputStream();
+			byte[] block = encodeHeaders(validRequestHeaders());
+			// GET with END_STREAM closes the client half of stream 1...
+			writeFrame(out, Http2Frame.TYPE_HEADERS,
+				Http2Frame.FLAG_END_HEADERS | Http2Frame.FLAG_END_STREAM, 1, block);
+			// ...so a following DATA on stream 1 is illegal.
+			writeFrame(out, Http2Frame.TYPE_DATA, 0, 1, new byte[] {1, 2, 3});
+			expectGoAway(s, STREAM_CLOSED);
+		}
+	}
+
+	@Test public void windowUpdateOnIdleStream_protocolError() throws Exception {
+		try (Socket s = connect()) {
+			byte[] inc = {0, 0, 0, 1};
+			writeFrame(s.getOutputStream(), Http2Frame.TYPE_WINDOW_UPDATE, 0, 5, inc); // stream 5 never opened
+			expectGoAway(s, PROTOCOL_ERROR);
+		}
+	}
+
+	@Test public void contentLengthMismatch_malformed() throws Exception {
+		try (Socket s = connect()) {
+			OutputStream out = s.getOutputStream();
+			List<Hpack.HeaderField> fields = new ArrayList<>();
+			fields.add(new Hpack.HeaderField(":method", "POST"));
+			fields.add(new Hpack.HeaderField(":path", "/"));
+			fields.add(new Hpack.HeaderField(":scheme", "http"));
+			fields.add(new Hpack.HeaderField(":authority", "localhost"));
+			fields.add(new Hpack.HeaderField("content-length", "100")); // lies: only 2 body bytes follow
+			writeFrame(out, Http2Frame.TYPE_HEADERS, Http2Frame.FLAG_END_HEADERS, 1, encodeHeaders(fields));
+			writeFrame(out, Http2Frame.TYPE_DATA, Http2Frame.FLAG_END_STREAM, 1, "ok".getBytes(StandardCharsets.US_ASCII));
+			expectRstStream(s, 1, PROTOCOL_ERROR);
+		}
+	}
+
+	@Test public void trailersAreAccepted() throws Exception {
+		try (Socket s = connect()) {
+			OutputStream out = s.getOutputStream();
+			// Both header blocks share one HPACK writer so the client's dynamic table tracks the server's
+			// single decoder (separate writers would desync the dynamic-table indices).
+			Hpack.Writer writer = new Hpack.Writer(4096);
+			List<Hpack.HeaderField> req = new ArrayList<>();
+			req.add(new Hpack.HeaderField(":method", "POST"));
+			req.add(new Hpack.HeaderField(":path", "/"));
+			req.add(new Hpack.HeaderField(":scheme", "http"));
+			req.add(new Hpack.HeaderField(":authority", "localhost"));
+			// Initial HEADERS without END_STREAM (stream stays open for body + trailers).
+			writeFrame(out, Http2Frame.TYPE_HEADERS, Http2Frame.FLAG_END_HEADERS, 1, encode(writer, req));
+			writeFrame(out, Http2Frame.TYPE_DATA, 0, 1, "hello".getBytes(StandardCharsets.US_ASCII));
+			// Trailer HEADERS (regular field only) with END_STREAM ends the request.
+			List<Hpack.HeaderField> trailer = new ArrayList<>();
+			trailer.add(new Hpack.HeaderField("x-checksum", "abc"));
+			writeFrame(out, Http2Frame.TYPE_HEADERS,
+				Http2Frame.FLAG_END_HEADERS | Http2Frame.FLAG_END_STREAM, 1, encode(writer, trailer));
+			Http2Frame resp = readUntil(s.getInputStream(), Http2Frame.TYPE_HEADERS);
+			assertEquals(1, resp.streamId);
+		}
+	}
+
+	private static byte[] encode(Hpack.Writer writer, List<Hpack.HeaderField> fields) throws IOException {
+		ByteArrayOutputStream baos = new ByteArrayOutputStream();
+		writer.writeHeaders(baos, fields);
+		return baos.toByteArray();
 	}
 
 	/** A valid request must still get a normal response (sanity: the validations don't reject good traffic). */
