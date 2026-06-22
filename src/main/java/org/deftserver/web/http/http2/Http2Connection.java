@@ -136,6 +136,9 @@ public class Http2Connection {
 			}
 
 			inboundBuffer.compact();
+		} catch (Http2Frame.FrameSizeException oversized) {
+			// A frame larger than SETTINGS_MAX_FRAME_SIZE is a connection FRAME_SIZE_ERROR (§4.2).
+			connectionError(FRAME_SIZE_ERROR, oversized.getMessage());
 		} catch (IOException e) {
 			logger.error("IOException in onReadable", e);
 			protocol.closeChannel(channel);

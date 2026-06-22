@@ -197,6 +197,21 @@ public class Http2ComplianceTest {
 		}
 	}
 
+	@Test public void frameExceedingMaxFrameSize_frameSizeError() throws Exception {
+		try (Socket s = connect()) {
+			// A frame header declaring length 20000 (> the advertised SETTINGS_MAX_FRAME_SIZE of 16384).
+			// The server rejects on the length before needing the (unsent) payload.
+			int len = 20000;
+			byte[] hdr = {
+				(byte) ((len >> 16) & 0xFF), (byte) ((len >> 8) & 0xFF), (byte) (len & 0xFF),
+				Http2Frame.TYPE_HEADERS, 0, 0, 0, 0, 1
+			};
+			s.getOutputStream().write(hdr);
+			s.getOutputStream().flush();
+			expectGoAway(s, FRAME_SIZE_ERROR);
+		}
+	}
+
 	@Test public void badInitialWindowSize_flowControlError() throws Exception {
 		try (Socket s = connect()) {
 			// SETTINGS_INITIAL_WINDOW_SIZE (id 4) = 0x80000000 (> 2^31-1).

@@ -13,8 +13,11 @@ stream id and an error code before closing (RFC 7540 §5.4.1, §6.8); a **stream
 
 ## h2spec verification
 
-Verified with [h2spec](https://github.com/summerwind/h2spec) 2.6.0 against the cleartext
-prior-knowledge h2c endpoint: **146 tests — 144 passed, 1 skipped, 1 known exception**.
+Verified with [h2spec](https://github.com/summerwind/h2spec) 2.6.0 — **146 tests: 144 passed, 1
+skipped, 1 known exception** — over **both** transports: cleartext prior-knowledge h2c, and HTTP/2
+over TLS via ALPN (`run-h2spec.sh` cleartext; `H2SpecHarness <port> tls` + `h2spec -t -k` for TLS).
+`--strict` adds one more passing test (147: 145 passed). Throughput is exercised separately with
+`h2load` (the sized `H2SpecHarness` endpoints) — clean across 2 B … 1 MiB bodies.
 
 The single non-pass is `http2/3.5.2` ("Sends invalid connection preface"), which expects a `GOAWAY`
 for arbitrary non-preface garbage. Dreft's cleartext port is intentionally **dual-mode** (HTTP/1.1 +

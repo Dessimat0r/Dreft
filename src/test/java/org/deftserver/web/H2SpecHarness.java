@@ -12,10 +12,11 @@ import org.deftserver.web.http.HttpResponse;
  * cleartext Dreft server exposing a single {@code /} handler, for running the external
  * <a href="https://github.com/summerwind/h2spec">h2spec</a> HTTP/2 conformance suite against it.
  *
- * <p>Usage: {@code java -cp <cp> org.deftserver.web.H2SpecHarness [port]} (default port 18080), then
- * {@code h2spec -p <port> -h 127.0.0.1}. The {@code run-h2spec.sh} script at the repo root wires this
- * all together (build → launch → run h2spec → tear down). See {@code HTTP2_COMPLIANCE.md} for the
- * expected result and the one documented exception.
+ * <p>Usage: {@code java -cp <cp> org.deftserver.web.H2SpecHarness [port] [tls]} (default port 18080),
+ * then {@code h2spec -p <port> -h 127.0.0.1} (add {@code -t -k} for the {@code tls} mode, which serves
+ * HTTP/2 over TLS via ALPN using the test keystore). The {@code run-h2spec.sh} script at the repo root
+ * wires the cleartext path together (build → launch → run h2spec → tear down). See {@code
+ * HTTP2_COMPLIANCE.md} for the expected result and the one documented exception.
  */
 public final class H2SpecHarness {
 
@@ -54,12 +55,26 @@ public final class H2SpecHarness {
 		handlers.put("/1m", new FixedSizeHandler(1024 * 1024));
 		handlers.put("/echo", new EchoHandler());
 		HttpServer server = new HttpServer(new Application(handlers));
-		// Enable the h2c Upgrade so load testers that default to it (e.g. h2load) can connect over
-		// cleartext. h2spec uses prior-knowledge (sends the preface directly), so it is unaffected.
-		server.setHttp2CleartextUpgradeEnabled(true);
+		boolean tls = args.length > 1 && args[1].equalsIgnoreCase("tls");
+		if (tls) {
+			// HTTP/2 over TLS via ALPN, using the test keystore.
+			java.security.KeyStore ks = java.security.KeyStore.getInstance("PKCS12");
+			try (java.io.FileInputStream fis = new java.io.FileInputStream("src/test/resources/keystore.p12")) {
+				ks.load(fis, "password".toCharArray());
+			}
+			javax.net.ssl.KeyManagerFactory kmf = javax.net.ssl.KeyManagerFactory.getInstance("SunX509");
+			kmf.init(ks, "password".toCharArray());
+			javax.net.ssl.SSLContext sslContext = javax.net.ssl.SSLContext.getInstance("TLS");
+			sslContext.init(kmf.getKeyManagers(), null, null);
+			server.enableSSL(sslContext);
+		} else {
+			// Enable the h2c Upgrade so load testers that default to it (e.g. h2load) can connect over
+			// cleartext. h2spec uses prior-knowledge (sends the preface directly), so it is unaffected.
+			server.setHttp2CleartextUpgradeEnabled(true);
+		}
 		server.bind(port);
 		server.start(1);
-		System.out.println("H2SpecHarness listening on " + port + " (Ctrl-C to stop)");
+		System.out.println("H2SpecHarness listening on " + port + (tls ? " (TLS/ALPN)" : " (cleartext)") + " (Ctrl-C to stop)");
 		Thread.currentThread().join();
 	}
 }

@@ -28,6 +28,15 @@ public final class Http2Frame {
 	public final int streamId;
 	public final byte[] payload;
 
+	/** Thrown when a frame declares a length greater than {@code SETTINGS_MAX_FRAME_SIZE}; the caller
+	 *  answers this with a connection error of type {@code FRAME_SIZE_ERROR} (RFC 7540 §4.2), distinct
+	 *  from a socket/SSL {@link IOException} which just means the connection is gone. */
+	public static final class FrameSizeException extends IOException {
+		public FrameSizeException(String message) {
+			super(message);
+		}
+	}
+
 	public Http2Frame(int length, int type, int flags, int streamId, byte[] payload) {
 		this.length = length;
 		this.type = type;
@@ -47,7 +56,7 @@ public final class Http2Frame {
 		int length = (len1 << 16) | (len2 << 8) | len3;
 
 		if (length > maxFrameSize) {
-			throw new IOException("Frame size limit exceeded: " + length);
+			throw new FrameSizeException("Frame size limit exceeded: " + length);
 		}
 
 		int type = buffer.get() & 0xFF;
