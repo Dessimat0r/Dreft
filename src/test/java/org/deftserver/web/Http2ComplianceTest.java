@@ -58,12 +58,21 @@ public class Http2ComplianceTest {
 		}
 	}
 
+	public static class CookieHandler extends RequestHandler {
+		@Override public void get(org.deftserver.web.http.HttpRequest req, org.deftserver.web.http.HttpResponse resp) {
+			resp.setCookie(new org.deftserver.web.http.Cookie("a", "1"));
+			resp.setCookie(new org.deftserver.web.http.Cookie("b", "2"));
+			resp.write("ok");
+		}
+	}
+
 	@BeforeClass
 	public static void setup() throws Exception {
 		Map<String, RequestHandler> handlers = new HashMap<>();
 		handlers.put("/", new OkHandler());
 		handlers.put("/big", new BigHandler());
 		handlers.put("/text", new TextHandler());
+		handlers.put("/cookies", new CookieHandler());
 		server = new HttpServer(new Application(handlers));
 		server.bind(0);
 		PORT = server.getPort();
@@ -568,6 +577,26 @@ public class Http2ComplianceTest {
 	private static byte[] gunzip(byte[] gz) throws IOException {
 		try (java.util.zip.GZIPInputStream gis = new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(gz))) {
 			return gis.readAllBytes();
+		}
+	}
+
+	/** Each cookie must be emitted as its own set-cookie header field over HTTP/2 (HPACK has no concept
+	 *  of folding multiple cookies into one field). */
+	@Test public void multipleCookiesAreSeparateHeaderFields() throws Exception {
+		try (Socket s = connect()) {
+			List<Hpack.HeaderField> req = new ArrayList<>();
+			req.add(new Hpack.HeaderField(":method", "GET"));
+			req.add(new Hpack.HeaderField(":path", "/cookies"));
+			req.add(new Hpack.HeaderField(":scheme", "http"));
+			req.add(new Hpack.HeaderField(":authority", "localhost"));
+			writeFrame(s.getOutputStream(), Http2Frame.TYPE_HEADERS,
+				Http2Frame.FLAG_END_HEADERS | Http2Frame.FLAG_END_STREAM, 1, encodeHeaders(req));
+			Http2Frame headers = readUntil(s.getInputStream(), Http2Frame.TYPE_HEADERS);
+			int setCookies = 0;
+			for (Hpack.HeaderField f : new Hpack.Reader(4096).readHeaders(java.nio.ByteBuffer.wrap(headers.payload))) {
+				if (f.name.equals("set-cookie")) setCookies++;
+			}
+			assertEquals("two cookies must be two separate set-cookie fields", 2, setCookies);
 		}
 	}
 
