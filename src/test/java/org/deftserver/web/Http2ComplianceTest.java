@@ -34,15 +34,25 @@ public class Http2ComplianceTest {
 	private static int PORT;
 	private static HttpServer server;
 
+	/** Larger than the initial flow-control window (65535) and SETTINGS_MAX_FRAME_SIZE (16384), so the
+	 *  response spans many DATA frames AND requires the client to extend the flow-control window. */
+	static final int BIG_SIZE = 200_000;
+
 	public static class OkHandler extends RequestHandler {
 		@Override public void get(org.deftserver.web.http.HttpRequest req, org.deftserver.web.http.HttpResponse resp) { resp.write("ok"); }
 		@Override public void post(org.deftserver.web.http.HttpRequest req, org.deftserver.web.http.HttpResponse resp) { resp.write("ok"); }
+	}
+
+	public static class BigHandler extends RequestHandler {
+		private static final String BODY = "x".repeat(BIG_SIZE);
+		@Override public void get(org.deftserver.web.http.HttpRequest req, org.deftserver.web.http.HttpResponse resp) { resp.write(BODY); }
 	}
 
 	@BeforeClass
 	public static void setup() throws Exception {
 		Map<String, RequestHandler> handlers = new HashMap<>();
 		handlers.put("/", new OkHandler());
+		handlers.put("/big", new BigHandler());
 		server = new HttpServer(new Application(handlers));
 		server.bind(0);
 		PORT = server.getPort();
@@ -383,6 +393,41 @@ public class Http2ComplianceTest {
 				assertEquals("declared content-length must equal the DATA length", declared, body);
 			}
 			assertEquals("handler wrote \"ok\" (2 bytes)", 2, body);
+		}
+	}
+
+	/** A response larger than SETTINGS_MAX_FRAME_SIZE and the initial flow-control window must transmit
+	 *  in full across many DATA frames, resuming after WINDOW_UPDATEs. Regression for the bug where
+	 *  flushPendingData emitted only one frame per stream per call, stalling any response > 16 KiB. */
+	@Test public void largeResponseTransmitsFullyWithFlowControl() throws Exception {
+		try (Socket s = connect()) {
+			OutputStream out = s.getOutputStream();
+			List<Hpack.HeaderField> req = new ArrayList<>();
+			req.add(new Hpack.HeaderField(":method", "GET"));
+			req.add(new Hpack.HeaderField(":path", "/big"));
+			req.add(new Hpack.HeaderField(":scheme", "http"));
+			req.add(new Hpack.HeaderField(":authority", "localhost"));
+			writeFrame(out, Http2Frame.TYPE_HEADERS,
+				Http2Frame.FLAG_END_HEADERS | Http2Frame.FLAG_END_STREAM, 1, encodeHeaders(req));
+			InputStream in = s.getInputStream();
+			readUntil(in, Http2Frame.TYPE_HEADERS);
+			long body = 0;
+			boolean ended = false;
+			while (!ended) {
+				Http2Frame f = readFrame(in);
+				if (f.type == Http2Frame.TYPE_DATA) {
+					body += f.payload.length;
+					if ((f.flags & Http2Frame.FLAG_END_STREAM) != 0) {
+						ended = true;
+					} else if (f.payload.length > 0) {
+						// Extend the connection + stream window so the server can keep sending.
+						byte[] inc = {0, 0, (byte) ((f.payload.length >> 8) & 0xFF), (byte) (f.payload.length & 0xFF)};
+						writeFrame(out, Http2Frame.TYPE_WINDOW_UPDATE, 0, 0, inc);
+						writeFrame(out, Http2Frame.TYPE_WINDOW_UPDATE, 0, 1, inc);
+					}
+				}
+			}
+			assertEquals("entire large body must be received", BIG_SIZE, body);
 		}
 	}
 

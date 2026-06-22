@@ -747,28 +747,37 @@ public class Http2Connection {
 				iterator.remove();
 				continue;
 			}
-			int availableStream = stream.outboundWindowSize;
-			int availableConn = connectionOutboundWindowSize;
-			int limit = Math.min(availableStream, availableConn);
-			limit = Math.min(limit, maxFrameSize);
-			if (limit <= 0 && pending.data.length > 0) {
-				continue;
-			}
-			int toSend = Math.min(pending.data.length - pending.offset, limit);
-			int chunkStart = pending.offset;
-			pending.offset += toSend;
-			boolean last = pending.endStream && (pending.offset == pending.data.length);
-			int flags = last ? Http2Frame.FLAG_END_STREAM : 0;
+			// Drain this stream as far as the flow-control windows allow, emitting as many
+			// max-frame-size DATA frames as fit. Sending only a single frame per call (the old bug)
+			// stalled any response larger than SETTINGS_MAX_FRAME_SIZE: the rest sat in the queue with
+			// nothing to re-trigger a flush, since the client's window was not yet full.
+			boolean done = false;
+			while (true) {
+				int remaining = pending.data.length - pending.offset;
+				int limit = Math.min(Math.min(stream.outboundWindowSize, connectionOutboundWindowSize), maxFrameSize);
+				if (remaining > 0 && limit <= 0) {
+					break; // flow-controlled: wait for a WINDOW_UPDATE to resume
+				}
+				int toSend = remaining > 0 ? Math.min(remaining, limit) : 0;
+				int chunkStart = pending.offset;
+				pending.offset += toSend;
+				done = (pending.offset == pending.data.length);
+				boolean last = pending.endStream && done;
+				int flags = last ? Http2Frame.FLAG_END_STREAM : 0;
 
-			stream.outboundWindowSize -= toSend;
-			connectionOutboundWindowSize -= toSend;
+				stream.outboundWindowSize -= toSend;
+				connectionOutboundWindowSize -= toSend;
 
-			writeFrameDirect(Http2Frame.TYPE_DATA, flags, pending.streamId, pending.data, chunkStart, toSend);
-			if (last) {
-				stream.setState(Http2Stream.STATE_CLOSED);
-				streams.remove(pending.streamId);
+				writeFrameDirect(Http2Frame.TYPE_DATA, flags, pending.streamId, pending.data, chunkStart, toSend);
+				if (last) {
+					stream.setState(Http2Stream.STATE_CLOSED);
+					streams.remove(pending.streamId);
+				}
+				if (done) {
+					break; // whole body (incl. any END_STREAM) sent
+				}
 			}
-			if (pending.offset == pending.data.length) {
+			if (done) {
 				iterator.remove();
 			}
 		}
