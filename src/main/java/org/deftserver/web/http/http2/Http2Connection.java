@@ -53,6 +53,10 @@ public class Http2Connection {
 	private int initialStreamInboundWindowSize = 65535;
 
 	private int currentHeaderStreamId = -1;
+	// The END_STREAM flag carried by a HEADERS frame whose header block continues across CONTINUATION
+	// frames — remembered here so it is applied when the block completes (otherwise a split header
+	// block would silently lose END_STREAM and the request would never be dispatched).
+	private boolean pendingEndStream = false;
 	private final ByteArrayOutputStream headerBlockBuilder = new ByteArrayOutputStream();
 	private int maxClientStreamId = 0;
 	private int recentRstCount = 0;
@@ -103,8 +107,9 @@ public class Http2Connection {
 					inboundBuffer.getByteBuffer().get(check);
 					for (int i = 0; i < check.length; i++) {
 						if (check[i] != HTTP2_PREFACE[i]) {
-							logger.warn("Preface mismatch, closing channel");
-							protocol.closeChannel(channel);
+							// RFC 7540 §3.5: an invalid preface is a connection error — answer with GOAWAY
+							// (best-effort) rather than a bare close so the peer learns why.
+							connectionError(PROTOCOL_ERROR, "invalid connection preface");
 							return;
 						}
 					}
@@ -249,6 +254,10 @@ public class Http2Connection {
 				break;
 			case Http2Frame.TYPE_PRIORITY:
 				handlePriority(frame);
+				break;
+			case Http2Frame.TYPE_PUSH_PROMISE:
+				// Clients must not send PUSH_PROMISE (only servers push, and this server never does).
+				connectionError(PROTOCOL_ERROR, "PUSH_PROMISE not allowed from client");
 				break;
 		}
 	}
@@ -396,9 +405,11 @@ public class Http2Connection {
 		headerBlockBuilder.reset();
 		headerBlockBuilder.write(frame.payload, offset, headerBlockLength);
 		currentHeaderStreamId = frame.streamId;
+		// Remember END_STREAM so it survives a header block continued over CONTINUATION frames.
+		pendingEndStream = (frame.flags & Http2Frame.FLAG_END_STREAM) != 0;
 
 		if ((frame.flags & Http2Frame.FLAG_END_HEADERS) != 0) {
-			finishHeaders(frame.streamId, (frame.flags & Http2Frame.FLAG_END_STREAM) != 0);
+			finishHeaders(frame.streamId, pendingEndStream);
 		}
 	}
 
@@ -415,7 +426,8 @@ public class Http2Connection {
 		}
 		headerBlockBuilder.write(frame.payload);
 		if ((frame.flags & Http2Frame.FLAG_END_HEADERS) != 0) {
-			finishHeaders(frame.streamId, false);
+			// Apply the END_STREAM flag carried by the originating HEADERS frame.
+			finishHeaders(frame.streamId, pendingEndStream);
 		}
 	}
 

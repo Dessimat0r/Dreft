@@ -156,6 +156,9 @@ public final class Hpack {
 
 		public List<HeaderField> readHeaders(ByteBuffer buffer) throws IOException {
 			decodedHeaders.clear();
+			// RFC 7541 §4.2: a dynamic table size update may only appear at the very start of a header
+			// block (before any header field). Once a field is decoded, a size update is a decoding error.
+			boolean sawHeaderField = false;
 			while (buffer.hasRemaining()) {
 				if (decodedHeaders.size() >= 100) {
 					throw new IOException("Too many headers (max 100)");
@@ -167,19 +170,25 @@ public final class Hpack {
 					// Indexed Header Field
 					int index = readInt(buffer, b, 0x7F);
 					addIndexedHeader(index);
+					sawHeaderField = true;
 				} else if (b == 0x40) {
 					// Literal Header Field with Incremental Indexing - New Name
 					String name = readString(buffer);
 					String value = readString(buffer);
 					insertDynamic(new HeaderField(name, value));
+					sawHeaderField = true;
 				} else if ((b & 0x40) == 0x40) {
 					// Literal Header Field with Incremental Indexing - Indexed Name
 					int index = readInt(buffer, b, 0x3F);
 					String name = getField(index).name;
 					String value = readString(buffer);
 					insertDynamic(new HeaderField(name, value));
+					sawHeaderField = true;
 				} else if ((b & 0x20) == 0x20) {
 					// Dynamic Table Size Update
+					if (sawHeaderField) {
+						throw new IOException("dynamic table size update must precede header fields");
+					}
 					dynamicTableLimit = readInt(buffer, b, 0x1F);
 					if (dynamicTableLimit < 0 || dynamicTableLimit > settingsMaxTableSize) {
 						throw new IOException("Invalid dynamic table size update: " + dynamicTableLimit);
@@ -190,12 +199,14 @@ public final class Hpack {
 					String name = readString(buffer);
 					String value = readString(buffer);
 					decodedHeaders.add(new HeaderField(name, value));
+					sawHeaderField = true;
 				} else {
 					// Literal Header Field without Indexing - Indexed Name
 					int index = readInt(buffer, b, 0x0F);
 					String name = getField(index).name;
 					String value = readString(buffer);
 					decodedHeaders.add(new HeaderField(name, value));
+					sawHeaderField = true;
 				}
 			}
 			return new ArrayList<>(decodedHeaders);

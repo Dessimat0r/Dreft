@@ -29,7 +29,7 @@ import org.junit.Test;
 public class Http2ComplianceTest {
 
 	private static final int NO_ERROR = 0x0, PROTOCOL_ERROR = 0x1, FLOW_CONTROL_ERROR = 0x3,
-		STREAM_CLOSED = 0x5, FRAME_SIZE_ERROR = 0x6;
+		STREAM_CLOSED = 0x5, FRAME_SIZE_ERROR = 0x6, COMPRESSION_ERROR = 0x9;
 
 	private static int PORT;
 	private static HttpServer server;
@@ -313,6 +313,45 @@ public class Http2ComplianceTest {
 		ByteArrayOutputStream baos = new ByteArrayOutputStream();
 		writer.writeHeaders(baos, fields);
 		return baos.toByteArray();
+	}
+
+	// ---- CONTINUATION / PUSH_PROMISE / HPACK (regressions found by h2spec) ----
+
+	/** A header block split across HEADERS + CONTINUATION must preserve the HEADERS frame's END_STREAM
+	 *  flag (a split block previously lost it and the request was never dispatched → timeout). */
+	@Test public void continuationPreservesEndStream() throws Exception {
+		try (Socket s = connect()) {
+			OutputStream out = s.getOutputStream();
+			byte[] block = encodeHeaders(validRequestHeaders());
+			int mid = block.length / 2;
+			byte[] part1 = java.util.Arrays.copyOfRange(block, 0, mid);
+			byte[] part2 = java.util.Arrays.copyOfRange(block, mid, block.length);
+			// HEADERS with END_STREAM but NOT END_HEADERS, then the rest in a CONTINUATION (END_HEADERS).
+			writeFrame(out, Http2Frame.TYPE_HEADERS, Http2Frame.FLAG_END_STREAM, 1, part1);
+			writeFrame(out, Http2Frame.TYPE_CONTINUATION, Http2Frame.FLAG_END_HEADERS, 1, part2);
+			Http2Frame resp = readUntil(s.getInputStream(), Http2Frame.TYPE_HEADERS);
+			assertEquals(1, resp.streamId);
+		}
+	}
+
+	@Test public void clientPushPromise_protocolError() throws Exception {
+		try (Socket s = connect()) {
+			// PUSH_PROMISE (type 0x5) from a client is illegal.
+			writeFrame(s.getOutputStream(), Http2Frame.TYPE_PUSH_PROMISE,
+				Http2Frame.FLAG_END_HEADERS, 1, new byte[] {0, 0, 0, 2});
+			expectGoAway(s, PROTOCOL_ERROR);
+		}
+	}
+
+	@Test public void hpackTableSizeUpdateAfterField_compressionError() throws Exception {
+		try (Socket s = connect()) {
+			ByteArrayOutputStream block = new ByteArrayOutputStream();
+			block.write(encodeHeaders(validRequestHeaders()));
+			block.write(0x20); // dynamic table size update — illegal AFTER header fields (RFC 7541 §4.2)
+			writeFrame(s.getOutputStream(), Http2Frame.TYPE_HEADERS,
+				Http2Frame.FLAG_END_HEADERS | Http2Frame.FLAG_END_STREAM, 1, block.toByteArray());
+			expectGoAway(s, COMPRESSION_ERROR);
+		}
 	}
 
 	/** A valid request must still get a normal response (sanity: the validations don't reject good traffic). */

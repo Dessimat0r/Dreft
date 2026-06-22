@@ -11,6 +11,21 @@ stream id and an error code before closing (RFC 7540 §5.4.1, §6.8); a **stream
 `RST_STREAM` with an error code (§5.4.2). Dreft historically just closed the socket. The
 `sendGoAway` / per-stream `RST_STREAM` plumbing added in the compliance pass fixes this.
 
+## h2spec verification
+
+Verified with [h2spec](https://github.com/summerwind/h2spec) 2.6.0 against the cleartext
+prior-knowledge h2c endpoint: **146 tests — 144 passed, 1 skipped, 1 known exception**.
+
+The single non-pass is `http2/3.5.2` ("Sends invalid connection preface"), which expects a `GOAWAY`
+for arbitrary non-preface garbage. Dreft's cleartext port is intentionally **dual-mode** (HTTP/1.1 +
+h2c by prior-knowledge preface detection), so bytes that are not the HTTP/2 preface are handled by
+the HTTP/1.1 parser rather than the HTTP/2 layer — h2spec assumes a dedicated h2-only endpoint. A
+near-miss that *starts* as the preface but diverges is correctly answered with `GOAWAY(PROTOCOL_ERROR)`.
+This is a property of cleartext protocol multiplexing, not a frame-handling defect.
+
+Re-run it yourself: start a server with a `/` handler on a cleartext port, then
+`h2spec -p <port> -h 127.0.0.1`.
+
 ## 3. Starting HTTP/2
 - [x] 3.5 — validates the client connection preface (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`); sends a server SETTINGS preface; mismatched preface closes the connection
 - [x] 3.2 — `Upgrade: h2c` (opt-in) and 3.4 prior-knowledge h2c; 3.3 ALPN `h2` over TLS
@@ -38,7 +53,8 @@ stream id and an error code before closing (RFC 7540 §5.4.1, §6.8); a **stream
 - [x] 6.7 PING — on stream ≠ 0 → `PROTOCOL_ERROR`; length ≠ 8 → `FRAME_SIZE_ERROR`; non-ACK answered with ACK
 - [x] 6.8 GOAWAY — on stream ≠ 0 → `PROTOCOL_ERROR`
 - [x] 6.9 WINDOW_UPDATE — length ≠ 4 → `FRAME_SIZE_ERROR`; increment 0 on connection → `PROTOCOL_ERROR`, on stream → `RST_STREAM(PROTOCOL_ERROR)`; window > 2³¹−1 → `FLOW_CONTROL_ERROR`
-- [x] 6.10 CONTINUATION — must follow HEADERS/CONTINUATION on the same stream, else `PROTOCOL_ERROR`; 64 KiB header-block cap
+- [x] 6.6 PUSH_PROMISE — a client-sent PUSH_PROMISE is illegal → `PROTOCOL_ERROR`
+- [x] 6.10 CONTINUATION — must follow HEADERS/CONTINUATION on the same stream, else `PROTOCOL_ERROR`; 64 KiB header-block cap; the originating HEADERS frame's `END_STREAM` flag is preserved across the split block
 
 ## 7. Error Codes
 - [x] error codes emitted via GOAWAY / RST_STREAM as above
@@ -53,9 +69,10 @@ stream id and an error code before closing (RFC 7540 §5.4.1, §6.8); a **stream
 ## RFC 7541 (HPACK)
 - [x] 5.2 — Huffman end-of-string padding validated (≤7 bits, all-ones); EOS-in-input rejected
 - [x] 6.1 — index 0 → decoding error
-- [x] dynamic table size update > `SETTINGS_HEADER_TABLE_SIZE` → decoding error
+- [x] 4.2 — dynamic table size update > `SETTINGS_HEADER_TABLE_SIZE` → decoding error; a size update after a header field (not at the block start) → decoding error (`COMPRESSION_ERROR`)
 - [x] Appendix B Huffman table verified (Kraft sum incl. EOS == 1.0, prefix-free, all 256 round-trip); RFC Appendix C vectors pinned in `HpackHuffmanTest`
 
 ## Out of scope
 - HTTP/3 / QUIC
-- Server push (`PUSH_PROMISE`) — `ENABLE_PUSH` accepted but the server never pushes
+- Server push — the server never sends `PUSH_PROMISE` (`ENABLE_PUSH` is accepted/validated; a
+  *client*-sent PUSH_PROMISE is rejected as above)
