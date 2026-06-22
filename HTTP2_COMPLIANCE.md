@@ -23,8 +23,15 @@ the HTTP/1.1 parser rather than the HTTP/2 layer — h2spec assumes a dedicated 
 near-miss that *starts* as the preface but diverges is correctly answered with `GOAWAY(PROTOCOL_ERROR)`.
 This is a property of cleartext protocol multiplexing, not a frame-handling defect.
 
-Re-run it yourself: start a server with a `/` handler on a cleartext port, then
-`h2spec -p <port> -h 127.0.0.1`.
+Re-run it yourself with the committed harness (builds, launches
+`org.deftserver.web.H2SpecHarness`, runs h2spec, tears down):
+
+```sh
+./run-h2spec.sh                 # default port 18080
+./run-h2spec.sh 9000 --strict   # custom port + extra h2spec flags
+```
+
+Requires `h2spec` on `PATH` (`brew install h2spec`).
 
 ## 3. Starting HTTP/2
 - [x] 3.5 — validates the client connection preface (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`); sends a server SETTINGS preface; mismatched preface closes the connection
