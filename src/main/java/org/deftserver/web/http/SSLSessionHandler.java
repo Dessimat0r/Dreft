@@ -8,6 +8,7 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSession;
 import org.deftserver.io.IOLoop;
 import org.slf4j.Logger;
@@ -46,6 +47,15 @@ public class SSLSessionHandler {
 		this.engine = sslContext.createSSLEngine();
 		this.engine.setUseClientMode(false);
 
+		// ALPN (RFC 7301): advertise HTTP/2 over TLS ("h2") with HTTP/1.1 fallback. A client that
+		// offers "h2" gets it negotiated here; per RFC 7540 §3.3 it then opens with the HTTP/2
+		// connection preface, which the existing preface-detection path (over the decrypted stream)
+		// routes to Http2Connection. A client that doesn't offer "h2" negotiates "http/1.1" (or no
+		// protocol) and is handled by the HTTP/1.1 path unchanged. Set before beginHandshake().
+		SSLParameters sslParams = engine.getSSLParameters();
+		sslParams.setApplicationProtocols(new String[] { "h2", "http/1.1" });
+		engine.setSSLParameters(sslParams);
+
 		SSLSession session = engine.getSession();
 		int packetBufferSize = session.getPacketBufferSize();
 		int appBufferSize = session.getApplicationBufferSize();
@@ -67,6 +77,12 @@ public class SSLSessionHandler {
 	/** True once the TLS handshake has finished and application data can flow. */
 	public boolean isHandshakeComplete() {
 		return handshakeComplete;
+	}
+
+	/** The ALPN-negotiated application protocol (e.g. {@code "h2"} or {@code "http/1.1"}), or an
+	 *  empty string if the peer offered no ALPN, or {@code null} before the handshake finishes. */
+	public String getApplicationProtocol() {
+		return engine.getApplicationProtocol();
 	}
 
 	/** Maximum TLS record size on the wire (used to size read buffers correctly). */
