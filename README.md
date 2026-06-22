@@ -54,15 +54,21 @@
 - Secure (WSS) over TLS
 - Separate idle timeout from HTTP keep-alive
 
-### HTTP/2 (cleartext h2c)
-Functional cleartext HTTP/2, negotiated by the connection **preface** — *prior knowledge* (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`):
-- **HPACK** header compression (`Hpack`)
-- Multiplexed **streams** over `HEADERS` / `DATA` / `WINDOW_UPDATE` / `RST_STREAM` / `SETTINGS` / `PING` / `GOAWAY` frames
-- `SETTINGS` negotiation + validation (`ENABLE_PUSH`, `INITIAL_WINDOW_SIZE`, `MAX_FRAME_SIZE`)
-- **DoS hardening** — frame-size cap, max concurrent streams, `RST_STREAM`-flood limit, idle timeout
-- End-to-end tested (GET / POST / static-file over h2c) in `Http2SystemTest`, plus `Http2DosHardeningTest`
+### HTTP/2
+Functional HTTP/2 with all three standard negotiation paths:
+- **ALPN** (`h2` over TLS, RFC 7301) — the TLS server advertises `{h2, http/1.1}`, so browsers and the JDK `HttpClient` negotiate HTTP/2 over HTTPS and fall back to HTTP/1.1 cleanly. Always on when TLS is enabled.
+- **Prior-knowledge cleartext h2c** — the connection **preface** (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`). Always on.
+- **HTTP/1.1 `Upgrade: h2c`** (RFC 7540 §3.2) — a cleartext upgrade request is answered with `101 Switching Protocols` and the original request is served as stream 1. **Opt-in** via `HttpServer.setHttp2CleartextUpgradeEnabled(true)` (off by default, since honouring it silently switches every HTTP/2-defaulting cleartext client over to HTTP/2); when off, the upgrade is ignored and the client falls back to HTTP/1.1.
 
-> **Scope:** negotiation is *prior-knowledge h2c only* — there is no ALPN (`h2` over TLS) and no HTTP/1.1 `Upgrade: h2c`, so browsers (which require ALPN) won't select HTTP/2; it serves clients that speak h2c with prior knowledge. The project's active compliance focus remains HTTP/1.1; HTTP/3 is not implemented.
+Core:
+- **HPACK** header compression (`Hpack`) — RFC 7541 Huffman coding (decoder validated against the RFC Appendix C vectors, with §5.2 padding checks)
+- Multiplexed **streams** over `HEADERS` / `CONTINUATION` / `DATA` / `WINDOW_UPDATE` / `RST_STREAM` / `SETTINGS` / `PING` / `GOAWAY` / `PRIORITY` frames, with connection + per-stream flow control
+- `SETTINGS` negotiation + validation (`ENABLE_PUSH`, `INITIAL_WINDOW_SIZE`, `MAX_FRAME_SIZE`)
+- **DoS hardening** — frame-size cap, max concurrent streams, control-frame + `RST_STREAM`-flood limits, idle timeout
+- **Allocation-lean write path** — frame headers emitted from a reused scratch buffer; DATA/HEADERS payloads sliced straight into the connection write buffer (no per-frame copies); per-frame trace logging guarded so it allocates nothing when disabled
+- End-to-end tested in `Http2SystemTest` (GET / POST / static-file over h2c), `Http2AlpnTest` (real JDK `HttpClient` over ALPN h2 + http/1.1 fallback), `Http2H2cUpgradeTest` (the `Upgrade: h2c` handshake), `HpackHuffmanTest` (RFC 7541 conformance), and `Http2DosHardeningTest`
+
+> **Scope:** the project's active compliance focus remains HTTP/1.1; HTTP/3 is not implemented.
 
 ### Static File Serving
 - Extension-based MIME mapping with `Files.probeContentType` fallback

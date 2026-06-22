@@ -4,6 +4,21 @@ Dreft is a hardened, HTTP/1.1-compliance-focused fork of Deft. The entries below
 this section are the upstream Deft changelog (ending at 0.4.0); the fork's full
 history is in git and the feature set is documented in README.md. Recent highlights:
 
+0.8.2
+ * HTTP/2 negotiation completed: ALPN ("h2" over TLS, RFC 7301) — the TLS server now advertises
+   {h2, http/1.1}, so browsers and the JDK HttpClient negotiate HTTP/2 over HTTPS with clean
+   HTTP/1.1 fallback; and the HTTP/1.1 "Upgrade: h2c" cleartext upgrade (RFC 7540 §3.2), opt-in via
+   HttpServer.setHttp2CleartextUpgradeEnabled (off by default). Prior-knowledge cleartext h2c
+   remains available. New tests: Http2AlpnTest, Http2H2cUpgradeTest, HpackHuffmanTest.
+ * HPACK correctness fix: the RFC 7541 Appendix B Huffman code-length table had dropped one entry,
+   shifting every length from index 66 onward and silently mis-decoding every Huffman-coded header
+   from a real HTTP/2 client (the prior test clients sent raw literals, so it was invisible). Table
+   restored (verified Kraft sum incl. EOS == 1.0, prefix-free, all 256 symbols round-trip) and the
+   decoder now validates RFC 7541 §5.2 end-of-string padding (rejecting an HPACK smuggling vector).
+ * HTTP/2 performance: per-frame trace logging no longer allocates when disabled; the write path
+   emits frame headers from a reused scratch buffer and slices DATA/HEADERS payloads straight into
+   the connection write buffer (one copy instead of three per frame).
+
 0.8.1
  * Crash-proof I/O loop: no per-request blocking I/O or heavy CPU runs on the reactor
    thread. Static-file disk reads, inbound body decompression + form/multipart parsing,
