@@ -34,6 +34,7 @@ public class Http2Connection {
 	private final DynamicByteBuffer writeBuffer = DynamicByteBuffer.allocate(65536);
 
 	private boolean prefaceReceived = false;
+	private boolean initialSettingsSent = false;
 	private int maxFrameSize = 16384;
 	private int connectionOutboundWindowSize = 65535;
 	private int initialStreamOutboundWindowSize = 65535;
@@ -98,7 +99,11 @@ public class Http2Connection {
 					}
 					prefaceReceived = true;
 					logger.debug("Preface matched, sending initial settings");
-					sendInitialSettings();
+					// In the h2c-upgrade path the server preface (SETTINGS) was already sent right after
+					// the 101, so don't send it twice — only send it here for the prior-knowledge path.
+					if (!initialSettingsSent) {
+						sendInitialSettings();
+					}
 				} else {
 					logger.debug("Preface incomplete, waiting");
 					inboundBuffer.compact();
@@ -130,6 +135,43 @@ public class Http2Connection {
 			0, 3, 0, 0, 0, 100
 		};
 		writeFrame(Http2Frame.TYPE_SETTINGS, 0, 0, payload);
+		initialSettingsSent = true;
+	}
+
+	/**
+	 * Bootstraps this connection from an HTTP/1.1 {@code Upgrade: h2c} request (RFC 7540 §3.2). The
+	 * caller has already written the {@code 101 Switching Protocols} response on the HTTP/1.1 wire.
+	 * Here we: (1) apply the client's decoded {@code HTTP2-Settings}; (2) send the server connection
+	 * preface (SETTINGS) — the first HTTP/2 frame the server sends; (3) materialise the upgraded
+	 * request as stream 1, which is implicitly half-closed on the remote side (the client cannot send
+	 * further data on it), and dispatch it. The client then sends its own connection preface
+	 * (PRI/SETTINGS), which {@link #onReadable()} validates as usual (without re-sending settings).
+	 *
+	 * @param http1ResponsePrefix the raw {@code 101 Switching Protocols} bytes to emit ahead of any
+	 *                            HTTP/2 frame, queued through this connection's ordered write buffer so
+	 *                            a partial socket write can't interleave it with the SETTINGS frame
+	 * @param clientSettings the decoded (raw, 6-bytes-per-setting) HTTP2-Settings payload, or empty
+	 * @param stream1Headers the upgraded request's pseudo + regular headers, as HPACK header fields
+	 * @param stream1Body    the upgraded request's body (may be empty)
+	 */
+	public void startH2cUpgrade(byte[] http1ResponsePrefix, byte[] clientSettings,
+			List<Hpack.HeaderField> stream1Headers, byte[] stream1Body) {
+		if (http1ResponsePrefix != null && http1ResponsePrefix.length > 0) {
+			writeBuffer.put(http1ResponsePrefix); // ordered ahead of the server preface + stream-1 frames
+		}
+		if (clientSettings != null && clientSettings.length % 6 == 0 && !applySettingsPayload(clientSettings)) {
+			return; // invalid settings — channel already closed
+		}
+		sendInitialSettings();
+		// Stream 1 is reserved by the upgrade; subsequent client streams must use higher odd IDs.
+		maxClientStreamId = 1;
+		Http2Stream stream = streams.computeIfAbsent(1, id -> new Http2Stream(id, initialStreamOutboundWindowSize));
+		stream.requestHeaders.addAll(stream1Headers);
+		if (stream1Body != null && stream1Body.length > 0) {
+			stream.requestBody.write(stream1Body, 0, stream1Body.length);
+		}
+		stream.setState(Http2Stream.STATE_HALF_CLOSED_REMOTE);
+		dispatchRequest(stream);
 	}
 
 	private void processFrame(Http2Frame frame) throws IOException {
@@ -216,7 +258,21 @@ public class Http2Connection {
 			protocol.closeChannel(channel);
 			return;
 		}
-		ByteBuffer buf = ByteBuffer.wrap(frame.payload);
+		if (!applySettingsPayload(frame.payload)) {
+			return; // applySettingsPayload already closed the channel on an invalid value
+		}
+		writeFrame(Http2Frame.TYPE_SETTINGS, Http2Frame.FLAG_ACK, 0, null);
+	}
+
+	/**
+	 * Applies a SETTINGS payload (6 bytes per setting) to this connection. Shared by the on-wire
+	 * SETTINGS frame handler and the h2c-upgrade path (RFC 7540 §3.2.1), where the client's settings
+	 * arrive base64url-encoded in the HTTP/1.1 {@code HTTP2-Settings} header rather than as a frame —
+	 * in that case no SETTINGS ACK is owed (there was no frame to acknowledge). Returns {@code false}
+	 * (after closing the channel) if a value is out of range; {@code true} on success.
+	 */
+	private boolean applySettingsPayload(byte[] payload) {
+		ByteBuffer buf = ByteBuffer.wrap(payload);
 		while (buf.remaining() >= 6) {
 			int id = buf.getShort() & 0xFFFF;
 			int value = buf.getInt();
@@ -224,13 +280,13 @@ public class Http2Connection {
 				if (value != 0 && value != 1) {
 					logger.warn("Invalid SETTINGS_ENABLE_PUSH: {}", value);
 					protocol.closeChannel(channel);
-					return;
+					return false;
 				}
 			} else if (id == 4) {
 				if (value < 0) {
 					logger.warn("Invalid SETTINGS_INITIAL_WINDOW_SIZE: {}", value);
 					protocol.closeChannel(channel);
-					return;
+					return false;
 				}
 				int diff = value - initialStreamOutboundWindowSize;
 				for (Http2Stream stream : streams.values()) {
@@ -241,12 +297,12 @@ public class Http2Connection {
 				if (value < 16384 || value > 16777215) {
 					logger.warn("Invalid SETTINGS_MAX_FRAME_SIZE: {}", value);
 					protocol.closeChannel(channel);
-					return;
+					return false;
 				}
 				maxFrameSize = value;
 			}
 		}
-		writeFrame(Http2Frame.TYPE_SETTINGS, Http2Frame.FLAG_ACK, 0, null);
+		return true;
 	}
 
 	private void handleHeaders(Http2Frame frame) throws IOException {

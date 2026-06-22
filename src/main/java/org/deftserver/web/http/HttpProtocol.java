@@ -883,6 +883,14 @@ public class HttpProtocol implements IOHandler {
 			logger.debug("handle read 3..., req class: {}, req: {}", request.getClass(), request);
 		}
 
+		// HTTP/2 cleartext upgrade (RFC 7540 §3.2): a well-formed `Upgrade: h2c` request switches this
+		// connection to HTTP/2, with the original request served as stream 1. Detected here so it sees a
+		// fully-parsed request but pre-empts normal routing. A malformed/partial upgrade falls through to
+		// be served as ordinary HTTP/1.1.
+		if (!(request instanceof MalFormedHttpRequest) && tryH2cUpgrade(key, clientChannel, request)) {
+			return;
+		}
+
 		final boolean keepAlive;
 
 		if (!(request instanceof MalFormedHttpRequest) && request.isKeepAlive()) {
@@ -951,6 +959,107 @@ public class HttpProtocol implements IOHandler {
 				closeChannel(clientChannel);
 			}
 		}
+	}
+
+	/** Header names that are connection-specific (hop-by-hop) or part of the upgrade mechanism itself
+	 *  and so MUST NOT be forwarded onto the HTTP/2 stream-1 request (RFC 7540 §8.1.2.2 forbids
+	 *  connection-specific header fields in HTTP/2; Host is conveyed via :authority). */
+	private static boolean isHopByHopOrUpgradeHeader(String lowerName) {
+		switch (lowerName) {
+			case "connection": case "upgrade": case "http2-settings": case "host":
+			case "keep-alive": case "proxy-connection": case "transfer-encoding":
+			case "te": case "trailer":
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	/** True if {@code token} appears (case-insensitively, trimmed) as one of the comma-separated
+	 *  elements of a list-valued header such as {@code Connection} or {@code Upgrade}. */
+	private static boolean headerListContainsToken(String headerValue, String token) {
+		if (headerValue == null) return false;
+		for (String part : headerValue.split(",")) {
+			if (part.trim().equalsIgnoreCase(token)) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Attempts the HTTP/1.1→HTTP/2 cleartext upgrade (RFC 7540 §3.2) for a fully-parsed request. Returns
+	 * {@code true} (and takes over the connection) only when this is a valid {@code h2c} upgrade over
+	 * cleartext; otherwise {@code false} so the request is served as ordinary HTTP/1.1. Over TLS, HTTP/2
+	 * is negotiated by ALPN instead, so the h2c upgrade is ignored there.
+	 */
+	private boolean tryH2cUpgrade(SelectionKey key, SocketChannel clientChannel, HttpRequest request) {
+		if (getSslSessionHandler(clientChannel) != null) return false;     // TLS ⇒ use ALPN, not h2c
+		if (!"HTTP/1.1".equals(request.getVersion())) return false;
+		if (!headerListContainsToken(request.getHeader("Upgrade"), "h2c")) return false;
+		String connection = request.getHeader("Connection");
+		if (!headerListContainsToken(connection, "Upgrade")
+				|| !headerListContainsToken(connection, "HTTP2-Settings")) return false;
+		String settingsB64 = request.getHeader("HTTP2-Settings");
+		if (settingsB64 == null) return false;
+		byte[] settings;
+		try {
+			// HTTP2-Settings is base64url (RFC 7540 §3.2.1), and may or may not carry '=' padding.
+			settings = java.util.Base64.getUrlDecoder().decode(settingsB64.trim());
+		} catch (IllegalArgumentException badBase64) {
+			return false; // malformed ⇒ ignore the upgrade, serve as HTTP/1.1
+		}
+		if (settings.length % 6 != 0) return false;
+
+		// Build the stream-1 request as HPACK header fields: pseudo-headers first, then the forwardable
+		// request headers (connection-specific ones stripped).
+		java.util.List<org.deftserver.web.http.http2.Hpack.HeaderField> fields = new java.util.ArrayList<>();
+		fields.add(new org.deftserver.web.http.http2.Hpack.HeaderField(":method", request.getMethod().toString()));
+		fields.add(new org.deftserver.web.http.http2.Hpack.HeaderField(":scheme", "http"));
+		fields.add(new org.deftserver.web.http.http2.Hpack.HeaderField(":path", request.getRequestedPath()));
+		String host = request.getHeader("host");
+		if (host != null) {
+			fields.add(new org.deftserver.web.http.http2.Hpack.HeaderField(":authority", host));
+		}
+		for (java.util.Map.Entry<String, String> e : request.getHeaders().entrySet()) {
+			if (isHopByHopOrUpgradeHeader(e.getKey())) continue;
+			fields.add(new org.deftserver.web.http.http2.Hpack.HeaderField(e.getKey(), e.getValue()));
+		}
+		String bodyStr = request.getBody();
+		byte[] body = (bodyStr == null) ? new byte[0]
+			: bodyStr.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+
+		byte[] resp101 = ("HTTP/1.1 101 Switching Protocols\r\n"
+			+ "Connection: Upgrade\r\n"
+			+ "Upgrade: h2c\r\n\r\n").getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+
+		// Any bytes already received past the request line/headers/body are an optimistic HTTP/2
+		// connection preface — hand them to the new connection so they aren't lost.
+		byte[] initialBytes = null;
+		ByteBuffer rb = getReadBuffer(clientChannel);
+		if (rb != null && rb.position() > 0) {
+			rb.flip();
+			initialBytes = new byte[rb.remaining()];
+			rb.get(initialBytes);
+		}
+
+		org.deftserver.web.http.http2.Http2Connection conn =
+			new org.deftserver.web.http.http2.Http2Connection(this, key, clientChannel, initialBytes);
+		putHttp2Connection(clientChannel, conn);
+		removeReadBuffer(clientChannel);
+		Timeout ht = removeHeaderReadTimeout(clientChannel);
+		if (ht != null) ht.cancel();
+		Timeout bt = removeBodyReadTimeout(clientChannel);
+		if (bt != null) bt.cancel();
+		prolongKeepAliveTimeout(clientChannel);
+		key.interestOps(SelectionKey.OP_READ);
+
+		conn.startH2cUpgrade(resp101, settings, fields, body);
+
+		// If the client already sent (part of) its connection preface alongside the request, process it
+		// now rather than waiting for the next readiness event.
+		if (initialBytes != null && initialBytes.length > 0) {
+			conn.onReadable();
+		}
+		return true;
 	}
 
 	/**
