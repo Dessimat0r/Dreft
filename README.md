@@ -68,7 +68,7 @@ Core:
 - **Allocation-lean write path** — frame headers emitted from a reused scratch buffer; DATA/HEADERS payloads sliced straight into the connection write buffer (no per-frame copies); per-frame trace logging guarded so it allocates nothing when disabled
 - End-to-end tested in `Http2SystemTest` (GET / POST / static-file over h2c), `Http2AlpnTest` (real JDK `HttpClient` over ALPN h2 + http/1.1 fallback), `Http2H2cUpgradeTest` (the `Upgrade: h2c` handshake), `HpackHuffmanTest` (RFC 7541 conformance), and `Http2DosHardeningTest`
 
-> **Scope:** HTTP/1.1 remains the most exhaustively hardened and compliance-tested surface (see `progress.md`), but HTTP/2 is now fully negotiable across all three standard paths and actively maintained. HTTP/3 / QUIC is not implemented.
+> **Scope:** full HTTP/1.1 **and** HTTP/2 compliance are both active goals. HTTP/1.1 is currently the most exhaustively hardened and compliance-tested surface (see `progress.md`); HTTP/2 is fully negotiable across all three standard paths and is being driven toward the same compliance bar. HTTP/3 / QUIC is not implemented.
 
 ### Static File Serving
 - Extension-based MIME mapping with `Files.probeContentType` fallback
