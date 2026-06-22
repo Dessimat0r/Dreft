@@ -827,7 +827,16 @@ public class Http2Connection {
 			try {
 				protocol.write(channel, writeBuffer.getByteBuffer());
 			} catch (IOException e) {
-				logger.error("IOException during write", e);
+				// A client closing its connection while we're mid-write (ClosedChannelException, broken
+				// pipe, connection reset) is a normal event, not a server error — log it at debug so it
+				// doesn't flood ERROR logs under load. The channel is torn down either way.
+				if (isExpectedDisconnect(e)) {
+					if (logger.isDebugEnabled()) {
+						logger.debug("Write failed (client disconnected): {}", e.toString());
+					}
+				} else {
+					logger.error("IOException during write", e);
+				}
 				protocol.closeChannel(channel);
 				return;
 			}
@@ -891,6 +900,23 @@ public class Http2Connection {
 		if (s != null) {
 			s.setState(Http2Stream.STATE_CLOSED);
 		}
+	}
+
+	/** True if an {@link IOException} from a socket write is a normal peer disconnect (the client closed
+	 *  or reset the connection) rather than an unexpected server-side failure — so it can be logged
+	 *  quietly. Covers {@link java.nio.channels.ClosedChannelException} and the usual
+	 *  "broken pipe" / "connection reset" messages. */
+	private static boolean isExpectedDisconnect(IOException e) {
+		if (e instanceof java.nio.channels.ClosedChannelException) {
+			return true;
+		}
+		String msg = e.getMessage();
+		if (msg == null) {
+			return false;
+		}
+		msg = msg.toLowerCase(java.util.Locale.ROOT);
+		return msg.contains("broken pipe") || msg.contains("connection reset")
+			|| msg.contains("connection closed") || msg.contains("forcibly closed");
 	}
 
 	/** A malformed request (RFC 7540 §8.1.2.6) → stream error of type PROTOCOL_ERROR. Returns void so
