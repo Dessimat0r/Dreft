@@ -17,20 +17,25 @@ public final class Hpack {
 		public final String name;
 		public final String value;
 		public final int size;
+		/** True if the supplied name contained an uppercase ASCII letter. HTTP/2 requires lowercase
+		 *  header field names (RFC 7540 §8.1.2), so this flags a malformed inbound request; the name
+		 *  itself is still stored lower-cased for routing. */
+		public final boolean nameHadUppercase;
 
-		private static String toLowerCaseIfNecessary(String s) {
+		private static boolean hasUppercase(String s) {
 			int len = s.length();
 			for (int i = 0; i < len; i++) {
 				char c = s.charAt(i);
 				if (c >= 'A' && c <= 'Z') {
-					return s.toLowerCase(Locale.ROOT);
+					return true;
 				}
 			}
-			return s;
+			return false;
 		}
 
 		public HeaderField(String name, String value) {
-			this.name = toLowerCaseIfNecessary(name);
+			this.nameHadUppercase = hasUppercase(name);
+			this.name = this.nameHadUppercase ? name.toLowerCase(Locale.ROOT) : name;
 			this.value = value;
 			this.size = name.length() + value.length() + 32;
 		}

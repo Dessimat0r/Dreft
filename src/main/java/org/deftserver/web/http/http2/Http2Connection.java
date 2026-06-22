@@ -23,6 +23,17 @@ public class Http2Connection {
 	private static final Logger logger = LoggerFactory.getLogger(Http2Connection.class);
 	private static final byte[] HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
 
+	// RFC 7540 §7 error codes.
+	private static final int NO_ERROR = 0x0;
+	private static final int PROTOCOL_ERROR = 0x1;
+	private static final int INTERNAL_ERROR = 0x2;
+	private static final int FLOW_CONTROL_ERROR = 0x3;
+	private static final int STREAM_CLOSED = 0x5;
+	private static final int FRAME_SIZE_ERROR = 0x6;
+	private static final int REFUSED_STREAM = 0x7;
+	private static final int COMPRESSION_ERROR = 0x9;
+	private static final int ENHANCE_YOUR_CALM = 0xb;
+
 	private final HttpProtocol protocol;
 	private final SelectionKey key;
 	private final SocketChannel channel;
@@ -175,9 +186,11 @@ public class Http2Connection {
 	}
 
 	private void processFrame(Http2Frame frame) throws IOException {
-		if (currentHeaderStreamId != -1 && frame.type != Http2Frame.TYPE_CONTINUATION) {
-			logger.warn("Expected CONTINUATION frame but got type={}", frame.type);
-			protocol.closeChannel(channel);
+		// RFC 7540 §6.10: once a HEADERS block is open, the next frame MUST be a CONTINUATION on the same
+		// stream — any other frame (type or stream) is a connection PROTOCOL_ERROR.
+		if (currentHeaderStreamId != -1
+				&& (frame.type != Http2Frame.TYPE_CONTINUATION || frame.streamId != currentHeaderStreamId)) {
+			connectionError(PROTOCOL_ERROR, "expected CONTINUATION on stream " + currentHeaderStreamId);
 			return;
 		}
 
@@ -190,8 +203,7 @@ public class Http2Connection {
 			}
 			controlFramesInWindow++;
 			if (controlFramesInWindow > 500) {
-				logger.warn("Control frame rate limit exceeded, closing channel");
-				protocol.closeChannel(channel);
+				connectionError(ENHANCE_YOUR_CALM, "control frame rate limit exceeded");
 				return;
 			}
 		}
@@ -218,48 +230,65 @@ public class Http2Connection {
 			case Http2Frame.TYPE_RST_STREAM:
 				recentRstCount++;
 				if (recentRstCount > 200) {
-					logger.warn("RST_STREAM limit exceeded, closing channel");
-					protocol.closeChannel(channel);
+					connectionError(ENHANCE_YOUR_CALM, "RST_STREAM flood");
 					return;
 				}
 				handleRstStream(frame);
 				break;
 			case Http2Frame.TYPE_GOAWAY:
+				if (frame.streamId != 0) {
+					connectionError(PROTOCOL_ERROR, "GOAWAY must be on stream 0");
+					return;
+				}
 				if (frame.payload.length < 8) {
-					logger.warn("GOAWAY frame length must be at least 8 bytes");
-					protocol.closeChannel(channel);
+					connectionError(FRAME_SIZE_ERROR, "GOAWAY length must be >= 8");
 					return;
 				}
 				logger.debug("Received GOAWAY, closing channel");
 				protocol.closeChannel(channel);
 				break;
 			case Http2Frame.TYPE_PRIORITY:
-				if (frame.payload.length != 5) {
-					logger.warn("PRIORITY frame length must be exactly 5 bytes");
-					protocol.closeChannel(channel);
-					return;
-				}
+				handlePriority(frame);
 				break;
 		}
 	}
 
+	private void handlePriority(Http2Frame frame) {
+		if (frame.streamId == 0) {
+			connectionError(PROTOCOL_ERROR, "PRIORITY must not be on stream 0");
+			return;
+		}
+		if (frame.payload.length != 5) {
+			// RFC 7540 §6.3: a PRIORITY of the wrong length is a stream error.
+			streamError(frame.streamId, FRAME_SIZE_ERROR);
+			return;
+		}
+		// §5.3.1: a stream cannot depend on itself.
+		int dependency = ByteBuffer.wrap(frame.payload).getInt() & 0x7FFFFFFF;
+		if (dependency == frame.streamId) {
+			streamError(frame.streamId, PROTOCOL_ERROR);
+		}
+	}
+
 	private void handleSettings(Http2Frame frame) throws IOException {
+		if (frame.streamId != 0) {
+			connectionError(PROTOCOL_ERROR, "SETTINGS must be on stream 0");
+			return;
+		}
 		if ((frame.flags & Http2Frame.FLAG_ACK) != 0) {
 			if (frame.payload.length != 0) {
-				logger.warn("SETTINGS ACK frame must have length 0");
-				protocol.closeChannel(channel);
+				connectionError(FRAME_SIZE_ERROR, "SETTINGS ACK must have length 0");
 				return;
 			}
 			logger.debug("Received SETTINGS ACK");
 			return;
 		}
 		if (frame.payload.length % 6 != 0) {
-			logger.warn("SETTINGS frame length must be a multiple of 6");
-			protocol.closeChannel(channel);
+			connectionError(FRAME_SIZE_ERROR, "SETTINGS length must be a multiple of 6");
 			return;
 		}
 		if (!applySettingsPayload(frame.payload)) {
-			return; // applySettingsPayload already closed the channel on an invalid value
+			return; // applySettingsPayload already raised the connection error
 		}
 		writeFrame(Http2Frame.TYPE_SETTINGS, Http2Frame.FLAG_ACK, 0, null);
 	}
@@ -278,15 +307,13 @@ public class Http2Connection {
 			int value = buf.getInt();
 			if (id == 2) {
 				if (value != 0 && value != 1) {
-					logger.warn("Invalid SETTINGS_ENABLE_PUSH: {}", value);
-					protocol.closeChannel(channel);
-					return false;
+					return connectionError(PROTOCOL_ERROR, "invalid SETTINGS_ENABLE_PUSH: " + value);
 				}
 			} else if (id == 4) {
+				// INITIAL_WINDOW_SIZE max is 2^31-1; a value above that (read as a negative int) is a
+				// flow-control error (RFC 7540 §6.5.2).
 				if (value < 0) {
-					logger.warn("Invalid SETTINGS_INITIAL_WINDOW_SIZE: {}", value);
-					protocol.closeChannel(channel);
-					return false;
+					return connectionError(FLOW_CONTROL_ERROR, "invalid SETTINGS_INITIAL_WINDOW_SIZE: " + value);
 				}
 				int diff = value - initialStreamOutboundWindowSize;
 				for (Http2Stream stream : streams.values()) {
@@ -295,9 +322,7 @@ public class Http2Connection {
 				initialStreamOutboundWindowSize = value;
 			} else if (id == 5) {
 				if (value < 16384 || value > 16777215) {
-					logger.warn("Invalid SETTINGS_MAX_FRAME_SIZE: {}", value);
-					protocol.closeChannel(channel);
-					return false;
+					return connectionError(PROTOCOL_ERROR, "invalid SETTINGS_MAX_FRAME_SIZE: " + value);
 				}
 				maxFrameSize = value;
 			}
@@ -306,30 +331,51 @@ public class Http2Connection {
 	}
 
 	private void handleHeaders(Http2Frame frame) throws IOException {
-		if (frame.streamId % 2 != 0 && frame.streamId <= maxClientStreamId) {
-			logger.warn("Stream ID {} is not greater than max seen {}", frame.streamId, maxClientStreamId);
-			protocol.closeChannel(channel);
+		// RFC 7540 §6.2 / §5.1.1: HEADERS must be on a client-initiated (odd, non-zero) stream whose id
+		// strictly exceeds every previous one (a lower/equal id is a reused or idle stream).
+		if (frame.streamId == 0) {
+			connectionError(PROTOCOL_ERROR, "HEADERS must not be on stream 0");
 			return;
 		}
-		if (frame.streamId % 2 != 0) {
-			maxClientStreamId = frame.streamId;
+		if (frame.streamId % 2 == 0) {
+			connectionError(PROTOCOL_ERROR, "client stream id must be odd: " + frame.streamId);
+			return;
 		}
+		if (frame.streamId <= maxClientStreamId) {
+			connectionError(PROTOCOL_ERROR, "stream id " + frame.streamId + " not greater than " + maxClientStreamId);
+			return;
+		}
+		maxClientStreamId = frame.streamId;
 		int offset = 0;
 		int padLength = 0;
 		if ((frame.flags & Http2Frame.FLAG_PADDED) != 0) {
+			if (frame.payload.length < 1) {
+				connectionError(PROTOCOL_ERROR, "PADDED HEADERS missing pad length");
+				return;
+			}
 			padLength = frame.payload[offset++] & 0xFF;
 		}
 		if ((frame.flags & Http2Frame.FLAG_PRIORITY) != 0) {
+			if (frame.payload.length < offset + 5) {
+				connectionError(PROTOCOL_ERROR, "PRIORITY-flagged HEADERS too short");
+				return;
+			}
+			// §5.3.1: a stream must not depend on itself.
+			int dependency = ((frame.payload[offset] & 0x7F) << 24) | ((frame.payload[offset + 1] & 0xFF) << 16)
+				| ((frame.payload[offset + 2] & 0xFF) << 8) | (frame.payload[offset + 3] & 0xFF);
+			if (dependency == frame.streamId) {
+				connectionError(PROTOCOL_ERROR, "HEADERS stream depends on itself");
+				return;
+			}
 			offset += 5;
 		}
 		int headerBlockLength = frame.payload.length - offset - padLength;
 		if (headerBlockLength < 0) {
-			protocol.closeChannel(channel);
+			connectionError(PROTOCOL_ERROR, "HEADERS pad length exceeds frame");
 			return;
 		}
 		if (headerBlockLength > 65536) {
-			logger.warn("Headers block too large: {} bytes", headerBlockLength);
-			protocol.closeChannel(channel);
+			connectionError(ENHANCE_YOUR_CALM, "header block too large: " + headerBlockLength);
 			return;
 		}
 		headerBlockBuilder.reset();
@@ -342,13 +388,14 @@ public class Http2Connection {
 	}
 
 	private void handleContinuation(Http2Frame frame) throws IOException {
-		if (frame.streamId != currentHeaderStreamId) {
-			protocol.closeChannel(channel);
+		// A CONTINUATION with no open header block, or on the wrong stream, is a connection PROTOCOL_ERROR
+		// (the wrong-stream case is also caught earlier in processFrame).
+		if (currentHeaderStreamId == -1 || frame.streamId != currentHeaderStreamId) {
+			connectionError(PROTOCOL_ERROR, "unexpected CONTINUATION on stream " + frame.streamId);
 			return;
 		}
 		if (headerBlockBuilder.size() + frame.payload.length > 65536) {
-			logger.warn("Headers block size exceeded 64 KiB cap during CONTINUATION");
-			protocol.closeChannel(channel);
+			connectionError(ENHANCE_YOUR_CALM, "header block exceeded 64 KiB during CONTINUATION");
 			return;
 		}
 		headerBlockBuilder.write(frame.payload);
@@ -362,11 +409,19 @@ public class Http2Connection {
 		byte[] block = headerBlockBuilder.toByteArray();
 		headerBlockBuilder.reset();
 
-		List<Hpack.HeaderField> fields = hpackReader.readHeaders(ByteBuffer.wrap(block));
-		if (!streams.containsKey(streamId) && streamId % 2 != 0) {
+		// HPACK applies to the whole connection (a shared dynamic table), so a decode failure is a
+		// connection COMPRESSION_ERROR, not a stream error (RFC 7540 §4.3).
+		List<Hpack.HeaderField> fields;
+		try {
+			fields = hpackReader.readHeaders(ByteBuffer.wrap(block));
+		} catch (IOException hpackFailure) {
+			connectionError(COMPRESSION_ERROR, "HPACK decode failed: " + hpackFailure.getMessage());
+			return;
+		}
+		if (!streams.containsKey(streamId)) {
 			if (streams.size() >= 100) {
 				logger.warn("Exceeded max concurrent streams limit (100), refusing stream={}", streamId);
-				writeFrame(Http2Frame.TYPE_RST_STREAM, 0, streamId, intToBytes(7));
+				streamError(streamId, REFUSED_STREAM);
 				return;
 			}
 		}
@@ -382,25 +437,33 @@ public class Http2Connection {
 	}
 
 	private void handleData(Http2Frame frame) throws IOException {
+		if (frame.streamId == 0) {
+			connectionError(PROTOCOL_ERROR, "DATA must not be on stream 0");
+			return;
+		}
 		Http2Stream stream = streams.get(frame.streamId);
 		if (stream == null) {
-			protocol.closeChannel(channel);
+			// DATA for an idle stream (never opened) or one already closed → no valid recipient.
+			connectionError(PROTOCOL_ERROR, "DATA on non-open stream " + frame.streamId);
 			return;
 		}
 		int offset = 0;
 		int padLength = 0;
 		if ((frame.flags & Http2Frame.FLAG_PADDED) != 0) {
+			if (frame.payload.length < 1) {
+				connectionError(PROTOCOL_ERROR, "PADDED DATA missing pad length");
+				return;
+			}
 			padLength = frame.payload[offset++] & 0xFF;
 		}
 		int dataLength = frame.payload.length - offset - padLength;
 		if (dataLength < 0) {
-			protocol.closeChannel(channel);
+			connectionError(PROTOCOL_ERROR, "DATA pad length exceeds frame");
 			return;
 		}
 		if (stream.requestBody.size() + dataLength > 16777216) {
 			logger.warn("Payload size exceeds maximum allowed limit (16 MiB) on stream {}", frame.streamId);
-			writeFrame(Http2Frame.TYPE_RST_STREAM, 0, frame.streamId, intToBytes(11));
-			protocol.closeChannel(channel);
+			streamError(frame.streamId, ENHANCE_YOUR_CALM);
 			return;
 		}
 		stream.requestBody.write(frame.payload, offset, dataLength);
@@ -425,21 +488,23 @@ public class Http2Connection {
 
 	private void handleWindowUpdate(Http2Frame frame) throws IOException {
 		if (frame.payload.length != 4) {
-			logger.warn("WINDOW_UPDATE frame length must be exactly 4 bytes");
-			protocol.closeChannel(channel);
+			connectionError(FRAME_SIZE_ERROR, "WINDOW_UPDATE length must be 4");
 			return;
 		}
 		int increment = ByteBuffer.wrap(frame.payload).getInt() & 0x7FFFFFFF;
 		if (increment == 0) {
-			logger.warn("WINDOW_UPDATE increment must be non-zero");
-			protocol.closeChannel(channel);
+			// §6.9: a zero increment is a stream error on a stream, a connection error on stream 0.
+			if (frame.streamId == 0) {
+				connectionError(PROTOCOL_ERROR, "WINDOW_UPDATE increment must be non-zero");
+			} else {
+				streamError(frame.streamId, PROTOCOL_ERROR);
+			}
 			return;
 		}
 		if (frame.streamId == 0) {
 			long newSize = (long) connectionOutboundWindowSize + increment;
 			if (newSize > Integer.MAX_VALUE) {
-				logger.warn("Connection window overflow, closing channel");
-				protocol.closeChannel(channel);
+				connectionError(FLOW_CONTROL_ERROR, "connection flow-control window overflow");
 				return;
 			}
 			connectionOutboundWindowSize = (int) newSize;
@@ -448,10 +513,7 @@ public class Http2Connection {
 			if (stream != null) {
 				long newSize = (long) stream.outboundWindowSize + increment;
 				if (newSize > Integer.MAX_VALUE) {
-					logger.warn("Stream window overflow, closing stream={}", frame.streamId);
-					writeFrame(Http2Frame.TYPE_RST_STREAM, 0, frame.streamId, intToBytes(3));
-					stream.setState(Http2Stream.STATE_CLOSED);
-					streams.remove(frame.streamId);
+					streamError(frame.streamId, FLOW_CONTROL_ERROR);
 					return;
 				}
 				stream.outboundWindowSize = (int) newSize;
@@ -461,9 +523,12 @@ public class Http2Connection {
 	}
 
 	private void handlePing(Http2Frame frame) throws IOException {
+		if (frame.streamId != 0) {
+			connectionError(PROTOCOL_ERROR, "PING must be on stream 0");
+			return;
+		}
 		if (frame.payload.length != 8) {
-			logger.warn("PING frame length must be exactly 8 bytes");
-			protocol.closeChannel(channel);
+			connectionError(FRAME_SIZE_ERROR, "PING length must be 8");
 			return;
 		}
 		if ((frame.flags & Http2Frame.FLAG_ACK) == 0) {
@@ -472,9 +537,18 @@ public class Http2Connection {
 	}
 
 	private void handleRstStream(Http2Frame frame) throws IOException {
+		if (frame.streamId == 0) {
+			connectionError(PROTOCOL_ERROR, "RST_STREAM must not be on stream 0");
+			return;
+		}
 		if (frame.payload.length != 4) {
-			logger.warn("RST_STREAM frame length must be exactly 4 bytes");
-			protocol.closeChannel(channel);
+			connectionError(FRAME_SIZE_ERROR, "RST_STREAM length must be 4");
+			return;
+		}
+		// RST_STREAM for a stream that was never opened (id above the highest we've seen) is a
+		// PROTOCOL_ERROR (RFC 7540 §5.1, idle state).
+		if (frame.streamId % 2 != 0 && frame.streamId > maxClientStreamId) {
+			connectionError(PROTOCOL_ERROR, "RST_STREAM on idle stream " + frame.streamId);
 			return;
 		}
 		Http2Stream stream = streams.remove(frame.streamId);
@@ -486,32 +560,57 @@ public class Http2Connection {
 	private void dispatchRequest(Http2Stream stream) {
 		String method = null;
 		String path = null;
+		String scheme = null;
 		String authority = null;
 		Map<String, String> headers = new HashMap<>();
+		boolean seenRegularHeader = false;
 
+		// RFC 7540 §8.1.2 message validation. Any violation makes the request malformed → a stream error
+		// of type PROTOCOL_ERROR (the connection and its other streams are unaffected).
+		String invalid = null;
 		for (Hpack.HeaderField field : stream.requestHeaders) {
 			String name = field.name;
-			if (name.equals(":method")) {
-				method = field.value;
-			} else if (name.equals(":path")) {
-				path = field.value;
-			} else if (name.equals(":authority")) {
-				authority = field.value;
-			} else if (name.startsWith(":")) {
-				continue;
+			if (field.nameHadUppercase) { invalid = "uppercase header name"; break; }
+			if (!name.isEmpty() && name.charAt(0) == ':') {
+				// §8.1.2.1: all pseudo-headers must precede regular headers, must be known request
+				// pseudo-headers, and must not be duplicated.
+				if (seenRegularHeader) { invalid = "pseudo-header after regular header: " + name; break; }
+				if (name.equals(":method")) {
+					if (method != null) { invalid = "duplicate :method"; break; }
+					method = field.value;
+				} else if (name.equals(":path")) {
+					if (path != null) { invalid = "duplicate :path"; break; }
+					path = field.value;
+				} else if (name.equals(":scheme")) {
+					if (scheme != null) { invalid = "duplicate :scheme"; break; }
+					scheme = field.value;
+				} else if (name.equals(":authority")) {
+					if (authority != null) { invalid = "duplicate :authority"; break; }
+					authority = field.value;
+				} else {
+					invalid = "unknown pseudo-header: " + name; break;
+				}
 			} else {
+				seenRegularHeader = true;
+				// §8.1.2.2: connection-specific header fields are forbidden in HTTP/2; TE is allowed only
+				// with the exact value "trailers".
+				if (isConnectionSpecificHeader(name)) { invalid = "connection-specific header: " + name; break; }
+				if (name.equals("te") && !field.value.equals("trailers")) { invalid = "TE must be 'trailers'"; break; }
 				headers.put(name, field.value);
 			}
 		}
 
-		if (authority != null && !headers.containsKey("host")) {
-			headers.put("host", authority);
+		// §8.1.2.3: a request must include :method, :scheme and :path (non-empty for the schemes we serve).
+		if (invalid == null && (method == null || scheme == null || path == null || path.isEmpty())) {
+			invalid = "missing/empty mandatory pseudo-header";
+		}
+		if (invalid != null) {
+			malformed(stream, invalid);
+			return;
 		}
 
-		if (method == null || path == null) {
-			logger.warn("Missing pseudo-headers: method={}, path={}", method, path);
-			writeFrame(Http2Frame.TYPE_RST_STREAM, 0, stream.streamId, intToBytes(1));
-			return;
+		if (authority != null && !headers.containsKey("host")) {
+			headers.put("host", authority);
 		}
 
 		if (logger.isDebugEnabled()) {
@@ -681,5 +780,69 @@ public class Http2Connection {
 			(byte) ((val >>> 8) & 0xFF),
 			(byte) (val & 0xFF)
 		};
+	}
+
+	/**
+	 * Raises a connection error (RFC 7540 §5.4.1): emits a {@code GOAWAY} carrying the last
+	 * client-initiated stream id we processed and {@code errorCode}, then tears the connection down via
+	 * the single cleanup point. The GOAWAY is written best-effort before the close so a conformant peer
+	 * learns why; if the socket can't take it, the close still happens. Always returns {@code false} so
+	 * callers can {@code return connectionError(...)} from a {@code boolean} method or
+	 * {@code if (...) { connectionError(...); return; }} uniformly.
+	 */
+	private boolean connectionError(int errorCode, String reason) {
+		if (logger.isDebugEnabled()) {
+			logger.debug("HTTP/2 connection error {} ({}): {}", errorCode, reason, channel);
+		}
+		byte[] payload = new byte[8];
+		int lastId = maxClientStreamId;
+		payload[0] = (byte) ((lastId >>> 24) & 0x7F);
+		payload[1] = (byte) ((lastId >>> 16) & 0xFF);
+		payload[2] = (byte) ((lastId >>> 8) & 0xFF);
+		payload[3] = (byte) (lastId & 0xFF);
+		payload[4] = (byte) ((errorCode >>> 24) & 0xFF);
+		payload[5] = (byte) ((errorCode >>> 16) & 0xFF);
+		payload[6] = (byte) ((errorCode >>> 8) & 0xFF);
+		payload[7] = (byte) (errorCode & 0xFF);
+		try {
+			writeFrame(Http2Frame.TYPE_GOAWAY, 0, 0, payload);
+		} catch (RuntimeException flushFailed) {
+			logger.debug("Failed to flush GOAWAY before close", flushFailed);
+		}
+		protocol.closeChannel(channel);
+		return false;
+	}
+
+	/**
+	 * Raises a stream error (RFC 7540 §5.4.2): emits a {@code RST_STREAM} with {@code errorCode} for the
+	 * given stream and drops it. The connection itself stays open.
+	 */
+	private void streamError(int streamId, int errorCode) {
+		writeFrame(Http2Frame.TYPE_RST_STREAM, 0, streamId, intToBytes(errorCode));
+		Http2Stream s = streams.remove(streamId);
+		if (s != null) {
+			s.setState(Http2Stream.STATE_CLOSED);
+		}
+	}
+
+	/** A malformed request (RFC 7540 §8.1.2.6) → stream error of type PROTOCOL_ERROR. Returns void so
+	 *  callers can {@code return malformed(...)} from the void dispatch path. */
+	private void malformed(Http2Stream stream, String reason) {
+		if (logger.isDebugEnabled()) {
+			logger.debug("malformed HTTP/2 request on stream {}: {}", stream.streamId, reason);
+		}
+		streamError(stream.streamId, PROTOCOL_ERROR);
+	}
+
+	/** Connection-specific (hop-by-hop) header fields that RFC 7540 §8.1.2.2 forbids in HTTP/2.
+	 *  Names are compared lower-cased (as stored by {@link Hpack.HeaderField}). */
+	private static boolean isConnectionSpecificHeader(String lowerName) {
+		switch (lowerName) {
+			case "connection": case "keep-alive": case "proxy-connection":
+			case "transfer-encoding": case "upgrade":
+				return true;
+			default:
+				return false;
+		}
 	}
 }
