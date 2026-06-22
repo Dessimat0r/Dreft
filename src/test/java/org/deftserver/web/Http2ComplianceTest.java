@@ -1,6 +1,7 @@
 package org.deftserver.web;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -443,6 +444,30 @@ public class Http2ComplianceTest {
 				}
 			}
 			assertEquals("entire large body must be received", BIG_SIZE, body);
+		}
+	}
+
+	/** A HEAD response must carry headers (incl. the would-be Content-Length) but NO body — the response
+	 *  HEADERS frame must set END_STREAM and no DATA frame may follow (regression: HTTP/2 HEAD used to
+	 *  send a DATA frame because Http2Response hardcoded suppressBody=false). */
+	@Test public void headResponseHasNoBody() throws Exception {
+		try (Socket s = connect()) {
+			List<Hpack.HeaderField> req = new ArrayList<>();
+			req.add(new Hpack.HeaderField(":method", "HEAD"));
+			req.add(new Hpack.HeaderField(":path", "/"));
+			req.add(new Hpack.HeaderField(":scheme", "http"));
+			req.add(new Hpack.HeaderField(":authority", "localhost"));
+			writeFrame(s.getOutputStream(), Http2Frame.TYPE_HEADERS,
+				Http2Frame.FLAG_END_HEADERS | Http2Frame.FLAG_END_STREAM, 1, encodeHeaders(req));
+			Http2Frame headers = readUntil(s.getInputStream(), Http2Frame.TYPE_HEADERS);
+			assertTrue("HEAD response HEADERS must set END_STREAM (no body)",
+				(headers.flags & Http2Frame.FLAG_END_STREAM) != 0);
+			List<Hpack.HeaderField> fields = new Hpack.Reader(4096).readHeaders(java.nio.ByteBuffer.wrap(headers.payload));
+			boolean hasCl = false;
+			for (Hpack.HeaderField f : fields) {
+				if (f.name.equals("content-length")) { hasCl = true; assertEquals("2", f.value); }
+			}
+			assertTrue("HEAD response should still advertise the would-be content-length", hasCl);
 		}
 	}
 

@@ -18,8 +18,11 @@ public class Http2Response extends HttpResponse {
 	private final Http2Stream stream;
 	private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
 
-	public Http2Response(HttpProtocol protocol, Http2Connection connection, Http2Stream stream) {
-		super(protocol, connection.getSelectionKey(), true, false);
+	public Http2Response(HttpProtocol protocol, Http2Connection connection, Http2Stream stream, boolean headRequest) {
+		// suppressBody mirrors the HTTP/1.1 path: a HEAD response carries the headers (incl. the
+		// would-be Content-Length) but no body. Previously hardcoded false, so HEAD over HTTP/2 wrongly
+		// sent a DATA frame.
+		super(protocol, connection.getSelectionKey(), true, headRequest);
 		this.connection = connection;
 		this.stream = stream;
 	}
@@ -150,6 +153,15 @@ public class Http2Response extends HttpResponse {
 			finished = true;
 			byte[] data = buffer.toByteArray();
 			buffer.reset();
+			if (isBodySuppressed()) {
+				// HEAD: advertise the would-be body length, end the stream, send no DATA.
+				if (!headersCreated) {
+					sendHeaders(true, data.length);
+				} else {
+					connection.sendData(stream.streamId, new byte[0], true); // close a headers-already-sent stream
+				}
+				return;
+			}
 			if (!headersCreated) {
 				// The complete body is known now, so advertise its exact length and, if it is empty,
 				// end the stream on the HEADERS frame (no DATA needed).

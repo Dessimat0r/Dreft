@@ -676,7 +676,7 @@ public class Http2Connection {
 			logger.debug("Dispatching stream={} method={} path={} headers={}", stream.streamId, method, path, headers);
 		}
 		Http2Request request = new Http2Request(method, path, headers, stream.requestBody.toByteArray());
-		Http2Response response = new Http2Response(protocol, this, stream);
+		Http2Response response = new Http2Response(protocol, this, stream, "HEAD".equals(method));
 		stream.request = request;
 		stream.response = response;
 

@@ -72,9 +72,13 @@ public final class H2SpecHarness {
 			// cleartext. h2spec uses prior-knowledge (sends the preface directly), so it is unaffected.
 			server.setHttp2CleartextUpgradeEnabled(true);
 		}
+		// Reactor (I/O-loop) count is controllable for multi-reactor benchmarking via -Dh2.reactors=N
+		// (default 1). h2spec uses a single connection so it is unaffected.
+		int reactors = Integer.getInteger("h2.reactors", 1);
 		server.bind(port);
-		server.start(1);
-		System.out.println("H2SpecHarness listening on " + port + (tls ? " (TLS/ALPN)" : " (cleartext)") + " (Ctrl-C to stop)");
+		server.start(reactors);
+		System.out.println("H2SpecHarness listening on " + port + (tls ? " (TLS/ALPN)" : " (cleartext)")
+			+ ", reactors=" + reactors + " (Ctrl-C to stop)");
 		Thread.currentThread().join();
 	}
 }
