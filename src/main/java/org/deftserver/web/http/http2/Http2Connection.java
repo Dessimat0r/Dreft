@@ -155,6 +155,7 @@ public class Http2Connection {
 		};
 		writeFrame(Http2Frame.TYPE_SETTINGS, 0, 0, payload);
 		initialSettingsSent = true;
+		tryWrite();
 	}
 
 	/**
@@ -178,7 +179,7 @@ public class Http2Connection {
 		if (http1ResponsePrefix != null && http1ResponsePrefix.length > 0) {
 			writeBuffer.put(http1ResponsePrefix); // ordered ahead of the server preface + stream-1 frames
 		}
-		if (clientSettings != null && clientSettings.length % 6 == 0 && !applySettingsPayload(clientSettings)) {
+		if (clientSettings != null && clientSettings.length % 6 == 0 && !applySettingsPayload(ByteBuffer.wrap(clientSettings))) {
 			return; // invalid settings — channel already closed
 		}
 		sendInitialSettings();
@@ -248,7 +249,7 @@ public class Http2Connection {
 					connectionError(PROTOCOL_ERROR, "GOAWAY must be on stream 0");
 					return;
 				}
-				if (frame.payload.length < 8) {
+				if (frame.payloadBuffer.remaining() < 8) {
 					connectionError(FRAME_SIZE_ERROR, "GOAWAY length must be >= 8");
 					return;
 				}
@@ -270,13 +271,13 @@ public class Http2Connection {
 			connectionError(PROTOCOL_ERROR, "PRIORITY must not be on stream 0");
 			return;
 		}
-		if (frame.payload.length != 5) {
+		if (frame.payloadBuffer.remaining() != 5) {
 			// RFC 7540 §6.3: a PRIORITY of the wrong length is a stream error.
 			streamError(frame.streamId, FRAME_SIZE_ERROR);
 			return;
 		}
 		// §5.3.1: a stream cannot depend on itself.
-		int dependency = ByteBuffer.wrap(frame.payload).getInt() & 0x7FFFFFFF;
+		int dependency = frame.payloadBuffer.getInt(0) & 0x7FFFFFFF;
 		if (dependency == frame.streamId) {
 			streamError(frame.streamId, PROTOCOL_ERROR);
 		}
@@ -288,21 +289,22 @@ public class Http2Connection {
 			return;
 		}
 		if ((frame.flags & Http2Frame.FLAG_ACK) != 0) {
-			if (frame.payload.length != 0) {
+			if (frame.payloadBuffer.remaining() != 0) {
 				connectionError(FRAME_SIZE_ERROR, "SETTINGS ACK must have length 0");
 				return;
 			}
 			logger.debug("Received SETTINGS ACK");
 			return;
 		}
-		if (frame.payload.length % 6 != 0) {
+		if (frame.payloadBuffer.remaining() % 6 != 0) {
 			connectionError(FRAME_SIZE_ERROR, "SETTINGS length must be a multiple of 6");
 			return;
 		}
-		if (!applySettingsPayload(frame.payload)) {
+		if (!applySettingsPayload(frame.payloadBuffer)) {
 			return; // applySettingsPayload already raised the connection error
 		}
 		writeFrame(Http2Frame.TYPE_SETTINGS, Http2Frame.FLAG_ACK, 0, null);
+		tryWrite();
 	}
 
 	/**
@@ -312,8 +314,8 @@ public class Http2Connection {
 	 * in that case no SETTINGS ACK is owed (there was no frame to acknowledge). Returns {@code false}
 	 * (after closing the channel) if a value is out of range; {@code true} on success.
 	 */
-	private boolean applySettingsPayload(byte[] payload) {
-		ByteBuffer buf = ByteBuffer.wrap(payload);
+	private boolean applySettingsPayload(ByteBuffer payload) {
+		ByteBuffer buf = payload.duplicate();
 		while (buf.remaining() >= 6) {
 			int id = buf.getShort() & 0xFFFF;
 			int value = buf.getInt();
@@ -376,27 +378,26 @@ public class Http2Connection {
 		int offset = 0;
 		int padLength = 0;
 		if ((frame.flags & Http2Frame.FLAG_PADDED) != 0) {
-			if (frame.payload.length < 1) {
+			if (frame.payloadBuffer.remaining() < 1) {
 				connectionError(PROTOCOL_ERROR, "PADDED HEADERS missing pad length");
 				return;
 			}
-			padLength = frame.payload[offset++] & 0xFF;
+			padLength = frame.payloadBuffer.get(offset++) & 0xFF;
 		}
 		if ((frame.flags & Http2Frame.FLAG_PRIORITY) != 0) {
-			if (frame.payload.length < offset + 5) {
+			if (frame.payloadBuffer.remaining() < offset + 5) {
 				connectionError(PROTOCOL_ERROR, "PRIORITY-flagged HEADERS too short");
 				return;
 			}
 			// §5.3.1: a stream must not depend on itself.
-			int dependency = ((frame.payload[offset] & 0x7F) << 24) | ((frame.payload[offset + 1] & 0xFF) << 16)
-				| ((frame.payload[offset + 2] & 0xFF) << 8) | (frame.payload[offset + 3] & 0xFF);
+			int dependency = frame.payloadBuffer.getInt(offset) & 0x7FFFFFFF;
 			if (dependency == frame.streamId) {
 				connectionError(PROTOCOL_ERROR, "HEADERS stream depends on itself");
 				return;
 			}
 			offset += 5;
 		}
-		int headerBlockLength = frame.payload.length - offset - padLength;
+		int headerBlockLength = frame.payloadBuffer.remaining() - offset - padLength;
 		if (headerBlockLength < 0) {
 			connectionError(PROTOCOL_ERROR, "HEADERS pad length exceeds frame");
 			return;
@@ -406,7 +407,15 @@ public class Http2Connection {
 			return;
 		}
 		headerBlockBuilder.reset();
-		headerBlockBuilder.write(frame.payload, offset, headerBlockLength);
+		if (frame.payloadBuffer.hasArray()) {
+			headerBlockBuilder.write(frame.payloadBuffer.array(), frame.payloadBuffer.arrayOffset() + frame.payloadBuffer.position() + offset, headerBlockLength);
+		} else {
+			byte[] temp = new byte[headerBlockLength];
+			ByteBuffer dup = frame.payloadBuffer.duplicate();
+			dup.position(dup.position() + offset);
+			dup.get(temp);
+			headerBlockBuilder.write(temp, 0, headerBlockLength);
+		}
 		currentHeaderStreamId = frame.streamId;
 		// Remember END_STREAM so it survives a header block continued over CONTINUATION frames.
 		pendingEndStream = (frame.flags & Http2Frame.FLAG_END_STREAM) != 0;
@@ -423,11 +432,18 @@ public class Http2Connection {
 			connectionError(PROTOCOL_ERROR, "unexpected CONTINUATION on stream " + frame.streamId);
 			return;
 		}
-		if (headerBlockBuilder.size() + frame.payload.length > 65536) {
+		int payloadLen = frame.payloadBuffer.remaining();
+		if (headerBlockBuilder.size() + payloadLen > 65536) {
 			connectionError(ENHANCE_YOUR_CALM, "header block exceeded 64 KiB during CONTINUATION");
 			return;
 		}
-		headerBlockBuilder.write(frame.payload);
+		if (frame.payloadBuffer.hasArray()) {
+			headerBlockBuilder.write(frame.payloadBuffer.array(), frame.payloadBuffer.arrayOffset() + frame.payloadBuffer.position(), payloadLen);
+		} else {
+			byte[] temp = new byte[payloadLen];
+			frame.payloadBuffer.duplicate().get(temp);
+			headerBlockBuilder.write(temp, 0, payloadLen);
+		}
 		if ((frame.flags & Http2Frame.FLAG_END_HEADERS) != 0) {
 			// Apply the END_STREAM flag carried by the originating HEADERS frame.
 			finishHeaders(frame.streamId, pendingEndStream);
@@ -487,13 +503,13 @@ public class Http2Connection {
 		int offset = 0;
 		int padLength = 0;
 		if ((frame.flags & Http2Frame.FLAG_PADDED) != 0) {
-			if (frame.payload.length < 1) {
+			if (frame.payloadBuffer.remaining() < 1) {
 				connectionError(PROTOCOL_ERROR, "PADDED DATA missing pad length");
 				return;
 			}
-			padLength = frame.payload[offset++] & 0xFF;
+			padLength = frame.payloadBuffer.get(offset++) & 0xFF;
 		}
-		int dataLength = frame.payload.length - offset - padLength;
+		int dataLength = frame.payloadBuffer.remaining() - offset - padLength;
 		if (dataLength < 0) {
 			connectionError(PROTOCOL_ERROR, "DATA pad length exceeds frame");
 			return;
@@ -503,7 +519,15 @@ public class Http2Connection {
 			streamError(frame.streamId, ENHANCE_YOUR_CALM);
 			return;
 		}
-		stream.requestBody.write(frame.payload, offset, dataLength);
+		if (frame.payloadBuffer.hasArray()) {
+			stream.requestBody.write(frame.payloadBuffer.array(), frame.payloadBuffer.arrayOffset() + frame.payloadBuffer.position() + offset, dataLength);
+		} else {
+			byte[] temp = new byte[dataLength];
+			ByteBuffer dup = frame.payloadBuffer.duplicate();
+			dup.position(dup.position() + offset);
+			dup.get(temp);
+			stream.requestBody.write(temp, 0, dataLength);
+		}
 
 		connectionInboundWindowSize -= frame.length;
 		stream.inboundWindowSize -= frame.length;
@@ -524,11 +548,11 @@ public class Http2Connection {
 	}
 
 	private void handleWindowUpdate(Http2Frame frame) throws IOException {
-		if (frame.payload.length != 4) {
+		if (frame.payloadBuffer.remaining() != 4) {
 			connectionError(FRAME_SIZE_ERROR, "WINDOW_UPDATE length must be 4");
 			return;
 		}
-		int increment = ByteBuffer.wrap(frame.payload).getInt() & 0x7FFFFFFF;
+		int increment = frame.payloadBuffer.getInt(0) & 0x7FFFFFFF;
 		if (increment == 0) {
 			// §6.9: a zero increment is a stream error on a stream, a connection error on stream 0.
 			if (frame.streamId == 0) {
@@ -571,12 +595,15 @@ public class Http2Connection {
 			connectionError(PROTOCOL_ERROR, "PING must be on stream 0");
 			return;
 		}
-		if (frame.payload.length != 8) {
+		if (frame.payloadBuffer.remaining() != 8) {
 			connectionError(FRAME_SIZE_ERROR, "PING length must be 8");
 			return;
 		}
 		if ((frame.flags & Http2Frame.FLAG_ACK) == 0) {
-			writeFrame(Http2Frame.TYPE_PING, Http2Frame.FLAG_ACK, 0, frame.payload);
+			byte[] pingPayload = new byte[8];
+			frame.payloadBuffer.duplicate().get(pingPayload);
+			writeFrame(Http2Frame.TYPE_PING, Http2Frame.FLAG_ACK, 0, pingPayload);
+			tryWrite();
 		}
 	}
 
@@ -585,7 +612,7 @@ public class Http2Connection {
 			connectionError(PROTOCOL_ERROR, "RST_STREAM must not be on stream 0");
 			return;
 		}
-		if (frame.payload.length != 4) {
+		if (frame.payloadBuffer.remaining() != 4) {
 			connectionError(FRAME_SIZE_ERROR, "RST_STREAM length must be 4");
 			return;
 		}
@@ -728,6 +755,7 @@ public class Http2Connection {
 					stream.setState(Http2Stream.STATE_CLOSED);
 					streams.remove(streamId);
 				}
+				tryWrite();
 			}
 		} catch (IOException e) {
 			logger.error("Error sending headers", e);
@@ -784,6 +812,7 @@ public class Http2Connection {
 				iterator.remove();
 			}
 		}
+		tryWrite();
 	}
 
 	// Reused per-connection 9-byte frame-header scratch (only ever touched on this connection's I/O-loop
@@ -818,7 +847,6 @@ public class Http2Connection {
 		if (src != null && len > 0) {
 			writeBuffer.put(src, off, len);
 		}
-		tryWrite();
 	}
 
 	private void tryWrite() {
@@ -883,6 +911,7 @@ public class Http2Connection {
 		payload[7] = (byte) (errorCode & 0xFF);
 		try {
 			writeFrame(Http2Frame.TYPE_GOAWAY, 0, 0, payload);
+			tryWrite();
 		} catch (RuntimeException flushFailed) {
 			logger.debug("Failed to flush GOAWAY before close", flushFailed);
 		}
@@ -900,6 +929,7 @@ public class Http2Connection {
 		if (s != null) {
 			s.setState(Http2Stream.STATE_CLOSED);
 		}
+		tryWrite();
 	}
 
 	/** True if an {@link IOException} from a socket write is a normal peer disconnect (the client closed

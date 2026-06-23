@@ -148,10 +148,28 @@ public final class Hpack {
 		private final int settingsMaxTableSize;
 		private int dynamicTableLimit;
 		private int currentTableSize = 0;
+		private final String[] stringCache = new String[512];
+		private final byte[][] byteCache = new byte[512][];
 
 		public Reader(int maxTableSize) {
 			this.settingsMaxTableSize = maxTableSize;
 			this.dynamicTableLimit = maxTableSize;
+		}
+
+		private String getCachedOrNewString(byte[] raw) {
+			int hash = 0;
+			for (byte b : raw) {
+				hash = 31 * hash + b;
+			}
+			int index = Math.abs(hash) % stringCache.length;
+			byte[] cachedBytes = byteCache[index];
+			if (cachedBytes != null && java.util.Arrays.equals(cachedBytes, raw)) {
+				return stringCache[index];
+			}
+			String s = new String(raw, StandardCharsets.UTF_8);
+			byteCache[index] = raw;
+			stringCache[index] = s;
+			return s;
 		}
 
 		public List<HeaderField> readHeaders(ByteBuffer buffer) throws IOException {
@@ -319,7 +337,7 @@ public final class Hpack {
 			if (cached != null) {
 				return cached;
 			}
-			return new String(raw, StandardCharsets.UTF_8);
+			return getCachedOrNewString(raw);
 		}
 	}
 
@@ -422,9 +440,7 @@ public final class Hpack {
 			}
 			if (isAscii) {
 				writeInt(out, len, 0x7F, 0x00);
-				for (int i = 0; i < len; i++) {
-					out.write((byte) str.charAt(i));
-				}
+				out.write(str.getBytes(StandardCharsets.US_ASCII));
 			} else {
 				byte[] bytes = str.getBytes(StandardCharsets.UTF_8);
 				writeInt(out, bytes.length, 0x7F, 0x00); // No Huffman encoding for outputs (simpler & compatible)

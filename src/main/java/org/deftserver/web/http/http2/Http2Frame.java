@@ -27,6 +27,7 @@ public final class Http2Frame {
 	public final int flags;
 	public final int streamId;
 	public final byte[] payload;
+	public final ByteBuffer payloadBuffer;
 
 	/** Thrown when a frame declares a length greater than {@code SETTINGS_MAX_FRAME_SIZE}; the caller
 	 *  answers this with a connection error of type {@code FRAME_SIZE_ERROR} (RFC 7540 §4.2), distinct
@@ -37,12 +38,22 @@ public final class Http2Frame {
 		}
 	}
 
+	public Http2Frame(int length, int type, int flags, int streamId, ByteBuffer payloadBuffer) {
+		this.length = length;
+		this.type = type;
+		this.flags = flags;
+		this.streamId = streamId;
+		this.payload = null;
+		this.payloadBuffer = payloadBuffer;
+	}
+
 	public Http2Frame(int length, int type, int flags, int streamId, byte[] payload) {
 		this.length = length;
 		this.type = type;
 		this.flags = flags;
 		this.streamId = streamId;
 		this.payload = payload;
+		this.payloadBuffer = ByteBuffer.wrap(payload);
 	}
 
 	public static Http2Frame read(ByteBuffer buffer, int maxFrameSize) throws IOException {
@@ -68,9 +79,15 @@ public final class Http2Frame {
 			return null;
 		}
 
-		byte[] payload = new byte[length];
-		buffer.get(payload);
-		return new Http2Frame(length, type, flags, streamId, payload);
+		ByteBuffer payloadBuffer;
+		if (length > 0) {
+			payloadBuffer = buffer.slice();
+			payloadBuffer.limit(length);
+			buffer.position(buffer.position() + length);
+		} else {
+			payloadBuffer = ByteBuffer.allocate(0);
+		}
+		return new Http2Frame(length, type, flags, streamId, payloadBuffer);
 	}
 
 	public static void write(ByteBuffer out, int type, int flags, int streamId, byte[] payload) {
