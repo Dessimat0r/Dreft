@@ -504,13 +504,50 @@ public class Http2ComplianceTest {
 			TEXT_BODY, new String(identity, StandardCharsets.UTF_8));
 	}
 
-	/** The bundled brotli (brotjli) emits a non-standard stream, so HTTP/2 must never negotiate it: a
-	 *  browser-style Accept-Encoding (which includes br) must pick a standard codec (zstd/gzip), and a
-	 *  br-only request must fall back to identity rather than send an undecodable response. */
-	@Test public void brotliNeverNegotiatedOverHttp2() throws Exception {
+	@Test public void brotliNegotiatedOverHttp2() throws Exception {
 		String enc = contentEncodingFor("gzip, deflate, br, zstd");
-		assertTrue("must negotiate a standard codec (zstd/gzip), got: " + enc, enc != null && !enc.equals("br"));
-		assertEquals("a br-only request must be served identity", null, contentEncodingFor("br"));
+		assertEquals("must negotiate brotli (br) when offered", "br", enc);
+
+		String brOnlyEnc = contentEncodingFor("br");
+		assertEquals("br-only request must negotiate br", "br", brOnlyEnc);
+	}
+
+	@Test public void textResponseBrotliWhenOffered() throws Exception {
+		byte[] br = fetchTextBodyOfEncoding("br");
+		assertEquals("brotli body must inflate to the original", TEXT_BODY,
+			new String(debrotli(br), StandardCharsets.UTF_8));
+		assertTrue("compressed body must be smaller than the original", br.length < TEXT_BODY.length());
+	}
+
+	private static byte[] fetchTextBodyOfEncoding(String acceptEncoding) throws Exception {
+		try (Socket s = connect()) {
+			List<Hpack.HeaderField> req = new ArrayList<>();
+			req.add(new Hpack.HeaderField(":method", "GET"));
+			req.add(new Hpack.HeaderField(":path", "/text"));
+			req.add(new Hpack.HeaderField(":scheme", "http"));
+			req.add(new Hpack.HeaderField(":authority", "localhost"));
+			req.add(new Hpack.HeaderField("accept-encoding", acceptEncoding));
+			writeFrame(s.getOutputStream(), Http2Frame.TYPE_HEADERS,
+				Http2Frame.FLAG_END_HEADERS | Http2Frame.FLAG_END_STREAM, 1, encodeHeaders(req));
+			InputStream in = s.getInputStream();
+			Http2Frame headers = readUntil(in, Http2Frame.TYPE_HEADERS);
+			ByteArrayOutputStream body = new ByteArrayOutputStream();
+			boolean ended = (headers.flags & Http2Frame.FLAG_END_STREAM) != 0;
+			while (!ended) {
+				Http2Frame f = readFrame(in);
+				if (f.type == Http2Frame.TYPE_DATA) {
+					body.write(f.payload);
+					if ((f.flags & Http2Frame.FLAG_END_STREAM) != 0) ended = true;
+				}
+			}
+			return body.toByteArray();
+		}
+	}
+
+	private static byte[] debrotli(byte[] br) throws IOException {
+		try (com.brotjli.stream.BrotliInputStream bis = new com.brotjli.stream.BrotliInputStream(new java.io.ByteArrayInputStream(br))) {
+			return bis.readAllBytes();
+		}
 	}
 
 	/** Returns the content-encoding header of GET /text with the given Accept-Encoding, or null if none. */

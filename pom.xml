@@ -3,7 +3,7 @@
 	<modelVersion>4.0.0</modelVersion>
 	<groupId>org.deftserver</groupId>
 	<artifactId>dreft</artifactId>
-	<version>0.8.2</version>
+	<version>0.8.3</version>
 
 	<dependencies>
 		<dependency>
@@ -37,9 +37,9 @@
 		<dependency>
 			<groupId>com.brotjli</groupId>
 			<artifactId>brotjli</artifactId>
-			<version>0.1.0</version>
+			<version>0.2.0</version>
 			<scope>system</scope>
-			<systemPath>${project.basedir}/brotjli-0.1.0.jar</systemPath>
+			<systemPath>${project.basedir}/brotjli-0.2.0.jar</systemPath>
 			<optional>true</optional>
 		</dependency>
 	</dependencies>

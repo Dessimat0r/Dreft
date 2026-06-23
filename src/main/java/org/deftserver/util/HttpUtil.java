@@ -420,14 +420,14 @@ public class HttpUtil {
 	private static final boolean ZSTD_SUPPORTED;
 
 	static {
-		// Brotli is intentionally disabled. The bundled `brotjli` 0.1.0 codec emits a stream that is
-		// NOT RFC 7932 brotli: the reference `brotli` decoder (and browsers) recover only a few bytes
-		// of a multi-KB body from it — it round-trips only with brotjli's own decoder. Advertising or
-		// serving `Content-Encoding: br` with it therefore corrupts the response for every real client,
-		// and it compresses far worse than gzip/zstd anyway (e.g. 10 KB vs 63 B for the same input).
-		// Clients are served the standard gzip/zstd codecs instead. Re-enable only behind a real,
-		// RFC 7932-compliant brotli library whose output is verified to decode with a standard decoder.
-		BROTLI_SUPPORTED = false;
+		boolean brotli;
+		try {
+			Class.forName("com.brotjli.stream.BrotliOutputStream");
+			brotli = true;
+		} catch (ClassNotFoundException e) {
+			brotli = false;
+		}
+		BROTLI_SUPPORTED = brotli;
 
 		boolean zstd;
 		try {
