@@ -3,7 +3,7 @@
 	<modelVersion>4.0.0</modelVersion>
 	<groupId>org.deftserver</groupId>
 	<artifactId>dreft</artifactId>
-	<version>0.8.3</version>
+	<version>0.9.0</version>
 
 	<dependencies>
 		<dependency>
@@ -28,9 +28,11 @@
 		</dependency>
 
 		<dependency>
-			<groupId>com.github.luben</groupId>
-			<artifactId>zstd-jni</artifactId>
-			<version>1.5.6-3</version>
+			<groupId>org.zstjd</groupId>
+			<artifactId>zstjd</artifactId>
+			<version>0.2.0</version>
+			<scope>system</scope>
+			<systemPath>${project.basedir}/zstjd-0.2.0.jar</systemPath>
 			<optional>true</optional>
 		</dependency>
 

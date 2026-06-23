@@ -431,7 +431,7 @@ public class HttpUtil {
 
 		boolean zstd;
 		try {
-			Class.forName("com.github.luben.zstd.ZstdOutputStream");
+			Class.forName("org.zstjd.ZstdOutputStream");
 			zstd = true;
 		} catch (ClassNotFoundException e) {
 			zstd = false;
@@ -449,13 +449,13 @@ public class HttpUtil {
 
 	private static class ZstdCodec {
 		static void compress(byte[] buf, int offset, int length, java.io.OutputStream out) throws java.io.IOException {
-			try (com.github.luben.zstd.ZstdOutputStream zos = new com.github.luben.zstd.ZstdOutputStream(out)) {
+			try (org.zstjd.ZstdOutputStream zos = new org.zstjd.ZstdOutputStream(out)) {
 				zos.write(buf, offset, length);
 			}
 		}
 
 		static java.io.InputStream decompress(java.io.InputStream in) throws java.io.IOException {
-			return new com.github.luben.zstd.ZstdInputStream(in);
+			return new org.zstjd.ZstdInputStream(in);
 		}
 	}
 
@@ -472,7 +472,7 @@ public class HttpUtil {
 	}
 
 	public static java.io.OutputStream createZstdOutputStream(java.io.OutputStream out) throws java.io.IOException {
-		return new com.github.luben.zstd.ZstdOutputStream(out);
+		return new org.zstjd.ZstdOutputStream(out);
 	}
 
 	public static java.io.OutputStream createBrotliOutputStream(java.io.OutputStream out) throws java.io.IOException {

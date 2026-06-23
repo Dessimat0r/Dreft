@@ -313,7 +313,7 @@ public class CompressionIntegrationTest {
 	@Test
 	public void testInboundDecompressionZstd() throws Exception {
 		String payload = "hello zstd server";
-		byte[] compressed = com.github.luben.zstd.Zstd.compress(payload.getBytes(StandardCharsets.UTF_8));
+		byte[] compressed = org.zstjd.Zstd.compress(payload.getBytes(StandardCharsets.UTF_8));
 		ByteArrayOutputStream reqOut = new ByteArrayOutputStream();
 		reqOut.write(("POST /decompress HTTP/1.1\r\n" +
 					"Host: localhost\r\n" +
@@ -338,7 +338,7 @@ public class CompressionIntegrationTest {
 		payloadOut.write(partContent.getBytes(StandardCharsets.UTF_8));
 		payloadOut.write(partFooter.getBytes(StandardCharsets.UTF_8));
 
-		byte[] compressed = com.github.luben.zstd.Zstd.compress(payloadOut.toByteArray());
+		byte[] compressed = org.zstjd.Zstd.compress(payloadOut.toByteArray());
 		ByteArrayOutputStream reqOut = new ByteArrayOutputStream();
 		reqOut.write(("POST /decompress-multipart HTTP/1.1\r\n" +
 					"Host: localhost\r\n" +
@@ -357,7 +357,7 @@ public class CompressionIntegrationTest {
 	public void testZipBombDecompressionDefense() throws Exception {
 		// A highly compressed payload of 1,000,000 zeros (small compressed, large expanded)
 		byte[] largePayload = new byte[17 * 1024 * 1024]; // 17 MB (exceeds MAX_BODY_SIZE = 16 MB)
-		byte[] compressed = com.github.luben.zstd.Zstd.compress(largePayload);
+		byte[] compressed = org.zstjd.Zstd.compress(largePayload);
 		ByteArrayOutputStream reqOut = new ByteArrayOutputStream();
 		reqOut.write(("POST /decompress HTTP/1.1\r\n" +
 					"Host: localhost\r\n" +
