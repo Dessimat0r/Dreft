@@ -22,12 +22,6 @@
 		</dependency>
 
 		<dependency>
-			<groupId>javax.activation</groupId>
-			<artifactId>activation</artifactId>
-			<version>1.1.1</version>
-		</dependency>
-
-		<dependency>
 			<groupId>org.zstjd</groupId>
 			<artifactId>zstjd</artifactId>
 			<version>0.2.0</version>

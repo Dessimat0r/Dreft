@@ -21,8 +21,6 @@ import java.util.HashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 
-import javax.activation.FileTypeMap;
-import javax.activation.MimetypesFileTypeMap;
 
 import org.deftserver.util.HttpUtil;
 import org.deftserver.web.http.HttpException;
@@ -428,7 +426,6 @@ public class StaticContentHandler extends RequestHandler {
 		java.util.Map.entry("xz", "application/x-xz")
 	);
 
-	private final FileTypeMap mimeTypeMap =  MimetypesFileTypeMap.getDefaultFileTypeMap();
 
 	/** The shared singleton instance (one per JVM; configured via {@link #setStaticContentDir}). */
 	public static StaticContentHandler getInstance() {
@@ -769,9 +766,6 @@ public class StaticContentHandler extends RequestHandler {
 						resolvedMime = java.nio.file.Files.probeContentType(file.toPath());
 					} catch (IOException e) {
 					}
-				}
-				if (resolvedMime == null) {
-					resolvedMime = mimeTypeMap.getContentType(file);
 				}
 				meta = new FileMetadata(lastModified, lastModifiedStr, etagValue, resolvedMime, file.length(), now);
 				metadataCache.put(absPath, meta);

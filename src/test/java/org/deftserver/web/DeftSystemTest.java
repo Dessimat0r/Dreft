@@ -2536,7 +2536,7 @@ public class DeftSystemTest {
 
 	@Test
 	public void UrlUtilJoinTest() throws Exception {
-		java.net.URL baseUrl = new java.net.URL("http://tt.se/sub/path/");
+		java.net.URL baseUrl = java.net.URI.create("http://tt.se/sub/path/").toURL();
 		
 		// 1. Relative with leading slash
 		assertEquals("http://tt.se/start", org.deftserver.util.UrlUtil.urlJoin(baseUrl, "/start"));
