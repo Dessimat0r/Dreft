@@ -109,11 +109,4 @@
 		</plugins>
 	</build>
 
-	<repositories>
-		<repository>
-			<id>Sonatype</id>
-			<name>Sonatype Release</name>
-			<url>http://oss.sonatype.org/content/repositories/releases</url>
-		</repository>
-	</repositories>
 </project>
